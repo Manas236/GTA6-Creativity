@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any
 
-from . import config, cut, db, discover, download, hooks, render, voiceover
+from . import config, cut, db, discover, download, hooks, posting, render, telegram_bot, voiceover
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,6 +176,13 @@ def run_single_cycle(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
     t0 = time.time()
     try:
         log.info("Starting pipeline cycle...")
+
+        # CP3 crash recovery comes first: rows left in 'publishing' by a crash are resolved
+        # against the remote before anything new is published, and never published a second time.
+        settled = posting.settle_publishing_rows(cfg=cfg, db_path=db_path)
+        if settled:
+            log.info("Settled %d post row(s) left in publishing: %s", len(settled), settled)
+
         discovered = discover.run_discovery(cfg=cfg, db_path=db_path)
         log.info("Discovered %d candidate items", len(discovered))
 
@@ -194,6 +201,13 @@ def run_single_cycle(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
             else:
                 log.warning("Render failed for %s: %s", cid, msg)
 
+        # The Telegram long poll runs here, inside the runner's loop: one card, one poll round.
+        approval = telegram_bot.run_approval_stage(cfg=cfg, db_path=db_path)
+        log.info("Approval pass: %s", approval)
+
+        posted = posting.run_posting_stage(cfg=cfg, db_path=db_path)
+        log.info("Posting pass: %s", posted)
+
         elapsed = time.time() - t0
         log.info("Cycle finished in %.2fs", elapsed)
         return {
@@ -202,10 +216,36 @@ def run_single_cycle(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
             "downloaded_count": len(downloaded),
             "cut_count": len(cut_ids),
             "rendered_count": rendered_count,
+            "approval": approval,
+            "posted": posted,
+            "settled": settled,
             "duration_s": elapsed,
         }
     finally:
         release_lock(db_path=db_path)
+
+
+def run_loop(cfg: dict[str, Any] | None = None, db_path: Any = None, interval_s: float | None = None) -> None:
+    """Run cycles until interrupted. The Telegram long poll happens inside each cycle."""
+    cfg = cfg or config.get_config()
+    gap = interval_s if interval_s is not None else float(
+        (cfg.get("orchestrator") or {}).get("loop_interval_seconds", 60)
+    )
+    log.info("Runner loop started (interval %.0fs). Ctrl-C to stop.", gap)
+    while True:
+        try:
+            result = run_single_cycle(cfg=cfg, db_path=db_path)
+            log.info("Cycle: %s", result.get("status"))
+        except KeyboardInterrupt:
+            log.info("Runner loop stopped.")
+            return
+        except Exception:
+            log.exception("Cycle failed; carrying on after the interval")
+        try:
+            time.sleep(gap)
+        except KeyboardInterrupt:
+            log.info("Runner loop stopped.")
+            return
 
 
 def main() -> None:
@@ -219,7 +259,11 @@ def main() -> None:
     subparsers.add_parser("hooks", help="Run Gemini hook generation stage only")
     subparsers.add_parser("voiceover", help="Run Kokoro TTS voiceover stage only")
     subparsers.add_parser("render", help="Run full vertical 9:16 video render (Variants A & B)")
+    subparsers.add_parser("approve", help="Run one approval pass (Telegram card + long poll, or the auto gate)")
+    subparsers.add_parser("post", help="Settle crashed publishes, then post approved items to Meta")
     subparsers.add_parser("cycle", help="Run complete pipeline cycle")
+    loop_parser = subparsers.add_parser("loop", help="Run cycles continuously (the approval long poll runs in it)")
+    loop_parser.add_argument("--interval", type=float, default=None, help="Seconds between cycles")
     subparsers.add_parser("status", help="Print current database status and stage counts")
 
     args = parser.parse_args()
@@ -286,8 +330,28 @@ def main() -> None:
                 print(f"Render {itm['id']}: {ok} - {msg} ({stats})")
         finally:
             release_lock(db_path=db_p)
+    elif args.command == "approve":
+        db.init_db(db_p)
+        if not acquire_lock(db_path=db_p):
+            print("Locked: another runner active")
+            sys.exit(1)
+        try:
+            print(telegram_bot.run_approval_stage(db_path=db_p))
+        finally:
+            release_lock(db_path=db_p)
+    elif args.command == "post":
+        db.init_db(db_p)
+        if not acquire_lock(db_path=db_p):
+            print("Locked: another runner active")
+            sys.exit(1)
+        try:
+            print(posting.run_posting_stage(db_path=db_p))
+        finally:
+            release_lock(db_path=db_p)
     elif args.command == "cycle":
         run_single_cycle(db_path=db_p)
+    elif args.command == "loop":
+        run_loop(db_path=db_p, interval_s=args.interval)
     elif args.command == "status":
         print_status(db_path=db_p)
     else:

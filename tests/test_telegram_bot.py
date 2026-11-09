@@ -1,0 +1,467 @@
+"""Unit tests for the CP3 Telegram approval card. Zero network: the transport is a fake."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from pipeline import db, telegram_bot
+
+CHAT_ID = "4242"
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+class FakeTransport:
+    """Records every Bot API call and answers from a scripted queue."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.updates: list[list[dict[str, Any]]] = []
+        self.next_message_id = 100
+        self.raise_on: dict[str, Exception] = {}
+
+    def __call__(self, method, params, files=None, http_timeout=30.0):
+        self.calls.append((method, params))
+        if method in self.raise_on:
+            raise self.raise_on[method]
+        if method == "getUpdates":
+            return self.updates.pop(0) if self.updates else []
+        if method in ("sendVideo", "sendMessage"):
+            self.next_message_id += 1
+            return {"message_id": self.next_message_id}
+        return True
+
+    def methods(self) -> list[str]:
+        return [m for m, _ in self.calls]
+
+    def of(self, method: str) -> list[dict[str, Any]]:
+        return [p for m, p in self.calls if m == method]
+
+
+class Clock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def cfg() -> dict[str, Any]:
+    return {
+        "app": {"dry_run": True},
+        "telegram": {"enabled": True, "poll_timeout_s": 1, "edit_throttle_gap_s": 2.5},
+        "approval": {
+            "mode": "telegram",
+            "auto_quality_gate": {
+                "require_both_renders": True,
+                "require_ffprobe_pass": True,
+                "require_grounded_hook": True,
+                "max_duration_seconds": 22.0,
+                "max_b_extra_seconds": 8.0,
+            },
+        },
+    }
+
+
+def make_item(
+    tmp_db: Path,
+    tmp_path: Path,
+    item_id: str = "item-1",
+    score: float = 0.5,
+    stage: str = "rendered",
+    grounded: int = 1,
+    renders: bool = True,
+) -> dict[str, Any]:
+    db.insert_discovered_item(
+        {
+            "id": item_id,
+            "source": "youtube",
+            "source_id": item_id,
+            "source_url": f"https://youtu.be/{item_id}",
+            "author_name": "GamingBolt",
+            "original_title": "GTA 6 detail nobody noticed",
+            "discovery_score": score,
+            "raw_velocity": 10.0,
+            "percentile_rank": 0.9,
+        },
+        db_path=tmp_db,
+    )
+    a = tmp_path / f"{item_id}_A.mp4"
+    b = tmp_path / f"{item_id}_B.mp4"
+    if renders:
+        a.write_bytes(b"A" * 2048)
+        b.write_bytes(b"B" * 2048)
+    db.transition_stage(
+        item_id,
+        stage,
+        extra_fields={
+            "hook_text": "WHAT IS HIDDEN IN THIS GTA 6 SHOT?",
+            "hook_style": "question",
+            "hook_grounded": grounded,
+            "authenticity": "unverified",
+            "render_a_path": str(a) if renders else None,
+            "render_b_path": str(b) if renders else None,
+            "caption_text": "WHAT IS HIDDEN IN THIS GTA 6 SHOT?\n\nCredit: GamingBolt\n.\n#gta6",
+        },
+        db_path=tmp_db,
+    )
+    return db.get_item(item_id, db_path=tmp_db)
+
+
+def make_bot(tmp_db: Path, cfg: dict[str, Any], transport: FakeTransport, clock: Clock | None = None):
+    return telegram_bot.ApprovalBot(
+        transport=transport, chat_id=CHAT_ID, cfg=cfg, db_path=tmp_db, clock=clock or Clock()
+    )
+
+
+def tap(item_id: str, action: str, message_id: int) -> dict[str, Any]:
+    return {
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1",
+            "data": f"a:{action}:{item_id}",
+            "from": {"id": int(CHAT_ID)},
+            "message": {"message_id": message_id, "chat": {"id": int(CHAT_ID), "type": "private"}},
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Card lifecycle
+# ---------------------------------------------------------------------------
+
+def test_card_send_carries_video_hook_authenticity_source_and_score(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+
+    sent = bot.ensure_card()
+
+    assert sent == "item-1"
+    # Variant B is the card's video; Variant A follows as a second message.
+    videos = transport.of("sendVideo")
+    assert len(videos) == 2
+    caption = videos[0]["caption"]
+    assert "WHAT IS HIDDEN IN THIS GTA 6 SHOT?" in caption   # hook
+    assert "UNVERIFIED" in caption                            # authenticity tag
+    assert "youtube" in caption and "youtu.be/item-1" in caption   # source
+    assert "GamingBolt" in caption                            # creator
+    assert "0.500" in caption                                 # discovery score
+    assert "🅰 Variant A" in videos[1]["caption"]
+    # Three buttons, only on the card itself.
+    buttons = [b["callback_data"] for row in videos[0]["reply_markup"]["inline_keyboard"] for b in row]
+    assert buttons == ["a:ok:item-1", "a:no:item-1", "a:aonly:item-1"]
+    assert "reply_markup" not in videos[1]
+    # The item moved to awaiting_approval and the card is recorded.
+    assert db.get_item("item-1", db_path=tmp_db)["stage"] == "awaiting_approval"
+    state = telegram_bot.card_state(tmp_db)
+    assert state["item_id"] == "item-1" and state["mid"] == 101
+
+
+def test_approve_edits_the_same_card_clears_buttons_and_leaves_variant_to_the_scheduler(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    clock = Clock()
+    bot = make_bot(tmp_db, cfg, transport, clock)
+    bot.ensure_card()
+    mid = telegram_bot.card_state(tmp_db)["mid"]
+
+    bot.handle_update(tap("item-1", "ok", mid))
+
+    item = db.get_item("item-1", db_path=tmp_db)
+    assert item["stage"] == "approved"
+    assert item["approval_type"] == "approved"
+    assert item["chosen_variant"] is None       # the scheduler assigns A/B later, not the reviewer
+    assert item["ab_excluded"] == 0
+    # The one card was edited in place (not a new message) and its buttons were removed.
+    edits = transport.of("editMessageCaption")
+    assert len(edits) == 1
+    assert edits[0]["message_id"] == mid
+    assert edits[0]["reply_markup"] == {"inline_keyboard": []}
+    assert "✅ Approved" in edits[0]["caption"]
+    assert "✅ Approved" in [p for m, p in transport.calls if m == "answerCallbackQuery"][0]["text"]
+    assert telegram_bot.card_state(tmp_db) is None   # the slot is free for the next item
+
+
+def test_reject_marks_the_item_rejected_with_user_rejected(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.ensure_card()
+    mid = telegram_bot.card_state(tmp_db)["mid"]
+
+    bot.handle_update(tap("item-1", "no", mid))
+
+    item = db.get_item("item-1", db_path=tmp_db)
+    assert item["stage"] == "rejected"
+    assert item["rejection_reason"] == "user_rejected"
+    assert "❌ Rejected" in transport.of("editMessageCaption")[0]["caption"]
+    assert telegram_bot.card_state(tmp_db) is None
+
+
+def test_approve_a_only_pins_variant_a_and_excludes_it_from_the_ab_comparison(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.ensure_card()
+    mid = telegram_bot.card_state(tmp_db)["mid"]
+
+    bot.handle_update(tap("item-1", "aonly", mid))
+
+    item = db.get_item("item-1", db_path=tmp_db)
+    assert item["stage"] == "approved"
+    assert item["approval_type"] == "approved_a_only"
+    assert item["chosen_variant"] == "A"
+    assert item["ab_excluded"] == 1
+    with db.db(tmp_db) as conn:
+        logged = [r["message"] for r in conn.execute(
+            "SELECT message FROM stage_log WHERE item_id = 'item-1' AND stage = 'approval'"
+        ).fetchall()]
+    assert any("excluded from the A/B comparison" in m for m in logged)
+
+
+def test_a_click_on_an_old_card_does_nothing_and_says_so(tmp_db, tmp_path, cfg):
+    """Stale-button protection: a tap on a superseded message changes no state."""
+    make_item(tmp_db, tmp_path, "item-1", score=0.9)
+    make_item(tmp_db, tmp_path, "item-2", score=0.1)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.ensure_card()
+    old_mid = telegram_bot.card_state(tmp_db)["mid"]
+    bot.handle_update(tap("item-1", "ok", old_mid))         # decide the first one
+    bot.ensure_card()                                        # the second card is now the live one
+    new_mid = telegram_bot.card_state(tmp_db)["mid"]
+    assert new_mid != old_mid
+
+    before = db.get_item("item-2", db_path=tmp_db)
+    bot.handle_update(tap("item-2", "ok", old_mid))           # a tap on the OLD message
+
+    assert db.get_item("item-2", db_path=tmp_db) == before     # nothing changed
+    answers = [p["text"] for m, p in transport.calls if m == "answerCallbackQuery"]
+    assert answers[-1] == telegram_bot.STALE
+    assert telegram_bot.card_state(tmp_db)["item_id"] == "item-2"   # the live card is untouched
+
+
+def test_a_click_for_a_different_item_on_the_live_message_is_stale(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "item-1")
+    make_item(tmp_db, tmp_path, "item-2")
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.ensure_card()
+    mid = telegram_bot.card_state(tmp_db)["mid"]
+
+    assert bot.on_button("a:ok:item-2", mid) == telegram_bot.STALE
+    assert db.get_item("item-2", db_path=tmp_db)["stage"] == "rendered"
+
+
+def test_a_click_from_another_chat_is_ignored_entirely(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.ensure_card()
+    mid = telegram_bot.card_state(tmp_db)["mid"]
+    intruder = tap("item-1", "ok", mid)
+    intruder["callback_query"]["message"]["chat"]["id"] = 999999
+
+    bot.handle_update(intruder)
+
+    assert db.get_item("item-1", db_path=tmp_db)["stage"] == "awaiting_approval"
+    assert "answerCallbackQuery" not in transport.methods()
+
+
+# ---------------------------------------------------------------------------
+# One at a time
+# ---------------------------------------------------------------------------
+
+def test_strictly_one_item_at_a_time_in_score_order(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "low", score=0.10)
+    make_item(tmp_db, tmp_path, "high", score=0.90)
+    make_item(tmp_db, tmp_path, "mid", score=0.50)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+
+    assert bot.ensure_card() == "high"          # highest score first
+    assert bot.ensure_card() is None            # a card is open: nothing else is sent
+    assert bot.ensure_card() is None
+    assert len(transport.of("sendVideo")) == 2  # still only the first item's two messages
+
+    bot.handle_update(tap("high", "ok", telegram_bot.card_state(tmp_db)["mid"]))
+    assert bot.ensure_card() == "mid"           # only now does the next one go out
+    assert bot.ensure_card() is None
+    bot.handle_update(tap("mid", "no", telegram_bot.card_state(tmp_db)["mid"]))
+    assert bot.ensure_card() == "low"
+
+    assert db.get_item("low", db_path=tmp_db)["stage"] == "awaiting_approval"
+
+
+def test_a_card_sent_before_a_crash_is_shown_again_not_skipped(tmp_db, tmp_path, cfg):
+    """The bot died between the send and the tap: the open card's item is re-sent, not passed over."""
+    make_item(tmp_db, tmp_path, "crashed", score=0.9, stage="awaiting_approval")
+    make_item(tmp_db, tmp_path, "fresh", score=0.5)
+    telegram_bot.set_card_state(None, tmp_db)   # the card state was lost with the process
+    transport = FakeTransport()
+
+    assert make_bot(tmp_db, cfg, transport).ensure_card() == "crashed"
+
+
+def test_the_poll_offset_is_persisted_so_a_tap_is_never_re_delivered(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.ensure_card()
+    mid = telegram_bot.card_state(tmp_db)["mid"]
+    transport.updates = [[tap("item-1", "ok", mid)], []]
+
+    assert bot.poll_once(1) == 1
+    assert db.kv_get(telegram_bot.K_OFFSET, db_path=tmp_db) == "2"
+    assert bot.poll_once(1) == 0
+    assert transport.of("getUpdates")[-1]["offset"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Throttled edits
+# ---------------------------------------------------------------------------
+
+def test_edits_are_throttled_to_one_per_gap_and_the_latest_text_wins(tmp_db, cfg):
+    transport = FakeTransport()
+    clock = Clock()
+    editor = telegram_bot.Editor(transport, CHAT_ID, clock=clock, gap=2.5)
+
+    assert editor.edit(1, "text", "first", None) is True
+    assert editor.edit(1, "text", "second", None) is False   # inside the gap
+    assert editor.edit(1, "text", "third", None) is False
+    assert len(transport.of("editMessageText")) == 1
+
+    clock.now += 2.5
+    editor.flush()                                            # the newest pending text goes out
+    texts = [p["text"] for p in transport.of("editMessageText")]
+    assert texts == ["first", "third"]
+
+
+def test_a_button_tap_skips_the_gap_but_never_a_429_wait(tmp_db, cfg):
+    transport = FakeTransport()
+    clock = Clock()
+    editor = telegram_bot.Editor(transport, CHAT_ID, clock=clock, gap=2.5)
+    editor.edit(1, "text", "first", None)
+
+    assert editor.edit(1, "text", "tapped", None, now=True) is True   # a tap is answered at once
+
+    transport.raise_on["editMessageText"] = telegram_bot.TelegramError(
+        "editMessageText", 429, "Too Many Requests", retry_after=30
+    )
+    assert editor.edit(1, "text", "limited", None, now=True) is False
+    assert editor.blocked_until == clock.now + 30
+    transport.raise_on.clear()
+    assert editor.edit(1, "text", "still held", None, now=True) is False   # held even for a tap
+    clock.now += 30
+    assert editor.edit(1, "text", "after the wait", None, now=True) is True
+    assert transport.of("editMessageText")[-1]["text"] == "after the wait"
+
+
+# ---------------------------------------------------------------------------
+# Auto mode
+# ---------------------------------------------------------------------------
+
+def test_auto_mode_approves_a_good_item_without_touching_telegram(tmp_db, tmp_path, cfg):
+    cfg["approval"]["mode"] = "auto"
+    make_item(tmp_db, tmp_path, "good")
+    transport = FakeTransport()
+
+    result = telegram_bot.run_approval_stage(
+        cfg=cfg, db_path=tmp_db, bot=make_bot(tmp_db, cfg, transport), probe=lambda p: 20.0
+    )
+
+    assert result["mode"] == "auto"
+    assert result["approved"] == ["good"]
+    item = db.get_item("good", db_path=tmp_db)
+    assert item["stage"] == "approved"
+    assert item["approval_type"] == "auto_approved"
+    assert item["chosen_variant"] is None
+    assert transport.calls == []   # no Telegram call at all in auto mode
+
+
+def test_auto_mode_rejects_an_ungrounded_hook(tmp_db, tmp_path, cfg):
+    cfg["approval"]["mode"] = "auto"
+    make_item(tmp_db, tmp_path, "fallback", grounded=0)
+
+    telegram_bot.run_auto_approval(cfg=cfg, db_path=tmp_db, probe=lambda p: 20.0)
+
+    item = db.get_item("fallback", db_path=tmp_db)
+    assert item["stage"] == "rejected"
+    assert "not grounded" in item["rejection_reason"]
+
+
+def test_auto_mode_rejects_a_missing_render(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "norender", renders=False)
+    passed, why = telegram_bot.quality_gate(
+        db.get_item("norender", db_path=tmp_db), cfg=cfg, probe=lambda p: 20.0
+    )
+    assert passed is False
+    assert "render missing" in why
+
+
+def test_the_gate_caps_variant_a_but_lets_variant_b_be_longer_by_design(tmp_db, tmp_path, cfg):
+    """Variant B is a freeze-frame plus the cut (PLAN.md 7), so it is checked against A's headroom."""
+    item = make_item(tmp_db, tmp_path, "durations")
+    lengths = {item["render_a_path"]: 20.4, item["render_b_path"]: 23.1}
+
+    passed, why = telegram_bot.quality_gate(item, cfg=cfg, probe=lambda p: lengths[str(p)])
+    assert passed is True, why
+
+    lengths[item["render_a_path"]] = 25.0           # A itself over the 22s cap
+    passed, why = telegram_bot.quality_gate(item, cfg=cfg, probe=lambda p: lengths[str(p)])
+    assert passed is False and "variant A is 25.0s" in why
+
+    lengths[item["render_a_path"]] = 20.0
+    lengths[item["render_b_path"]] = 40.0           # B far beyond the freeze headroom
+    passed, why = telegram_bot.quality_gate(item, cfg=cfg, probe=lambda p: lengths[str(p)])
+    assert passed is False and "longer than A" in why
+
+
+def test_the_gate_fails_when_ffprobe_cannot_read_a_render(tmp_db, tmp_path, cfg):
+    item = make_item(tmp_db, tmp_path, "unreadable")
+    passed, why = telegram_bot.quality_gate(item, cfg=cfg, probe=lambda p: None)
+    assert passed is False and "ffprobe" in why
+
+
+# ---------------------------------------------------------------------------
+# Failure alerts
+# ---------------------------------------------------------------------------
+
+def test_failure_alerts_go_to_the_same_chat_and_the_same_failure_is_not_repeated(tmp_db, cfg):
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+
+    assert bot.alert("render failed for item-9", key="render:item-9") is True
+    assert bot.alert("render failed for item-9", key="render:item-9") is False   # inside the hour
+    assert bot.alert("a different failure", key="other") is True
+
+    sent = transport.of("sendMessage")
+    assert len(sent) == 2
+    assert all(p["chat_id"] == CHAT_ID for p in sent)
+    assert sent[0]["text"].startswith("🚨")
+
+
+def test_the_approval_stage_is_skipped_when_telegram_is_switched_off(tmp_db, cfg):
+    cfg["telegram"]["enabled"] = False
+    transport = FakeTransport()
+    result = telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=make_bot(tmp_db, cfg, transport))
+    assert result["skipped"] == "telegram.enabled is false"
+    assert transport.calls == []
+
+
+def test_one_runner_pass_sends_the_card_and_polls_once(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    transport.updates = [[]]
+
+    result = telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot, poll_timeout=1)
+
+    assert result == {"mode": "telegram", "card_sent": "item-1", "updates_handled": 0}
+    assert transport.methods().count("getUpdates") == 1

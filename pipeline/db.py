@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS items (
     render_b_path TEXT,
     chosen_variant TEXT,
     approval_type TEXT,
+    ab_excluded INTEGER DEFAULT 0,
     stage TEXT NOT NULL,
     error_stage TEXT,
     error_message TEXT,
@@ -109,6 +110,10 @@ CREATE TABLE IF NOT EXISTS posts (
     remote_container_id TEXT,
     remote_id TEXT,
     remote_url TEXT,
+    ab_excluded INTEGER DEFAULT 0,
+    attempt_count INTEGER DEFAULT 0,
+    publish_started_at TEXT,
+    caption_text TEXT,
     error_message TEXT,
     posted_at TEXT,
     created_at TEXT NOT NULL,
@@ -215,9 +220,20 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE items ADD COLUMN channel_id TEXT")
         if "authenticity" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN authenticity TEXT DEFAULT 'unverified'")
+        if "ab_excluded" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN ab_excluded INTEGER DEFAULT 0")
         post_cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "authenticity" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN authenticity TEXT DEFAULT 'unverified'")
+        # CP3 two-phase posting bookkeeping
+        for col, ddl in (
+            ("ab_excluded", "ALTER TABLE posts ADD COLUMN ab_excluded INTEGER DEFAULT 0"),
+            ("attempt_count", "ALTER TABLE posts ADD COLUMN attempt_count INTEGER DEFAULT 0"),
+            ("publish_started_at", "ALTER TABLE posts ADD COLUMN publish_started_at TEXT"),
+            ("caption_text", "ALTER TABLE posts ADD COLUMN caption_text TEXT"),
+        ):
+            if col not in post_cols:
+                conn.execute(ddl)
 
 
 # ---------------------------------------------------------------------------

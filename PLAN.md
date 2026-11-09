@@ -423,6 +423,96 @@ Per user requirements and review fixes:
 - **YouTube items**:
   `{hook_text}\n\nCredit: {author_name}\n.\n#gta6 #grandtheftauto #gta #gaming #rockstargames`
 
+Implemented as `posting.build_caption()`; `posting.caption_for_item()` prefers the caption the
+render stage already stored and falls back to the template. The caption is frozen onto each
+`posts` row (`posts.caption_text`) when the row is created, so a retry after a crash sends exactly
+the caption the first attempt did - which is also what the recent-media crash check matches on.
+Capped at Instagram's 2,200 characters.
+
+---
+
+## 9b. CP3 Implementation (Telegram approval + Meta posting)
+
+### Telegram approval card (`pipeline/telegram_bot.py`)
+- **One self-editing card per item, strictly one item at a time.** The open card is recorded in
+  `kv` under `telegram:card` as `{"mid", "item_id", "extra_mids"}`. `ensure_card()` returns
+  immediately while that key holds a card, so the next item is only sent after the current one is
+  decided. Items are offered highest `discovery_score` first, and an `awaiting_approval` item whose
+  card was lost with a crashed process is re-sent before any fresh item.
+- **What the card carries**: Variant B as the video message with the buttons, Variant A as a second
+  message without buttons, and in the caption the hook, the authenticity tag, the source + source
+  URL, the creator and the discovery score. A render over the Bot API's 50 MB limit degrades to a
+  text card rather than failing.
+- **Buttons**: `Approve` -> `approved` / `approval_type='approved'` with `chosen_variant` left NULL,
+  because the CP4 scheduler assigns A/B, not the reviewer. `Reject` -> `rejected` /
+  `rejection_reason='user_rejected'`. `Approve A only` -> `approved` /
+  `approval_type='approved_a_only'`, `chosen_variant='A'` and `items.ab_excluded=1`, logged to
+  `stage_log` and excluded from the A/B comparison.
+- **Stale-button protection**: a click only counts when its `message_id` equals the recorded `mid`
+  AND its item id equals the recorded `item_id`. Anything else answers "This card is out of date"
+  and changes nothing. A click from any chat other than `TELEGRAM_CHAT_ID` is ignored entirely.
+- **Throttled edits**: `Editor` sends at most one edit per `telegram.edit_throttle_gap_s` per
+  message, the latest text winning; a button tap skips that gap but never a 429's `retry_after`,
+  which holds every edit back and keeps the pending text.
+- **The long poll runs inside the runner's loop**: `run_approval_stage()` does one `ensure_card()`,
+  one `getUpdates` round and one `editor.flush()` per cycle. The `getUpdates` offset is persisted in
+  `kv` under `telegram:offset` before each update is handled, so a crash skips an update and never
+  repeats one.
+- **`approval.mode: auto`** skips Telegram entirely and applies `approval.auto_quality_gate`:
+  both renders present, hook present and grounded, and ffprobe readable within the duration caps.
+  A pass becomes `approved` / `auto_approved`; a failure becomes `rejected` with the reason.
+- **Failure-only alerts** go to the same chat through `ApprovalBot.alert(text, key=...)`; the same
+  `key` is not re-sent within an hour, so one broken item cannot flood the chat.
+
+### Meta posting (`pipeline/posting.py`)
+- Instagram Reels by **resumable upload from the local file**: `POST /{ig-user-id}/media` with
+  `upload_type=resumable`, then the bytes to `rupload.facebook.com/ig-api-upload/{ver}/{container}`,
+  then `GET /{container}?fields=status_code` until `FINISHED`, then `POST /{ig-user-id}/media_publish`.
+- Facebook Page Reels by the **`video_reels` start / upload / finish** flow:
+  `upload_phase=start` -> the bytes to `rupload.facebook.com/video-upload/{ver}/{video-id}` ->
+  `upload_phase=finish` with `video_state=PUBLISHED`.
+- **Status order is exactly** `uploading -> container_ready -> publishing -> live`. The container /
+  video id is written to `posts.remote_container_id` *before* any byte is uploaded, and the row is
+  moved to `publishing` with `publish_started_at` *before* the publish call is issued.
+- **Crash recovery in `publishing`** (`remote_state()` / `settle()`), called from the runner before
+  anything new is published:
+  - `published` -> record the remote id / permalink and mark `live`. For Instagram that is a
+    container reading `PUBLISHED`, or a caption-and-time match in the account's recent media; for
+    Facebook, `publishing_phase.publish_status == published` or `video_status in (ready, published)`.
+  - `not_published` -> only on positive proof that publishing is impossible: the container is
+    `ERROR` / `EXPIRED`, the Facebook video is `error` / `upload_failed` / `expired`, or no container
+    id was ever saved. Only then is a fresh container started.
+  - `unknown` -> **mark `failed` and alert, never publish again.** A container that merely reads
+    `FINISHED` with no matching recent media counts as unknown, because it cannot tell a publish
+    that never happened from one whose media has not yet surfaced in `/media`.
+- **Partial platform retry**: a row already `live` is skipped, so a failed Facebook row retries
+  Facebook alone. The item becomes `posted` only when *every* enabled platform row is `live`.
+- **Dry run** (`app.dry_run`, true by default): `posting.dry_run_mode: plan_only` (the default)
+  sends no write request at all - the whole state machine runs, every request that would go out is
+  logged and written to `media/dry_run/post_<id>_<platform>.json` with every token redacted, and the
+  row ends `dry_run`. `up_to_publish` additionally creates the real container and uploads the real
+  bytes and skips only the publish call; that touches the live account, so it is opt-in. A dry run
+  never advances the item to `posted`, so the real post still happens once dry run is switched off.
+- **Pacing, retries and limits**: every request waits `posting.meta_min_gap_seconds` after the
+  previous one, the moment being kept in `kv` under `meta_api:next_free` so the gap holds across
+  processes. 5xx and network errors retry with capped exponential backoff
+  (`max_retries`, `retry_backoff_s`, `retry_backoff_cap_s`); a row is given up on after
+  `max_post_attempts`. An HTTP 429 or a Graph block code (4, 17, 32, 613, 80004) pauses the whole
+  `meta_graph` source for `posting.rate_limit_pause_hours` through `rate_limit` and alerts Telegram;
+  the pause is checked before every posting pass.
+- **Secret hygiene**: `posting.redact()` strips `access_token=...` and the token values themselves
+  out of every message that reaches a log, the database, a dry-run plan or Telegram;
+  `telegram_bot.redact()` does the same for the bot token.
+
+### The laptop dry run (`scripts/cp3_dry_run.py`)
+One command, no prompts: `python scripts/cp3_dry_run.py`. It sends one real Telegram card (using the
+highest-scoring existing render, or a synthetic 1080x1920 pair built with ffmpeg when the database
+holds none), validates the Meta tokens with read-only GETs (`/debug_token`, the IG user, the IG
+publishing limit, the Page) and then runs the real posting flow in dry-run mode. It cannot publish:
+`app.dry_run` and `plan_only` are forced for the process, a `GuardedTransport` raises on any
+non-GET request and on any URL or body naming a write endpoint, and the posting flow is given a
+client built around that guarded transport. Exit code 0 when every check passed, 1 otherwise.
+
 ---
 
 ## 10. Scheduling & Multi-Armed Bandit Learning (CP4)
@@ -641,6 +731,21 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 30. **Safe Area**: x 90-990, y 250-1440. Captions centred at y 1300 (ink ≈ 1258-1340); hook centred in band y 280-560 (2-line ink ≈ 328-510).
 31. **Lazy ML Imports**: `faster_whisper`, `kokoro_onnx` and `soundfile` are imported inside the functions that use them, so the pipeline and the zero-network tests import without the ML stack.
 32. **Config Key Fix**: `cut.select_best_cut_window` now reads `min_duration` / `max_duration` / `target_duration` (the keys in config.yaml), falling back to the old `*_seconds` names.
+33. **A `FINISHED` Container Counts as Unknown (CP3)**: on resume in `publishing`, only `ERROR` / `EXPIRED` (publishing impossible) lets a fresh container be started. A container reading `FINISHED` with no matching recent media is treated as *unknown* and the row is failed and alerted, never re-published: Instagram's `/media` list is eventually consistent, so "FINISHED and not in `/media`" cannot distinguish a publish that never happened from one whose media has not yet appeared. A duplicate public post is worse than a post that needs one manual retry.
+34. **Recent-Media Matching by Caption and Time**: Graph gives no way to ask "which media came from container X", so a published media is identified by its caption's first line matching `posts.caption_text` and its timestamp being at or after `posts.publish_started_at`. The caption is therefore frozen onto the row when the row is created, not rebuilt at publish time.
+35. **Dry Run Defaults to `plan_only` (CP3)**: "everything except the publish call" was read conservatively. Creating a container and uploading bytes are real writes against the live account that leave unpublished containers behind, so the default dry run sends nothing and instead walks the whole state machine while writing a redacted plan of every request. `posting.dry_run_mode: up_to_publish` gives the literal reading (real container, real upload, no publish) as a one-line opt-in.
+36. **A Dry Run Never Advances an Item to `posted`**: `run_posting_for_item` marks the item `posted` only when every platform row is `live`. All-`dry_run` leaves the stage alone, otherwise flipping `dry_run: false` would find the item already "posted" and it would never actually go out.
+37. **`max_duration_seconds` Applies to Variant A Only (CP3)**: PLAN.md section 7 / call #25 make Variant B a freeze-frame plus the cut (approximately 23 s), which the 22.0 s gate would have rejected on every item. The gate now caps Variant A at `max_duration_seconds` and allows Variant B up to `approval.auto_quality_gate.max_b_extra_seconds` (8.0 s) longer than A.
+38. **The Reviewer Does Not Pick the Variant**: `Approve` leaves `chosen_variant` NULL for the CP4 scheduler's bandit to assign. Only `Approve A only` pins a variant, and it sets `items.ab_excluded = 1` so that item never enters the A/B comparison.
+39. **New Columns for CP3**: `items.ab_excluded`, and on `posts`: `ab_excluded`, `attempt_count`, `publish_started_at` and `caption_text`. All added with `ALTER TABLE` migrations in `db.init_db`, so an existing `pipeline.db` upgrades in place.
+40. **Stale Protection Keys on the Message Id and the Item Id**: both the recorded `mid` and the recorded `item_id` must match the click. The message id alone would let a tap on a re-sent card decide the wrong item; the item id alone would let an old message decide a current item.
+41. **Strict One-at-a-Time Enforced in `kv`, Not in Memory**: the open card lives in the database, so a restarted runner still refuses to send a second card and an item whose decision was lost is re-offered rather than skipped.
+42. **The `getUpdates` Offset Is Saved Before the Update Is Handled**: a crash mid-handling therefore skips that tap instead of replaying it. Replaying a decision is worse than losing one, which the user can simply tap again.
+43. **Telegram Alerts Are Deduplicated for an Hour per Key**: a failure that recurs every cycle would otherwise fill the approval chat and bury the cards.
+44. **Meta Request Pacing Lives in the Database**: `kv:meta_api:next_free` keeps `posting.meta_min_gap_seconds` between any two Meta requests across processes, so the publisher, the bot and the dry-run script cannot collectively trip the limit.
+45. **Rate-Limit Pause Is Source-Wide**: a 429 or block pauses the whole `meta_graph` source for `posting.rate_limit_pause_hours` (3 h), not just the failing row, and the row is left at its current status rather than failed, so it resumes cleanly when the pause lifts.
+46. **Facebook Can Use Its Own Page Token**: `FB_PAGE_ACCESS_TOKEN` is read first and falls back to `IG_ACCESS_TOKEN`, since Page Reels need a PAGE token with `pages_manage_posts` while Instagram publishing needs `instagram_content_publish`; one token often covers both, but not always.
+47. **Graph API v25.0 Pinned in Config**: `posting.api_version`, `posting.graph_base` and `posting.rupload_base` are config keys, so a version bump is an edit rather than a code change.
 
 ---
 
@@ -696,5 +801,6 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 | **CP 0** | Plan approval ("go") | Chat response | Completed. |
 | **CP 1** | None (public YouTube) | N/A | **Re-Proof Completed & Passing.** |
 | **CP 2** | `GEMINI_API_KEY` | `.env` | Needed for hook generation and VO scripting. |
-| **CP 3** | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IG_USER_ID`, `IG_ACCESS_TOKEN`, `FB_PAGE_ID` | `.env` | Needed for Telegram card & social publishing. |
+| **CP 3** | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IG_USER_ID`, `IG_ACCESS_TOKEN`, `FB_PAGE_ID`, optionally `FB_PAGE_ACCESS_TOKEN` | `.env` | **Built and tested (mocked).** Keys needed to run `python scripts/cp3_dry_run.py` on the laptop. |
+| **CP 3** | Explicit "go" before the first live post | Chat response | Pending. `app.dry_run: true` stays until then. |
 | **CP 4** | `HEALTHCHECK_URL` (optional), `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET` (before 19 Nov) | `.env` | Needed for dead-man switch and Twitch Helix. |
