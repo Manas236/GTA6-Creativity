@@ -73,11 +73,46 @@ render:
   width: 1080
   height: 1920
   fps: 30
-  font_path: "assets/fonts/Montserrat-Bold.ttf"
+  audio_sample_rate: 48000
+  audio_channels: 2
+  audio_bitrate: "192k"
+  fonts_dir: "assets/fonts"
+  font_path: "assets/fonts/Montserrat-Black.ttf"
+  font_name: "Montserrat Black" # static Black (900) face; nameID 1 of Montserrat-Black.ttf
   whisper_model: "base.en"
   target_lufs: -14.0
-  ducking_attenuation_db: -14.0
   voiceover_target_duration_s: 4.5
+  # Variant B freeze-frame format: first frame held for VO duration + pad, then the cut plays at full level.
+  freeze_pad_s: 0.3
+  end_fade_s: 0.25 # audio fade-out at the very end of A and B
+  av_duration_tolerance_s: 0.1 # verification fails if |audio - video| stream duration exceeds this
+  # Instagram-safe text area (pixels on the 1080x1920 canvas).
+  safe_area:
+    x_min: 90
+    x_max: 990
+    y_min: 250
+    y_max: 1440
+  # libass sizes the font so (winAscent + winDescent) = Fontsize; for Montserrat that gives
+  # cap height = 0.448 x Fontsize. 138 -> ~62 px caps, 150 -> ~67 px caps (measured).
+  caption:
+    font_size: 138
+    outline: 7
+    shadow: 3
+    max_words: 3
+    max_gap_s: 0.6
+    center_y: 1300
+    color: "&H00FFFFFF" # white
+    highlight_color: "&H0000FFFF" # yellow (ASS is &HAABBGGRR)
+  hook:
+    font_size: 150
+    min_font_size: 96 # only used if a hook cannot fit 2 lines inside the safe width
+    outline: 8
+    shadow: 3
+    max_lines: 2
+    band_top_y: 280
+    band_bottom_y: 560
+    line_spacing: 1.45 # line pitch as a multiple of cap height
+    color: "&H0000FFFF" # yellow
 
 approval:
   mode: "telegram" # 'telegram' or 'auto'

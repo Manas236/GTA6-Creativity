@@ -106,3 +106,43 @@ def test_cut_level_dedupe_detects_duplicate(tmp_db: Path):
 
     is_dup = dedupe.check_consecutive_match(cand_hashes, prior_hashes, consecutive_n=3, hamming_threshold=8)
     assert is_dup is True
+
+
+# ----------------------------------------------------------------------------- end snapping
+
+def _w(word, s, e):
+    return {"word": word, "start": s, "end": e}
+
+
+def test_snap_end_picks_word_pause():
+    """Proposed end 20.0 falls mid-word; the 19.1-19.5 s gap (>= 0.25 s) must be chosen."""
+    words = [_w("A", 17.0, 18.0), _w("B", 18.1, 19.1), _w("C", 19.5, 20.4), _w("D", 20.5, 21.5)]
+    end = cut.snap_end_to_pause(0.0, 20.0, words=words, min_dur=18.0, max_dur=20.0)
+    assert 19.2 <= end < 19.5
+
+
+def test_snap_end_ignores_gaps_shorter_than_min_gap():
+    words = [_w("A", 17.0, 19.0), _w("B", 19.1, 19.9), _w("C", 20.3, 21.0)]  # 0.1 s gap, then 0.4 s gap
+    end = cut.snap_end_to_pause(0.0, 20.0, words=words, min_dur=18.0, max_dur=22.0)
+    assert 20.0 <= end < 20.3
+
+
+def test_snap_end_uses_trailing_silence_after_last_word():
+    words = [_w("A", 10.0, 18.5)]
+    end = cut.snap_end_to_pause(0.0, 20.0, words=words, min_dur=18.0, max_dur=22.0)
+    assert end == pytest.approx(20.0)
+
+
+def test_snap_end_falls_back_to_loudness_trough():
+    loud = [(t / 10, -20.0) for t in range(150, 230)]
+    loud = [(t, -45.0 if abs(t - 18.7) < 0.15 else v) for t, v in loud]
+    end = cut.snap_end_to_pause(0.0, 20.0, words=None, loudness=loud, min_dur=18.0, max_dur=22.0)
+    assert end == pytest.approx(18.7, abs=0.15)
+
+
+def test_snap_end_respects_bounds_and_offset_start():
+    words = [_w("A", 100.0, 125.0)]  # speech covers the whole window: no pause
+    end = cut.snap_end_to_pause(100.0, 125.0, words=words, min_dur=18.0, max_dur=22.0)
+    assert 118.0 <= end <= 122.0
+    end = cut.snap_end_to_pause(0.0, 20.0, min_dur=18.0, max_dur=22.0, hard_max_end=19.0)
+    assert 18.0 <= end <= 19.0

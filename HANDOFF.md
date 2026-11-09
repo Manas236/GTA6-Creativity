@@ -29,7 +29,7 @@
    pip install -r requirements.txt
    ```
 3. **External Binaries**:
-   - Ensure `ffmpeg` and `ffprobe` are installed and accessible on your `PATH`.
+   - Ensure `ffmpeg` and `ffprobe` are installed and accessible on your `PATH`, and that ffmpeg is built with libass (`ffmpeg -filters` lists `ass`).
 4. **Configuration & Secrets**:
    - Copy `.env.example` to `.env`:
      ```bash
@@ -49,15 +49,18 @@ The remote repository is **public** (`https://github.com/Manas236/GTA6-Creativit
 
 ---
 
-## 4. Open Render Issues (from Review of CP2 Renders)
-*Verbatim intent from review:*
-1. **Caption and hook text is too thin and too small**:
-   - Research standard typography for vertical short-form clips. Text in these formats is noticeably larger, bolder, and heavier. Update ASS subtitle styles / font rendering to match that standard.
-2. **Audio cuts off at the end of the clip**:
-   - Investigate the cut/muxing logic in `pipeline/render.py` (e.g. audio stream trimming, pad filters, or ffmpeg duration flags) and resolve the cutoff.
-3. **Variant B narration freeze frame**:
-   - In Variant B, the background video should **PAUSE** (freeze frame) while the narrator speaks the line, then resume when the narration finishes. Currently, the background video continues playing under the voiceover.
-4. *Content selection was good; keep it.*
+## 4. CP2 Render Issues: FIXED (render-fix pass, see PLAN.md §7 and Calls I Made #21-32)
+> **Laptop: run `git pull` on `main` before continuing** (new font file, config keys, render code and tests).
+
+1. **Variant B audio died after the VO** (3.1 s audio in a 20 s video; sidechaincompress ended with the VO): **FIXED.** Ducking removed. B is now freeze-frame: first frame held for VO + 0.3 s with VO only, then the cut with original audio at full level. B = freeze + cut (≈ 23 s).
+2. **Variant A audio stopped dead at 20.0 s**: **FIXED.** Cut END snapped to a ≥ 0.25 s whisper word gap or ebur128 trough within 18-22 s (18 s → cut length at render time), plus a 0.25 s fade-out.
+3. **Text too small and thin**: **FIXED.** Static Montserrat Black (OFL) in `assets/fonts/`; captions 62 px caps (Fontsize 138, outline 7), hook 68 px caps (Fontsize 150, outline 8, max 2 lines in 900 px). A test confirms libass renders the Black face.
+4. **Text in Instagram's covered zones**: **FIXED.** Safe area x 90-990, y 250-1440; captions centred at y 1300, hook in the band y 280-560.
+5. **59.94 fps / 96 kHz output**: **FIXED.** 30 fps and 48 kHz stereo AAC.
+6. **Guard**: every render is ffprobe-verified and FAILS if audio/video stream durations differ by > 0.1 s or fps / sample rate / channels / resolution differ from config.
+7. *Content selection was good; kept.*
+
+**Verification status:** no sample pack is in the public repo, so the fixes were verified on a synthetic 20 s 16:9 clip (`samples/synthetic/contact_sheet.png`, `render_report.json`). **Real-clip verification must still run on the laptop:** `python scripts/render_check.py` (reads `samples/cp2/<id>/cut.mp4, vo.wav, item.json`, writes `A_v2.mp4`, `B_v2.mp4`, `contact_sheet.png`). If the laptop's `item.json` uses different key names than the ones listed at the top of that script, adjust `load_item`.
 
 ---
 

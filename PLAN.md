@@ -15,7 +15,7 @@ This pipeline automates the end-to-end lifecycle of short vertical videos (Reels
    - Hook burned via ASS subtitle file (not drawtext) to support line wrapping and special characters.
    - Transcribe word-level timestamps via local `faster-whisper`. If no speech is detected, Variant A displays the hook only.
    - Synthesize a punchy 3–6s voiceover line near the start via local `Kokoro TTS`.
-   - Render two 1080x1920 (9:16) variants (**Variant A**: clip + hook + captions; **Variant B**: A + ducked original audio during VO + Kokoro voiceover + combined VO/speech captions).
+   - Render two 1080x1920 (9:16), 30 fps, 48 kHz stereo AAC variants (**Variant A**: clip + hook + captions; **Variant B**: freeze-frame format: the cut's first frame held while only the Kokoro VO plays, then the cut plays with its original audio at full level, with VO captions then speech captions). No ducking.
 6. **Approve & Schedule**:
    - Single config setting: `approval.mode: telegram | auto`.
    - **Telegram Approval**: Single self-editing status card with `Approve`, `Reject`, and `Approve A only` buttons. ("A only" logs the item as A-only and excludes it from the A/B comparison).
@@ -60,7 +60,7 @@ Creativity/
 │   ├── cut.py                # Stage 4: Audio loudness peaks & scene cut window selection + cut dedupe
 │   ├── hooks.py              # Stage 5: Grounded Gemini hook generation & grounding check
 │   ├── voiceover.py          # Stage 6: 3-6s Gemini VO script & local Kokoro TTS synthesis
-│   ├── render.py             # Stage 7: ffmpeg 9:16 compositing, ASS captions & hook, asplit ducking
+│   ├── render.py             # Stage 7: ffmpeg 9:16 compositing, ASS captions & hook, B freeze-frame VO, ffprobe guard
 │   ├── telegram_bot.py       # Stage 8: Single self-editing Telegram approval & alert card
 │   ├── posting.py            # Stage 9: Two-phase Meta Graph API Reel uploader (IG + FB)
 │   ├── scheduler.py          # Stage 10: 2 daily slots, A/B bandit allocator, healthchecks ping
@@ -68,7 +68,7 @@ Creativity/
 │   ├── cleanup.py            # Stage 12: Disk retention manager (source, render, rejected/failed purge)
 │   └── runner.py             # Single long-running orchestrator with stale-lock detection
 ├── assets/
-│   └── fonts/                # Bundled open-source fonts (Montserrat-Bold.ttf)
+│   └── fonts/                # Bundled OFL fonts (Montserrat-Black.ttf, Montserrat-Bold.ttf, OFL.txt)
 ├── media/                    # Local storage (gitignored)
 │   ├── downloads/            # Source media (purged immediately post-render)
 │   ├── cuts/                 # 20s cropped clips
@@ -83,7 +83,7 @@ Creativity/
     ├── test_dedupe.py        # 1 fps black-bar crop hash collision & consecutive frame match
     ├── test_cut.py           # Audio peak + scene density scoring, boundary snap, cut dedupe
     ├── test_hooks.py         # Hook grounding check, fallback to question hook, style extraction
-    ├── test_voiceover.py     # 3-6s TTS generation, audio timing, ducking asplit parameters
+    ├── test_voiceover.py     # 3-6s TTS generation (Kokoro mocked)
     ├── test_render.py        # ffmpeg filtergraph syntax, ASS subtitle & hook formatting
     ├── test_telegram.py      # Self-editing card, Approve / Reject / Approve A only buttons
     ├── test_posting.py       # Two-phase upload flow, remote inspection on resume, partial FB retry
@@ -347,31 +347,38 @@ Per user requirements and review fixes:
 
 ## 7. Render Layout & Audio Engineering
 
-### Canvas Layout (1080x1920, 9:16)
-- **Background Layer**: Source video scaled to cover 1080x1920, cropped, blurred with `boxblur=25:25`, and darkened by -22% brightness.
-- **Foreground Layer**: Source video centered vertically.
-  - A standard 16:9 widescreen video at 1080px wide is exactly **607.5px (608px) tall** ($1080 \times 9 / 16$).
-  - Vertical position: $Y = (1920 - 608) / 2 = 656\text{px}$.
-- **Hook Title Overlay**:
-  - Embedded inside the **ASS subtitle file** (not `drawtext`) with `\pos(540, 240)` and text alignment, avoiding apostrophe and colon escaping bugs and ensuring auto-wrapping.
-- **Word-by-Word Highlighted Captions**:
-  - Transcribed by `faster-whisper`.
-  - Positioned at $Y \approx 1540\text{px}$ in the ASS file.
-  - Active word highlighted in yellow/cyan (`{\c&H00FFFF&}`), inactive words in white (`{\c&HFFFFFF&}`).
-  - **No speech fallback**: If whisper finds no speech (music/gameplay only), Variant A displays the hook only.
+*Revised after the CP2 render review (all numbers live in `config.yaml` → `render:`).*
 
-### Voiceover & Audio Ducking (Variant B)
-- **VO Script**: A single punchy line of **3–6 seconds** near the start, written by Gemini based on grounded clip action.
-- **Kokoro TTS**: Generates local voiceover WAV (`am_adam` or `af_heart`).
-- **Audio Ducking**:
-  - Split TTS stream using `asplit`: one stream feeds the sidechain compressor input, the other mixes into the output.
-  - Original audio is ducked by $-14\text{dB}$ only while the TTS line plays, returning to full volume immediately afterwards:
-    ```
-    [1:a]asplit=2[vo_duck][vo_mix];
-    [0:a][vo_duck]sidechaincompress=threshold=0.08:ratio=8:attack=40:release=350[ducked];
-    [ducked][vo_mix]amix=inputs=2:duration=first:dropout_transition=2[a_out]
-    ```
-- **Variant B Captions**: The VO line's words (timestamps from whisper run on the TTS wav) followed by the original speech captions.
+### Output Format (verified on every render)
+- 1080x1920, **30 fps** (`fps=30` on the composite), H.264 yuv420p.
+- Audio: **48 kHz stereo AAC** 192k. `loudnorm` (I=-14, LRA=11, TP=-1.5) is followed by `aresample=48000` (loudnorm runs internally at 192 kHz, which is why CP2 shipped 96 kHz).
+- Audio is padded/trimmed to the exact sample count of the video (`apad=whole_len`, `atrim=end_sample`); video is trimmed by frame count (`trim=end_frame`).
+- **0.25 s audio fade-out** (`afade=t=out`) at the very end of A and B.
+- **Fail-closed verification** (`render.verify_render`): ffprobe each output; the render FAILS if |audio stream duration - video stream duration| > 0.1 s, or fps / sample rate / channels / resolution differ from config, or the length differs from the expected length. Both `render_variant_a` and `render_variant_b` call it before reporting success.
+
+### Canvas Layout (1080x1920, 9:16)
+- **Background Layer**: Source video scaled to cover, cropped, blurred (`boxblur=8:8` at 360x640, upscaled), darkened by -22% brightness.
+- **Foreground Layer**: Source video centred; a 16:9 source is 1080x608 at y = 656-1264.
+- **Instagram safe area**: x 90-990, y 250-1440 (`render.safe_area`). Instagram's own UI covers the top band and everything below ~1440.
+- **Font**: static **Montserrat Black** (`assets/fonts/Montserrat-Black.ttf`, OFL in `assets/fonts/OFL.txt`), referenced as `Montserrat Black` (its nameID 1). A test rasterises the same glyphs with the TTF directly and checks libass's ink matches the Black face (and is >1.2x the Bold face), so a silent fallback fails CI.
+- **libass sizing**: libass scales the face so usWinAscent + usWinDescent (1109 + 453 units) = Fontsize, so cap height = 700/1562 = **0.448 x Fontsize** at PlayRes 1080x1920.
+- **Hook**: Fontsize 150 → **68 px caps measured**; yellow `&H0000FFFF`, black outline 8, shadow 3. Wrapped by measured glyph widths into **max 2 lines** inside the 900 px safe width (minus outline+shadow); a hook that cannot fit 2 lines is shrunk just enough (logged when below `min_font_size` 96). Lines are separate `\an5\pos` events centred in the band y 280-560 (line pitch 1.45 x cap height). Shown for the whole video (A and B).
+- **Captions**: 1-3 words per chunk (chunk also breaks on a >0.6 s gap or if it would exceed the safe width), Fontsize 138 → **62 px caps measured**; white with yellow active word, black outline 7, shadow 3; `\an5\pos(540,1300)` (≈68% down, ink y≈1258-1340, never below 1440).
+- **No speech fallback**: if whisper finds no speech, Variant A shows the hook only.
+
+### Cut End Snapping (Variant A audio cut-off fix)
+- `cut.snap_end_to_pause`: the END is snapped like the start: (1) a whisper word gap ≥ 0.25 s inside [start+18, start+22] (end placed in the gap, ≥0.1 s after the last word, closest to the proposed end); else (2) the ebur128 momentary-loudness trough (3-point smoothed, ties within 1 LU → closest to proposed); else (3) the proposed end.
+- Cut stage: loudness trough on the source (no transcript yet). Render stage: `render.snap_render_end` refines inside the existing cut with whisper words (bounds 18 s → cut length, e.g. 18-20 s for a fixed 20 s cut), falling back to the cut's loudness trough.
+
+### Variant B: Freeze-Frame Voiceover (replaces ducking)
+- **VO Script**: one punchy 3-6 s line (Gemini, grounded); **Kokoro TTS** (`am_adam`).
+- **Video**: the cut's FIRST frame is held as a still (`tpad=start=N:start_mode=clone`) for `freeze = VO duration + 0.3 s` (rounded up to a whole frame), then the cut plays from its start.
+- **Audio**: VO only during the freeze (padded with silence to exactly the freeze), then the cut's original audio at full level (`concat`), then the shared loudnorm/48 kHz/fade tail. No sidechaincompress/amix (sidechaincompress ended at its shortest input, which cut CP2's B audio to 3.1 s).
+- **Length**: B = freeze + cut (≈ 23 s for a 20 s cut), intended.
+- **Captions**: VO words (whisper on the VO wav, else evenly spread script words) during the freeze, then the cut's speech captions offset by the freeze.
+
+### Verification Script
+- `python scripts/render_check.py` renders A_v2/B_v2 for every `samples/cp2/<id>/` (cut.mp4, vo.wav, item.json) or, if no pack exists, a synthetic 20 s clip; writes `contact_sheet.png` (A @1 s, B mid-freeze, B freeze+2 s, A last 0.5 s, plus A/B waveforms) and `render_report.json`, prints the ffprobe table and measured cap heights, exits non-zero on any failure.
 
 ---
 
@@ -502,11 +509,46 @@ render:
   width: 1080
   height: 1920
   fps: 30
-  font_path: "assets/fonts/Montserrat-Bold.ttf"
+  audio_sample_rate: 48000
+  audio_channels: 2
+  audio_bitrate: "192k"
+  fonts_dir: "assets/fonts"
+  font_path: "assets/fonts/Montserrat-Black.ttf"
+  font_name: "Montserrat Black" # static Black (900) face; nameID 1 of Montserrat-Black.ttf
   whisper_model: "base.en"
   target_lufs: -14.0
-  ducking_attenuation_db: -14.0
   voiceover_target_duration_s: 4.5
+  # Variant B freeze-frame format: first frame held for VO duration + pad, then the cut plays at full level.
+  freeze_pad_s: 0.3
+  end_fade_s: 0.25 # audio fade-out at the very end of A and B
+  av_duration_tolerance_s: 0.1 # verification fails if |audio - video| stream duration exceeds this
+  # Instagram-safe text area (pixels on the 1080x1920 canvas).
+  safe_area:
+    x_min: 90
+    x_max: 990
+    y_min: 250
+    y_max: 1440
+  # libass sizes the font so (winAscent + winDescent) = Fontsize; for Montserrat that gives
+  # cap height = 0.448 x Fontsize. 138 -> ~62 px caps, 150 -> ~67 px caps (measured).
+  caption:
+    font_size: 138
+    outline: 7
+    shadow: 3
+    max_words: 3
+    max_gap_s: 0.6
+    center_y: 1300
+    color: "&H00FFFFFF" # white
+    highlight_color: "&H0000FFFF" # yellow (ASS is &HAABBGGRR)
+  hook:
+    font_size: 150
+    min_font_size: 96 # only used if a hook cannot fit 2 lines inside the safe width
+    outline: 8
+    shadow: 3
+    max_lines: 2
+    band_top_y: 280
+    band_bottom_y: 560
+    line_spacing: 1.45 # line pitch as a multiple of cap height
+    color: "&H0000FFFF" # yellow
 
 approval:
   mode: "telegram" # 'telegram' or 'auto'
@@ -581,12 +623,24 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 12. **Target Cut Duration Range**: Hard-bounded between 18.0s and 22.0s with a 20.0s target window.
 13. **YouTube Query Duration Ceiling**: Capped search results at 600s (10 minutes) to avoid downloading multi-hour livestreams.
 14. **Local Whisper Model**: Selected `base.en` as default for sub-second CPU transcription latency while retaining high word-timestamp accuracy.
-15. **Voiceover Line**: 3–6s via local Kokoro TTS near video start with -14 dB audio ducking.
-16. **Font Choice**: Bundled open-source `Montserrat-Bold.ttf` for high vertical readability.
+15. **Voiceover Line**: 3–6s via local Kokoro TTS, played over a freeze of the cut's first frame (freeze = VO + 0.3 s); no ducking (superseded the CP2 -14 dB sidechain design).
+16. **Font Choice**: Static `Montserrat-Black.ttf` (weight 900, OFL) from JulietaUla/Montserrat `fonts/ttf/`, referenced as `Montserrat Black`; `Montserrat-Bold.ttf` kept only for script labels.
 17. **Audio Loudness Target**: Standardized at $-14.0\text{ LUFS}$ per Instagram and Facebook Reels ingest specs.
 18. **Ready Buffer Size**: Fixed at 6 ready rendered items to prevent unbounded disk usage and conserve Gemini API calls.
 19. **Bandit Exploration Floor**: Set minimum exploration floor at 20% for each variant to guarantee ongoing statistical validation.
 20. **Failed Media Retention**: Set retention for rejected and failed item media at 3 days before disk purge.
+21. **Output Format**: 30 fps (`fps=30` on the composite) and 48 kHz stereo AAC 192k (`aresample=48000` after loudnorm).
+22. **A/V Verification Tolerance**: render FAILS if audio and video stream durations differ by > 0.1 s, or fps / sample rate / channels / resolution / expected length differ from config.
+23. **End Snap**: word gap ≥ 0.25 s, else ebur128 trough, within 18-22 s (render stage: 18 s → cut length); end placed ≥ 0.1 s after the last word, ≤ 0.4 s into the gap.
+24. **End Fade**: 0.25 s audio fade-out at the very end of A and B.
+25. **Freeze Pad**: Variant B freeze = VO duration + 0.3 s, rounded up to a whole 1/30 s frame. B length = freeze + cut (≈ 23 s).
+26. **Caption Size**: ASS Fontsize 138 → 62 px caps measured (target 60-65). The brief's "Fontsize 88-92" estimate would give only ~40 px with this font, because libass scales Montserrat by its win ascent+descent (cap = 0.448 x Fontsize); the measured pixel target was used.
+27. **Hook Size**: ASS Fontsize 150 → 68 px caps measured (target 65-70); max 2 lines in the 900 px safe width; shrinks only when a hook cannot fit (e.g. a 43-character hook → Fontsize 91). Typical 4-6 word hooks fit at full size.
+28. **Outlines / Shadow**: captions outline 7, hook outline 8, shadow 3 on both (semi-transparent black).
+29. **Caption Chunking**: 1-3 words; new chunk on > 0.6 s gap or if the chunk would exceed the safe width.
+30. **Safe Area**: x 90-990, y 250-1440. Captions centred at y 1300 (ink ≈ 1258-1340); hook centred in band y 280-560 (2-line ink ≈ 328-510).
+31. **Lazy ML Imports**: `faster_whisper`, `kokoro_onnx` and `soundfile` are imported inside the functions that use them, so the pipeline and the zero-network tests import without the ML stack.
+32. **Config Key Fix**: `cut.select_best_cut_window` now reads `min_duration` / `max_duration` / `target_duration` (the keys in config.yaml), falling back to the old `*_seconds` names.
 
 ---
 

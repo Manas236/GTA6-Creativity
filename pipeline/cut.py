@@ -73,6 +73,81 @@ def extract_audio_loudness_profile(video_path: Path | str) -> list[tuple[float, 
     return points
 
 
+def _word_pauses(words: list[dict[str, Any]], min_gap: float) -> list[tuple[float, float]]:
+    """Return speech pauses (gap_start, gap_end) of at least min_gap seconds between words.
+
+    The region after the last word is an open-ended pause (gap_end = inf).
+    """
+    ws = sorted(words, key=lambda w: float(w["start"]))
+    pauses: list[tuple[float, float]] = []
+    for a, b in zip(ws, ws[1:]):
+        gs, ge = float(a["end"]), float(b["start"])
+        if ge - gs >= min_gap:
+            pauses.append((gs, ge))
+    if ws:
+        pauses.append((float(ws[-1]["end"]), math.inf))
+    return pauses
+
+
+def snap_end_to_pause(
+    start_s: float,
+    proposed_end_s: float,
+    *,
+    words: list[dict[str, Any]] | None = None,
+    loudness: list[tuple[float, float]] | None = None,
+    min_dur: float = 18.0,
+    max_dur: float = 22.0,
+    min_gap: float = 0.25,
+    hard_max_end: float | None = None,
+) -> float:
+    """Snap a cut END to a speech pause or loudness trough within [start+min_dur, start+max_dur].
+
+    Priority:
+      1. Whisper word gap >= min_gap (end placed inside the gap, closest to proposed end;
+         never less than 0.1 s after the last spoken word).
+      2. ebur128 momentary-loudness trough (3-point smoothed minimum; ties within 1 LU go
+         to the point closest to the proposed end).
+      3. The proposed end, clamped to the bounds.
+    Times are in the same timeline as `words` / `loudness` (absolute in the source).
+    """
+    lo = start_s + min_dur
+    hi = start_s + max_dur
+    if hard_max_end is not None:
+        hi = min(hi, hard_max_end)
+    if hi < lo:
+        return round(min(proposed_end_s, hi), 3)
+    target = min(max(proposed_end_s, lo), hi)
+
+    if words:
+        best: tuple[float, float] | None = None  # (distance, point)
+        for gs, ge in _word_pauses(words, min_gap):
+            f_lo = max(lo, gs + 0.1)
+            f_hi = min(hi, ge - 0.05)
+            if f_lo > f_hi:
+                continue
+            mid = gs + min((ge - gs) / 2.0, 0.4)  # sit a little after the word ends
+            point = min(max(target, f_lo), f_hi) if ge == math.inf else min(max(mid, f_lo), f_hi)
+            dist = abs(point - target)
+            if best is None or dist < best[0]:
+                best = (dist, point)
+        if best is not None:
+            return round(best[1], 3)
+
+    if loudness:
+        pts = sorted(loudness)
+        smoothed: list[tuple[float, float]] = []
+        for i, (t, _) in enumerate(pts):
+            window = [v for _, v in pts[max(0, i - 1): i + 2]]
+            smoothed.append((t, sum(window) / len(window)))
+        in_bounds = [(t, v) for t, v in smoothed if lo <= t <= hi]
+        if in_bounds:
+            v_min = min(v for _, v in in_bounds)
+            near_min = [t for t, v in in_bounds if v <= v_min + 1.0]
+            return round(min(near_min, key=lambda t: abs(t - target)), 3)
+
+    return round(target, 3)
+
+
 def select_best_cut_window(
     video_path: Path | str,
     cfg: dict[str, Any] | None = None,
@@ -83,9 +158,9 @@ def select_best_cut_window(
     """
     cfg = cfg or config.get_config()
     cut_cfg = cfg.get("cut", {})
-    min_dur = float(cut_cfg.get("min_duration_seconds", 18.0))
-    max_dur = float(cut_cfg.get("max_duration_seconds", 22.0))
-    target_dur = float(cut_cfg.get("target_duration_seconds", 20.0))
+    min_dur = float(cut_cfg.get("min_duration", cut_cfg.get("min_duration_seconds", 18.0)))
+    max_dur = float(cut_cfg.get("max_duration", cut_cfg.get("max_duration_seconds", 22.0)))
+    target_dur = float(cut_cfg.get("target_duration", cut_cfg.get("target_duration_seconds", 20.0)))
     static_floor = float(cut_cfg.get("min_scene_change_density", 0.05))
 
     audio_weight = float(cut_cfg.get("weights", {}).get("audio_energy", 0.75))
@@ -174,7 +249,18 @@ def select_best_cut_window(
         return 0.0, min(total_duration, target_dur), 0.5
 
     best = candidate_windows[0]
-    return best["start"], best["end"], best["score"]
+    # Snap the END to a loudness trough inside the 18-22 s bounds so the clip does not
+    # stop mid-sound (whisper words are not available at this stage; the render stage
+    # refines the end with word gaps).
+    snapped_end = snap_end_to_pause(
+        best["start"],
+        best["end"],
+        loudness=loudness_profile,
+        min_dur=min_dur,
+        max_dur=max_dur,
+        hard_max_end=total_duration,
+    )
+    return best["start"], round(snapped_end, 2), best["score"]
 
 
 def run_cut_item(
@@ -195,8 +281,6 @@ def run_cut_item(
 
     download_path = Path(download_path_str)
     cut_cfg = cfg.get("cut", {})
-    min_dur = float(cut_cfg.get("min_duration_seconds", 18.0))
-    max_dur = float(cut_cfg.get("max_duration_seconds", 22.0))
     consecutive_n = int(cfg.get("dedupe", {}).get("consecutive_frames", 3))
     hamming_thresh = int(cfg.get("dedupe", {}).get("hamming_threshold", 8))
 

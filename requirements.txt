@@ -7,3 +7,4 @@ pytest>=8.0.0
 kokoro-onnx>=0.6.0
 faster-whisper>=1.0.0
 soundfile>=0.12.0
+fonttools>=4.40.0

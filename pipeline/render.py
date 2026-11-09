@@ -1,30 +1,104 @@
-"""Stage 7: ASS subtitle generation and ffmpeg 9:16 vertical video rendering for Variants A and B."""
+"""Stage 7: ASS subtitle generation and ffmpeg 9:16 vertical rendering for Variants A and B.
+
+Variant A: cut (end snapped to a pause) + hook + word-highlighted captions, 0.25 s fade-out.
+Variant B: freeze-frame format. The cut's FIRST frame is held as a still for
+           (VO duration + freeze_pad_s) while ONLY the voiceover plays; then the cut plays
+           from its start with its original audio at full level. No ducking anywhere.
+Every output is ffprobe-verified: audio/video stream durations must match within
+render.av_duration_tolerance_s and fps / sample rate / channels / resolution must match config.
+"""
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
 import os
-import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
-import faster_whisper
-
 from . import config, db, hooks, voiceover
+from .cut import extract_audio_loudness_profile, snap_end_to_pause
 from .download import verify_video_file
 
 log = logging.getLogger(__name__)
 
-_WHISPER_INSTANCE: faster_whisper.WhisperModel | None = None
+_WHISPER_INSTANCE: Any = None
+
+RENDER_DEFAULTS: dict[str, Any] = {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "audio_sample_rate": 48000,
+    "audio_channels": 2,
+    "audio_bitrate": "192k",
+    "fonts_dir": "assets/fonts",
+    "font_path": "assets/fonts/Montserrat-Black.ttf",
+    "font_name": "Montserrat Black",
+    "whisper_model": "base.en",
+    "target_lufs": -14.0,
+    "freeze_pad_s": 0.3,
+    "end_fade_s": 0.25,
+    "av_duration_tolerance_s": 0.1,
+    "safe_area": {"x_min": 90, "x_max": 990, "y_min": 250, "y_max": 1440},
+    "caption": {
+        "font_size": 138,
+        "outline": 7,
+        "shadow": 3,
+        "max_words": 3,
+        "max_gap_s": 0.6,
+        "center_y": 1300,
+        "color": "&H00FFFFFF",
+        "highlight_color": "&H0000FFFF",
+    },
+    "hook": {
+        "font_size": 150,
+        "min_font_size": 96,
+        "outline": 8,
+        "shadow": 3,
+        "max_lines": 2,
+        "band_top_y": 280,
+        "band_bottom_y": 560,
+        "line_spacing": 1.45,
+        "color": "&H0000FFFF",
+    },
+}
 
 
-def get_whisper_model(model_name: str = "base.en") -> faster_whisper.WhisperModel:
-    """Return shared WhisperModel singleton on CPU."""
+class RenderVerificationError(RuntimeError):
+    """Raised / reported when an output fails the ffprobe stream checks."""
+
+
+def render_settings(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the render config merged over RENDER_DEFAULTS (nested dicts merged one level)."""
+    cfg = cfg if cfg is not None else config.get_config()
+    user = dict(cfg.get("render", {}) or {})
+    out: dict[str, Any] = {}
+    for k, v in RENDER_DEFAULTS.items():
+        if isinstance(v, dict):
+            merged = dict(v)
+            merged.update(user.get(k) or {})
+            out[k] = merged
+        else:
+            out[k] = user.get(k, v)
+    for k, v in user.items():
+        out.setdefault(k, v)
+    return out
+
+
+def _abs_project_path(p: str | Path) -> Path:
+    path = Path(p)
+    return path if path.is_absolute() else config.project_root() / path
+
+
+def get_whisper_model(model_name: str = "base.en") -> Any:
+    """Return shared WhisperModel singleton on CPU (faster_whisper imported lazily)."""
     global _WHISPER_INSTANCE
     if _WHISPER_INSTANCE is None:
+        import faster_whisper
+
         log.info("Loading faster-whisper model '%s' (device=cpu, compute_type=int8)...", model_name)
         _WHISPER_INSTANCE = faster_whisper.WhisperModel(model_name, device="cpu", compute_type="int8")
         log.info("WhisperModel '%s' loaded.", model_name)
@@ -90,81 +164,237 @@ def transcribe_words(audio_or_video_path: Path | str, model_name: str = "base.en
         return []
 
 
+# --------------------------------------------------------------------------------------
+# Font metrics (libass sizing) and text layout
+# --------------------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=8)
+def _font_metrics(font_path: str) -> dict[str, float]:
+    """Return metrics libass uses: it scales the face so usWinAscent + usWinDescent == Fontsize."""
+    from fontTools.ttLib import TTFont
+
+    t = TTFont(font_path, lazy=True)
+    os2 = t["OS/2"]
+    upm = float(t["head"].unitsPerEm)
+    real_dim = float(os2.usWinAscent + os2.usWinDescent) or upm
+    return {
+        "upm": upm,
+        "real_dim": real_dim,
+        "cap_height": float(getattr(os2, "sCapHeight", 0) or 0.7 * upm),
+        "weight": float(os2.usWeightClass),
+    }
+
+
+def em_px(font_size: float, font_path: str | Path) -> float:
+    m = _font_metrics(str(_abs_project_path(font_path)))
+    return float(font_size) * m["upm"] / m["real_dim"]
+
+
+def cap_height_px(font_size: float, font_path: str | Path) -> float:
+    """Predicted rendered cap height in pixels for an ASS Fontsize at PlayRes 1080x1920."""
+    m = _font_metrics(str(_abs_project_path(font_path)))
+    return float(font_size) * m["cap_height"] / m["real_dim"]
+
+
+@functools.lru_cache(maxsize=4096)
+def _text_width_cached(text: str, font_size: float, font_path: str) -> float:
+    from PIL import ImageFont
+
+    size = em_px(font_size, font_path)
+    font = ImageFont.truetype(font_path, size=max(1.0, size))
+    return float(font.getlength(text))
+
+
+def text_width_px(text: str, font_size: float, font_path: str | Path) -> float:
+    """Advance width of `text` in canvas pixels as libass would lay it out (no outline)."""
+    return _text_width_cached(text, float(font_size), str(_abs_project_path(font_path)))
+
+
+def _clean_text(text: str) -> str:
+    """Upper-case and strip characters that would be read as ASS override/escape syntax."""
+    t = str(text).replace("{", "").replace("}", "").replace("\\", "").strip()
+    return t.upper()
+
+
+def _clean_caption_word(word: str) -> str:
+    return _clean_text(word).strip(",.;:\"\u201c\u201d")
+
+
+def layout_hook(hook_text: str, rs: dict[str, Any]) -> tuple[list[str], int]:
+    """Wrap the hook into <= max_lines lines that fit the safe-area width.
+
+    Returns (lines, font_size). Shrinks the font only if 2 lines cannot fit.
+    """
+    hk = rs["hook"]
+    sa = rs["safe_area"]
+    font_path = rs["font_path"]
+    max_w = (sa["x_max"] - sa["x_min"]) - 2 * (hk["outline"] + hk["shadow"])
+    words = _clean_text(hook_text).split()
+    if not words:
+        return [], int(hk["font_size"])
+    max_lines = max(1, int(hk.get("max_lines", 2)))
+    size = float(hk["font_size"])
+
+    def best_split(sz: float) -> tuple[list[str], float]:
+        one = " ".join(words)
+        candidates: list[tuple[float, list[str]]] = [(text_width_px(one, sz, font_path), [one])]
+        if max_lines >= 2 and len(words) >= 2:
+            for i in range(1, len(words)):
+                lines = [" ".join(words[:i]), " ".join(words[i:])]
+                w = max(text_width_px(l, sz, font_path) for l in lines)
+                candidates.append((w, lines))
+        fitting = [c for c in candidates if c[0] <= max_w]
+        if fitting:
+            # Prefer fewest lines, then most balanced.
+            fitting.sort(key=lambda c: (len(c[1]), c[0]))
+            if len(fitting[0][1]) == 1:
+                return fitting[0][1], fitting[0][0]
+            return min(fitting, key=lambda c: c[0])[1], min(c[0] for c in fitting)
+        widest = min(candidates, key=lambda c: c[0])
+        return widest[1], widest[0]
+
+    for _ in range(20):
+        lines, width = best_split(size)
+        if width <= max_w:
+            break
+        size = math.floor(size * max_w / width) - 1
+    if size < float(hk.get("min_font_size", 0)):
+        log.warning("Hook %r needed font size %.0f (< min %s) to fit 2 lines", hook_text, size, hk.get("min_font_size"))
+    return lines, int(size)
+
+
+def hook_line_centers(n_lines: int, font_size: float, rs: dict[str, Any]) -> list[float]:
+    """Vertical centres of each hook line, centred in the band above the video."""
+    hk = rs["hook"]
+    center = (float(hk["band_top_y"]) + float(hk["band_bottom_y"])) / 2.0
+    pitch = cap_height_px(font_size, rs["font_path"]) * float(hk.get("line_spacing", 1.45))
+    return [center + (i - (n_lines - 1) / 2.0) * pitch for i in range(n_lines)]
+
+
+def chunk_caption_words(words: list[dict[str, Any]], rs: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    """Group words into 1-3 word chunks that fit the safe-area width on one line."""
+    cap = rs["caption"]
+    sa = rs["safe_area"]
+    max_w = (sa["x_max"] - sa["x_min"]) - 2 * (cap["outline"] + cap["shadow"])
+    max_words = max(1, int(cap.get("max_words", 3)))
+    max_gap = float(cap.get("max_gap_s", 0.6))
+    chunks: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    for w in words:
+        if not _clean_caption_word(w["word"]):
+            continue
+        if cur:
+            trial = " ".join(_clean_caption_word(x["word"]) for x in cur + [w])
+            too_wide = text_width_px(trial, cap["font_size"], rs["font_path"]) > max_w
+            if len(cur) >= max_words or (w["start"] - cur[-1]["end"]) > max_gap or too_wide:
+                chunks.append(cur)
+                cur = []
+        cur.append(w)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def build_ass_subtitles(
     hook_text: str,
     video_duration: float,
     words: list[dict[str, Any]] | None = None,
     fonts_dir: Path | str | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> str:
-    """Generate ASS subtitle file content with top Hook and bottom word-highlighted captions."""
-    header = """[Script Info]
+    """Generate ASS content: hook in the band above the video for the whole clip, plus
+    1-3 word captions centred at caption.center_y with the active word highlighted.
+
+    `words` must already be on the output timeline (Variant B: see build_variant_b_words).
+    """
+    rs = render_settings(cfg)
+    hk, cap = rs["hook"], rs["caption"]
+    font = rs["font_name"]
+    W, H = int(rs["width"]), int(rs["height"])
+    cx = W / 2.0
+    hook_lines, hook_size = layout_hook(hook_text, rs)
+
+    header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {W}
+PlayResY: {H}
+WrapStyle: 2
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Hook,Montserrat,58,&H0000FFFF,&H00000000,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,5,3,8,80,80,180,1
-Style: Caption,Montserrat,46,&H00FFFFFF,&H00000000,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,4,2,2,70,70,300,1
+Style: Hook,{font},{hook_size},{hk['color']},&H00000000,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,{hk['outline']},{hk['shadow']},5,{rs['safe_area']['x_min']},{W - rs['safe_area']['x_max']},0,1
+Style: Caption,{font},{cap['font_size']},{cap['color']},&H00000000,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,{cap['outline']},{cap['shadow']},5,{rs['safe_area']['x_min']},{W - rs['safe_area']['x_max']},0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events: list[str] = []
 
-    # 1. Top Hook Event: spans entire clip
-    clean_hook = hook_text.strip().upper()
-    # If hook text is long (> 5 words), insert line break for balanced 2-line title
-    hook_words = clean_hook.split()
-    if len(hook_words) > 5:
-        mid = len(hook_words) // 2
-        clean_hook = " ".join(hook_words[:mid]) + "\\N" + " ".join(hook_words[mid:])
+    t0 = format_ass_timestamp(0.0)
+    t1 = format_ass_timestamp(video_duration)
+    for line, y in zip(hook_lines, hook_line_centers(len(hook_lines), hook_size, rs)):
+        events.append(f"Dialogue: 0,{t0},{t1},Hook,,0,0,0,,{{\\an5\\pos({cx:.0f},{y:.0f})}}{line}")
 
-    t_start_hook = format_ass_timestamp(0.0)
-    t_end_hook = format_ass_timestamp(video_duration)
-    events.append(f"Dialogue: 0,{t_start_hook},{t_end_hook},Hook,,0,0,0,,{clean_hook}")
-
-    # 2. Bottom Word-by-Word Highlighted Captions (if speech words exist)
     if words:
-        # Group words into chunks of 3-5 words
-        chunks: list[list[dict[str, Any]]] = []
-        current_chunk: list[dict[str, Any]] = []
-
-        for w in words:
-            if not current_chunk:
-                current_chunk.append(w)
-            elif len(current_chunk) >= 4 or (w["start"] - current_chunk[-1]["end"]) > 0.6:
-                chunks.append(current_chunk)
-                current_chunk = [w]
-            else:
-                current_chunk.append(w)
-        if current_chunk:
-            chunks.append(current_chunk)
-
-        # For each chunk, create dialogue entries per active word
-        for chunk in chunks:
-            raw_words = [cw["word"].upper() for cw in chunk]
-            for i, active_w in enumerate(chunk):
-                w_start = format_ass_timestamp(active_w["start"])
-                # Next word's start or current word's end + small hold
-                w_end_time = active_w["end"]
+        timeline = [w for w in words if float(w["start"]) < video_duration - 0.05]
+        chunks = chunk_caption_words(timeline, rs)
+        hl, base = cap["highlight_color"], cap["color"]
+        cy = float(cap["center_y"])
+        for ci, chunk in enumerate(chunks):
+            raw = [_clean_caption_word(cw["word"]) for cw in chunk]
+            next_chunk_start = chunks[ci + 1][0]["start"] if ci + 1 < len(chunks) else video_duration
+            for i, active in enumerate(chunk):
+                start = float(active["start"])
                 if i + 1 < len(chunk):
-                    w_end_time = min(chunk[i + 1]["start"], active_w["end"] + 0.15)
-                w_end = format_ass_timestamp(max(active_w["start"] + 0.1, w_end_time))
-
-                # Build line with active word highlighted
-                line_parts: list[str] = []
-                for j, word_str in enumerate(raw_words):
-                    if j == i:
-                        line_parts.append(f"{{\\c&H0000FFFF&}}{word_str}{{\\c&H00FFFFFF&}}")
-                    else:
-                        line_parts.append(word_str)
-                caption_text = " ".join(line_parts)
-                events.append(f"Dialogue: 1,{w_start},{w_end},Caption,,0,0,0,,{caption_text}")
+                    end = float(chunk[i + 1]["start"])
+                else:
+                    end = min(float(active["end"]) + 0.3, float(next_chunk_start))
+                end = min(max(end, start + 0.1), video_duration)
+                parts = [f"{{\\c{hl}&}}{w}{{\\c{base}&}}" if j == i else w for j, w in enumerate(raw)]
+                text = f"{{\\an5\\pos({cx:.0f},{cy:.0f})}}" + " ".join(parts)
+                events.append(
+                    f"Dialogue: 1,{format_ass_timestamp(start)},{format_ass_timestamp(end)},Caption,,0,0,0,,{text}"
+                )
 
     return header + "\n".join(events) + "\n"
 
+
+def build_variant_b_words(
+    vo_words: list[dict[str, Any]],
+    speech_words: list[dict[str, Any]],
+    freeze_s: float,
+) -> list[dict[str, Any]]:
+    """Variant B caption timeline: VO words during the freeze, then the cut's speech
+    shifted by the freeze duration."""
+    out: list[dict[str, Any]] = []
+    for w in vo_words:
+        if float(w["start"]) >= freeze_s:
+            continue
+        out.append({**w, "end": min(float(w["end"]), freeze_s)})
+    for w in speech_words:
+        out.append({**w, "start": round(float(w["start"]) + freeze_s, 3), "end": round(float(w["end"]) + freeze_s, 3)})
+    return out
+
+
+def estimate_words_from_script(script: str, duration_s: float) -> list[dict[str, Any]]:
+    """Fallback VO word timings when whisper is unavailable: spread words by character count."""
+    toks = [t for t in (script or "").split() if t.strip()]
+    if not toks or duration_s <= 0:
+        return []
+    total = sum(len(t) + 1 for t in toks)
+    t = 0.0
+    out = []
+    for tok in toks:
+        d = duration_s * (len(tok) + 1) / total
+        out.append({"word": tok, "start": round(t, 3), "end": round(t + d, 3), "prob": 1.0})
+        t += d
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# ffprobe helpers and output verification
+# --------------------------------------------------------------------------------------
 
 def has_audio_stream(video_path: Path | str) -> bool:
     """Check if video contains an audio stream using ffprobe."""
@@ -184,75 +414,208 @@ def has_audio_stream(video_path: Path | str) -> bool:
         return False
 
 
+def _rate(r: str | None) -> float:
+    if not r or r in ("0/0", "N/A"):
+        return 0.0
+    if "/" in r:
+        n, d = r.split("/", 1)
+        return float(n) / float(d) if float(d) else 0.0
+    return float(r)
+
+
+def probe_streams(path: Path | str) -> dict[str, Any]:
+    """ffprobe the first video and audio streams. Durations are STREAM durations."""
+    cmd = ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    data = json.loads(res.stdout or "{}")
+    info: dict[str, Any] = {"path": str(path), "format_duration": float(data.get("format", {}).get("duration", 0) or 0)}
+    for st in data.get("streams", []):
+        kind = st.get("codec_type")
+        if kind == "video" and "video_duration" not in info:
+            info.update({
+                "video_duration": float(st.get("duration", 0) or 0),
+                "fps": round(_rate(st.get("avg_frame_rate")), 3),
+                "width": int(st.get("width", 0)),
+                "height": int(st.get("height", 0)),
+                "video_frames": int(st.get("nb_frames", 0) or 0),
+            })
+        elif kind == "audio" and "audio_duration" not in info:
+            info.update({
+                "audio_duration": float(st.get("duration", 0) or 0),
+                "sample_rate": int(st.get("sample_rate", 0) or 0),
+                "channels": int(st.get("channels", 0) or 0),
+            })
+    return info
+
+
+def verify_render(
+    path: Path | str,
+    cfg: dict[str, Any] | None = None,
+    expected_duration: float | None = None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    """Fail-closed output check. Returns (ok, probe_info, errors)."""
+    rs = render_settings(cfg)
+    tol = float(rs["av_duration_tolerance_s"])
+    errors: list[str] = []
+    try:
+        info = probe_streams(path)
+    except Exception as e:  # pragma: no cover - ffprobe missing/corrupt
+        return False, {}, [f"ffprobe failed: {e}"]
+    if "video_duration" not in info:
+        errors.append("no video stream")
+    if "audio_duration" not in info:
+        errors.append("no audio stream")
+    if errors:
+        return False, info, errors
+    vd, ad = info["video_duration"], info["audio_duration"]
+    if abs(vd - ad) > tol:
+        errors.append(f"audio/video stream durations differ: video={vd:.3f}s audio={ad:.3f}s (tol {tol}s)")
+    if abs(info["fps"] - float(rs["fps"])) > 0.01:
+        errors.append(f"fps {info['fps']} != {rs['fps']}")
+    if info["sample_rate"] != int(rs["audio_sample_rate"]):
+        errors.append(f"sample rate {info['sample_rate']} != {rs['audio_sample_rate']}")
+    if info["channels"] != int(rs["audio_channels"]):
+        errors.append(f"channels {info['channels']} != {rs['audio_channels']}")
+    if (info["width"], info["height"]) != (int(rs["width"]), int(rs["height"])):
+        errors.append(f"resolution {info['width']}x{info['height']} != {rs['width']}x{rs['height']}")
+    if expected_duration is not None and abs(vd - expected_duration) > tol:
+        errors.append(f"video duration {vd:.3f}s != expected {expected_duration:.3f}s")
+    return not errors, info, errors
+
+
+def media_duration(path: Path | str) -> float:
+    """Duration of a media file (video stream if present, else audio, else container)."""
+    info = probe_streams(path)
+    return float(info.get("video_duration") or info.get("audio_duration") or info.get("format_duration") or 0.0)
+
+
+def freeze_duration(vo_duration_s: float, cfg: dict[str, Any] | None = None) -> float:
+    """Variant B still-frame length: VO duration + pad, rounded UP to a whole frame."""
+    rs = render_settings(cfg)
+    fps = int(rs["fps"])
+    return math.ceil((float(vo_duration_s) + float(rs["freeze_pad_s"])) * fps - 1e-6) / fps
+
+
+# --------------------------------------------------------------------------------------
+# ffmpeg renders
+# --------------------------------------------------------------------------------------
+
+def _ass_arg(ass_path: Path | str, rs: dict[str, Any]) -> str:
+    fonts_dir = _abs_project_path(rs["fonts_dir"])
+    return f"filename='{escape_filter_path(ass_path)}':fontsdir='{escape_filter_path(fonts_dir)}'"
+
+
+def _video_chain(rs: dict[str, Any], ass_arg: str, n_cut_frames: int, freeze_frames: int = 0) -> str:
+    """Build the 9:16 composite: blurred cover background + centred 16:9 foreground, 30 fps."""
+    W, H, fps = int(rs["width"]), int(rs["height"]), int(rs["fps"])
+    fg_h = int(round(W * 9 / 16 / 2) * 2)
+    freeze = f",tpad=start={freeze_frames}:start_mode=clone" if freeze_frames > 0 else ""
+    total = n_cut_frames + freeze_frames
+    return (
+        f"[0:v]fps={fps},tpad=stop=-1:stop_mode=clone:stop_duration=2,trim=end_frame={n_cut_frames},"
+        f"setpts=PTS-STARTPTS{freeze},split=2[vs1][vs2];"
+        f"[vs1]scale={W // 3}:{H // 3}:force_original_aspect_ratio=increase,crop={W // 3}:{H // 3},"
+        f"boxblur=8:8,scale={W}:{H},eq=brightness=-0.22[bg];"
+        f"[vs2]scale={W}:{fg_h}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,ass={ass_arg},format=yuv420p,"
+        f"trim=end_frame={total},setpts=PTS-STARTPTS[v]"
+    )
+
+
+def _audio_tail(rs: dict[str, Any], target_lufs: float, total_s: float, normalize: bool = True) -> str:
+    """loudnorm -> 48 kHz -> exact length -> end fade-out.
+
+    normalize=False skips loudnorm (digital silence, where loudnorm makes the AAC encoder fail).
+    """
+    sr = int(rs["audio_sample_rate"])
+    ns = int(round(total_s * sr))
+    fade = float(rs["end_fade_s"])
+    fade_st = max(0.0, total_s - fade)
+    norm = f"loudnorm=I={target_lufs}:LRA=11:TP=-1.5," if normalize else ""
+    return (
+        f"{norm}aresample={sr},"
+        f"aformat=sample_fmts=fltp:sample_rates={sr}:channel_layouts=stereo,"
+        f"apad=whole_len={ns},atrim=end_sample={ns},asetpts=PTS-STARTPTS,"
+        f"afade=t=out:st={fade_st:.3f}:d={fade:.3f}[a]"
+    )
+
+
+def _run_ffmpeg(cmd: list[str], label: str) -> tuple[bool, float]:
+    t0 = time.time()
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        elapsed = time.time() - t0
+        if res.returncode != 0:
+            log.error("ffmpeg %s render error: %s", label, res.stderr[-1500:])
+            return False, elapsed
+        return True, elapsed
+    except Exception as e:
+        log.error("ffmpeg %s process error: %s", label, e)
+        return False, time.time() - t0
+
+
+def _encode_args(rs: dict[str, Any], out_p: Path) -> list[str]:
+    return [
+        "-r", str(rs["fps"]),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", str(rs["audio_bitrate"]),
+        "-ar", str(rs["audio_sample_rate"]), "-ac", str(rs["audio_channels"]),
+        "-movflags", "+faststart",
+        str(out_p),
+    ]
+
+
+def _frames(duration_s: float, fps: int) -> int:
+    return max(1, int(math.floor(float(duration_s) * fps + 1e-6)))
+
+
 def render_variant_a(
     cut_path: Path | str,
     ass_path: Path | str,
     output_path: Path | str,
     target_lufs: float = -14.0,
+    *,
+    duration_s: float | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> tuple[bool, float]:
-    """Render Variant A: 1080x1920 9:16 layout with hook & captions, -14 LUFS loudness.
+    """Render Variant A (1080x1920, 30 fps, 48 kHz stereo AAC, -14 LUFS, 0.25 s end fade).
 
-    Returns (success: bool, elapsed_seconds: float).
+    duration_s trims the cut (end-snapped length); defaults to the full cut.
+    The output is ffprobe-verified; a failed check returns (False, elapsed).
     """
-    cut_p = Path(cut_path)
-    ass_p = Path(ass_path)
-    out_p = Path(output_path)
+    rs = render_settings(cfg)
+    cut_p, out_p = Path(cut_path), Path(output_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
+    fps, sr = int(rs["fps"]), int(rs["audio_sample_rate"])
+    dur = float(duration_s) if duration_s else media_duration(cut_p)
+    n = _frames(dur, fps)
+    total_s = n / fps
 
-    # Use forward slashes in relative or clean path for ass filter
-    ass_filter_arg = f"filename='{escape_filter_path(ass_p)}':fontsdir='assets/fonts'"
-    has_audio = has_audio_stream(cut_p)
-
-    if has_audio:
-        filter_complex = (
-            f"[0:v]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
-            f"boxblur=8:8,scale=1080:1920,eq=brightness=-0.22[bg];"
-            f"[0:v]scale=1080:608:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[comp];"
-            f"[comp]ass={ass_filter_arg}[v];"
-            f"[0:a]loudnorm=I={target_lufs}:LRA=11:TP=-1.5[a]"
+    cut_has_audio = has_audio_stream(cut_p)
+    if cut_has_audio:
+        src_audio = (
+            f"[0:a]aformat=sample_fmts=fltp:sample_rates={sr}:channel_layouts=stereo,"
+            f"atrim=end={total_s:.4f},asetpts=PTS-STARTPTS,"
         )
-        audio_map = ["-map", "[a]"]
     else:
-        # Fallback if cut video is silent: generate silent stereo audio
-        filter_complex = (
-            f"[0:v]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
-            f"boxblur=8:8,scale=1080:1920,eq=brightness=-0.22[bg];"
-            f"[0:v]scale=1080:608:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[comp];"
-            f"[comp]ass={ass_filter_arg}[v];"
-            f"anullsrc=r=44100:cl=stereo[a]"
-        )
-        audio_map = ["-map", "[a]"]
+        src_audio = f"anullsrc=r={sr}:cl=stereo,atrim=end={total_s:.4f},"
+    filter_complex = _video_chain(rs, _ass_arg(ass_path, rs), n) + ";" + src_audio + _audio_tail(rs, target_lufs, total_s, cut_has_audio)
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-nostats",
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
         "-i", str(cut_p),
         "-filter_complex", filter_complex,
-        "-map", "[v]",
-        *audio_map,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        str(out_p),
+        "-map", "[v]", "-map", "[a]",
+        *_encode_args(rs, out_p),
     ]
-
-    t0 = time.time()
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        elapsed = time.time() - t0
-        if res.returncode != 0:
-            log.error("ffmpeg Variant A render error: %s", res.stderr[-500:])
-            return False, elapsed
-        return True, elapsed
-    except Exception as e:
-        log.error("ffmpeg Variant A process error: %s", e)
-        return False, time.time() - t0
+    ok, elapsed = _run_ffmpeg(cmd, "Variant A")
+    if not ok:
+        return False, elapsed
+    v_ok, info, errors = verify_render(out_p, cfg, expected_duration=total_s)
+    if not v_ok:
+        log.error("Variant A verification FAILED for %s: %s (%s)", out_p, "; ".join(errors), info)
+        return False, elapsed
+    return True, elapsed
 
 
 def render_variant_b(
@@ -261,71 +624,149 @@ def render_variant_b(
     ass_path: Path | str,
     output_path: Path | str,
     target_lufs: float = -14.0,
-    ducking_attenuation_db: float = -14.0,
+    ducking_attenuation_db: float | None = None,  # unused: kept for call compatibility (no ducking)
+    *,
+    duration_s: float | None = None,
+    freeze_s: float | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> tuple[bool, float]:
-    """Render Variant B: 1080x1920 9:16 layout with hook, captions, and VO ducking graph.
+    """Render Variant B in the freeze-frame format.
 
-    Audio ducking ducks original audio only while 3-6s VO line plays, returning to full.
-    Returns (success: bool, elapsed_seconds: float).
+    Video: first frame of the cut held for freeze_s (default VO duration + freeze_pad_s),
+           then the cut plays from its start.
+    Audio: VO only during the freeze, then the cut's original audio at full level.
+    Total = freeze_s + cut duration. The ASS file must use the same timeline
+    (see build_variant_b_words). Output is ffprobe-verified.
     """
-    cut_p = Path(cut_path)
-    vo_p = Path(voiceover_wav_path)
-    ass_p = Path(ass_path)
-    out_p = Path(output_path)
+    rs = render_settings(cfg)
+    cut_p, vo_p, out_p = Path(cut_path), Path(voiceover_wav_path), Path(output_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
+    fps, sr = int(rs["fps"]), int(rs["audio_sample_rate"])
+    dur = float(duration_s) if duration_s else media_duration(cut_p)
+    n_cut = _frames(dur, fps)
+    cut_s = n_cut / fps
+    if freeze_s is None:
+        freeze_s = freeze_duration(media_duration(vo_p), cfg)
+    n_freeze = max(1, int(round(float(freeze_s) * fps)))
+    freeze_s = n_freeze / fps
+    total_s = (n_freeze + n_cut) / fps
+    freeze_samples = int(round(freeze_s * sr))
 
-    ass_filter_arg = f"filename='{escape_filter_path(ass_p)}':fontsdir='assets/fonts'"
-    has_audio = has_audio_stream(cut_p)
-
-    # Audio ducking filter graph: asplit VO stream, duck original, mix, loudnorm
-    if has_audio:
-        audio_prep = "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a0];"
+    if has_audio_stream(cut_p):
+        cut_audio = (
+            f"[0:a]aformat=sample_fmts=fltp:sample_rates={sr}:channel_layouts=stereo,"
+            f"atrim=end={cut_s:.4f},asetpts=PTS-STARTPTS[a0];"
+        )
     else:
-        audio_prep = "anullsrc=r=44100:cl=stereo[a0];"
-
-    filter_complex = (
-        f"[0:v]scale=360:640:force_original_aspect_ratio=increase,crop=360:640,"
-        f"boxblur=8:8,scale=1080:1920,eq=brightness=-0.22[bg];"
-        f"[0:v]scale=1080:608:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[comp];"
-        f"[comp]ass={ass_filter_arg}[v];"
-        f"{audio_prep}"
-        f"[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,adelay=500|500[vo_del];"
-        f"[vo_del]asplit=2[vo_side][vo_mix];"
-        f"[a0][vo_side]sidechaincompress=threshold=0.08:ratio=10:attack=40:release=300[ducked];"
-        f"[ducked][vo_mix]amix=inputs=2:duration=first:dropout_transition=2[a_mix];"
-        f"[a_mix]loudnorm=I={target_lufs}:LRA=11:TP=-1.5[a]"
+        cut_audio = f"anullsrc=r={sr}:cl=stereo,atrim=end={cut_s:.4f}[a0];"
+    audio = (
+        f"[1:a]aformat=sample_fmts=fltp:sample_rates={sr}:channel_layouts=stereo,"
+        f"apad=whole_len={freeze_samples},atrim=end_sample={freeze_samples},asetpts=PTS-STARTPTS[vo];"
+        f"{cut_audio}"
+        f"[vo][a0]concat=n=2:v=0:a=1,"
+        + _audio_tail(rs, target_lufs, total_s)
     )
+    filter_complex = _video_chain(rs, _ass_arg(ass_path, rs), n_cut, n_freeze) + ";" + audio
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-nostats",
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
         "-i", str(cut_p),
         "-i", str(vo_p),
         "-filter_complex", filter_complex,
-        "-map", "[v]",
-        "-map", "[a]",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        str(out_p),
+        "-map", "[v]", "-map", "[a]",
+        *_encode_args(rs, out_p),
     ]
+    ok, elapsed = _run_ffmpeg(cmd, "Variant B")
+    if not ok:
+        return False, elapsed
+    v_ok, info, errors = verify_render(out_p, cfg, expected_duration=total_s)
+    if not v_ok:
+        log.error("Variant B verification FAILED for %s: %s (%s)", out_p, "; ".join(errors), info)
+        return False, elapsed
+    return True, elapsed
 
-    t0 = time.time()
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        elapsed = time.time() - t0
-        if res.returncode != 0:
-            log.error("ffmpeg Variant B render error: %s", res.stderr[-500:])
-            return False, elapsed
-        return True, elapsed
-    except Exception as e:
-        log.error("ffmpeg Variant B process error: %s", e)
-        return False, time.time() - t0
+
+def snap_render_end(
+    cut_path: Path | str,
+    cut_duration: float,
+    speech_words: list[dict[str, Any]] | None,
+    cfg: dict[str, Any] | None = None,
+) -> float:
+    """Pick the Variant A/B content length inside the existing cut: a whisper word gap
+    (>= 0.25 s) or an ebur128 trough within [min_duration, min(max_duration, cut_duration)]."""
+    cfg = cfg if cfg is not None else config.get_config()
+    cut_cfg = cfg.get("cut", {})
+    min_dur = float(cut_cfg.get("min_duration", 18.0))
+    max_dur = float(cut_cfg.get("max_duration", 22.0))
+    if cut_duration <= min_dur:
+        return cut_duration
+    loud = None if speech_words else extract_audio_loudness_profile(cut_path)
+    return snap_end_to_pause(
+        0.0,
+        cut_duration,
+        words=speech_words or None,
+        loudness=loud,
+        min_dur=min_dur,
+        max_dur=max_dur,
+        hard_max_end=cut_duration,
+    )
+
+
+def render_item_variants(
+    cut_path: Path | str,
+    vo_path: Path | str,
+    hook_text: str,
+    speech_words: list[dict[str, Any]],
+    vo_words: list[dict[str, Any]],
+    out_a: Path | str,
+    out_b: Path | str,
+    subtitles_dir: Path | str,
+    cfg: dict[str, Any] | None = None,
+    name: str = "item",
+) -> dict[str, Any]:
+    """Snap the end, build both ASS files, render A and B, verify both.
+
+    speech_words are on the cut timeline (0 = cut start); vo_words on the VO timeline.
+    Raises RenderVerificationError if either output fails verification.
+    """
+    cfg = cfg if cfg is not None else config.get_config()
+    rs = render_settings(cfg)
+    fps = int(rs["fps"])
+    target_lufs = float(rs["target_lufs"])
+    cut_dur = media_duration(cut_path)
+    end_s = snap_render_end(cut_path, cut_dur, speech_words, cfg)
+    content_s = _frames(end_s, fps) / fps
+    vo_dur = media_duration(vo_path)
+    freeze_s = freeze_duration(vo_dur, cfg)
+
+    subs = Path(subtitles_dir)
+    subs.mkdir(parents=True, exist_ok=True)
+    ass_a, ass_b = subs / f"{name}_A.ass", subs / f"{name}_B.ass"
+    words_a = [w for w in speech_words if float(w["start"]) < content_s]
+    words_b = build_variant_b_words(vo_words, words_a, freeze_s)
+    ass_a.write_text(build_ass_subtitles(hook_text, content_s, words_a, cfg=cfg), encoding="utf-8")
+    ass_b.write_text(build_ass_subtitles(hook_text, freeze_s + content_s, words_b, cfg=cfg), encoding="utf-8")
+
+    ok_a, el_a = render_variant_a(cut_path, ass_a, out_a, target_lufs, duration_s=content_s, cfg=cfg)
+    if not ok_a:
+        raise RenderVerificationError(f"Variant A render/verification failed: {out_a}")
+    ok_b, el_b = render_variant_b(cut_path, vo_path, ass_b, out_b, target_lufs, duration_s=content_s, freeze_s=freeze_s, cfg=cfg)
+    if not ok_b:
+        raise RenderVerificationError(f"Variant B render/verification failed: {out_b}")
+    _, probe_a, _ = verify_render(out_a, cfg)
+    _, probe_b, _ = verify_render(out_b, cfg)
+    return {
+        "cut_duration_s": round(cut_dur, 3),
+        "end_s": round(content_s, 3),
+        "vo_duration_s": round(vo_dur, 3),
+        "freeze_s": round(freeze_s, 3),
+        "elapsed_a_s": round(el_a, 2),
+        "elapsed_b_s": round(el_b, 2),
+        "probe_a": probe_a,
+        "probe_b": probe_b,
+        "ass_a": str(ass_a),
+        "ass_b": str(ass_b),
+    }
 
 
 def run_render_item(
@@ -377,77 +818,46 @@ def run_render_item(
         vo_path_str = item.get("voiceover_audio_path")
 
     vo_path = Path(vo_path_str) if vo_path_str else None
+    if not vo_path or not vo_path.exists():
+        db.mark_failed(item_id, "render", "Voiceover audio missing on disk", db_path=db_path)
+        return False, "Voiceover audio missing", {}
 
-    # Transcribe speech in cut clip
-    whisper_model = cfg.get("render", {}).get("whisper_model", "base.en")
+    rs = render_settings(cfg)
+    whisper_model = rs["whisper_model"]
     log.info("Transcribing cut clip speech for item %s...", item_id)
     speech_words = transcribe_words(cut_path, model_name=whisper_model)
     log.info("Transcribed %d speech words from cut clip.", len(speech_words))
 
-    # Transcribe VO line for Variant B
-    vo_words: list[dict[str, Any]] = []
-    if vo_path and vo_path.exists():
-        raw_vo_words = transcribe_words(vo_path, model_name=whisper_model)
-        # Apply 0.5s delay to VO words to align with adelay=500|500
-        for w in raw_vo_words:
-            vo_words.append({
-                "word": w["word"],
-                "start": round(w["start"] + 0.5, 2),
-                "end": round(w["end"] + 0.5, 2),
-                "prob": w["prob"],
-            })
+    # VO words on the VO timeline (VO starts at 0 in Variant B's freeze).
+    vo_words = transcribe_words(vo_path, model_name=whisper_model)
+    if not vo_words:
+        vo_words = estimate_words_from_script(item.get("voiceover_script") or "", media_duration(vo_path))
 
-    # Variant B captions = VO words followed by original speech that occurs after VO ends
-    vo_end_time = vo_words[-1]["end"] if vo_words else 0.0
-    subsequent_speech = [w for w in speech_words if w["start"] >= (vo_end_time + 0.2)]
-    variant_b_words = vo_words + subsequent_speech
-
-    # Build ASS files
-    subtitles_dir = config.media_dir("subtitles")
-    ass_a_path = subtitles_dir / f"{item_id}_A.ass"
-    ass_b_path = subtitles_dir / f"{item_id}_B.ass"
-
-    ass_a_content = build_ass_subtitles(hook_text, cut_dur, speech_words)
-    ass_b_content = build_ass_subtitles(hook_text, cut_dur, variant_b_words)
-
-    ass_a_path.write_text(ass_a_content, encoding="utf-8")
-    ass_b_path.write_text(ass_b_content, encoding="utf-8")
-
-    # Render destinations
     renders_dir = config.media_dir("renders")
     render_a_path = renders_dir / f"{item_id}_A.mp4"
     render_b_path = renders_dir / f"{item_id}_B.mp4"
 
-    target_lufs = float(cfg.get("render", {}).get("target_lufs", -14.0))
-    ducking_db = float(cfg.get("render", {}).get("ducking_attenuation_db", -14.0))
+    log.info("Rendering Variants A and B for %s...", item_id)
+    try:
+        result = render_item_variants(
+            cut_path,
+            vo_path,
+            hook_text,
+            speech_words,
+            vo_words,
+            render_a_path,
+            render_b_path,
+            config.media_dir("subtitles"),
+            cfg=cfg,
+            name=item_id,
+        )
+    except RenderVerificationError as e:
+        db.mark_failed(item_id, "render", str(e), db_path=db_path)
+        return False, str(e), {}
 
-    # Render Variant A
-    log.info("Rendering Variant A for %s...", item_id)
-    ok_a, elapsed_a = render_variant_a(cut_path, ass_a_path, render_a_path, target_lufs=target_lufs)
-    if not ok_a:
-        db.mark_failed(item_id, "render", "Variant A render failed", db_path=db_path)
-        return False, "Variant A render failed", {}
-
-    # Render Variant B
-    log.info("Rendering Variant B for %s...", item_id)
-    ok_b, elapsed_b = render_variant_b(
-        cut_path,
-        vo_path,
-        ass_b_path,
-        render_b_path,
-        target_lufs=target_lufs,
-        ducking_attenuation_db=ducking_db,
-    )
-    if not ok_b:
-        db.mark_failed(item_id, "render", "Variant B render failed", db_path=db_path)
-        return False, "Variant B render failed", {}
-
-    # Verify both renders with ffprobe
-    val_a, dur_a = verify_video_file(render_a_path)
-    val_b, dur_b = verify_video_file(render_b_path)
-    if not (val_a and val_b):
-        db.mark_failed(item_id, "render", f"Render verification failed: A_valid={val_a}, B_valid={val_b}", db_path=db_path)
-        return False, "Render ffprobe validation failed", {}
+    elapsed_a, elapsed_b = result["elapsed_a_s"], result["elapsed_b_s"]
+    dur_a = result["probe_a"]["video_duration"]
+    dur_b = result["probe_b"]["video_duration"]
 
     # Generate Creator Credit Social Caption
     author = item.get("author_name") or "Creator"

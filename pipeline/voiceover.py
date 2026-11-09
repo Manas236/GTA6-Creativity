@@ -6,17 +6,18 @@ from pathlib import Path
 from typing import Any
 
 import requests
-import soundfile as sf
-from kokoro_onnx import Kokoro
 
 from . import config, db
+
+# kokoro_onnx and soundfile are imported lazily so the pipeline (and its tests) can be
+# imported on machines without the TTS stack installed.
 
 log = logging.getLogger(__name__)
 
 KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx"
 KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin"
 
-_KOKORO_INSTANCE: Kokoro | None = None
+_KOKORO_INSTANCE: Any = None
 
 
 def get_model_paths() -> tuple[Path, Path]:
@@ -53,10 +54,11 @@ def ensure_kokoro_models() -> tuple[Path, Path]:
     return model_path, voices_path
 
 
-def get_kokoro() -> Kokoro:
+def get_kokoro() -> Any:
     """Return shared Kokoro singleton."""
     global _KOKORO_INSTANCE
     if _KOKORO_INSTANCE is None:
+        from kokoro_onnx import Kokoro
         model_path, voices_path = ensure_kokoro_models()
         _KOKORO_INSTANCE = Kokoro(str(model_path), str(voices_path))
     return _KOKORO_INSTANCE
@@ -72,6 +74,8 @@ def synthesize_voiceover(
 
     Returns duration in seconds.
     """
+    import soundfile as sf
+
     kokoro = get_kokoro()
     samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang="en-us")
 

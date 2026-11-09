@@ -1,0 +1,38 @@
+{
+  "cut_duration_s": 20.003,
+  "end_s": 19.3,
+  "vo_duration_s": 3.1,
+  "freeze_s": 3.4,
+  "elapsed_a_s": 14.52,
+  "elapsed_b_s": 17.05,
+  "probe_a": {
+    "path": "A_v2.mp4",
+    "format_duration": 19.3,
+    "video_duration": 19.3,
+    "fps": 30.0,
+    "width": 1080,
+    "height": 1920,
+    "video_frames": 579,
+    "audio_duration": 19.3,
+    "sample_rate": 48000,
+    "channels": 2
+  },
+  "probe_b": {
+    "path": "B_v2.mp4",
+    "format_duration": 22.7,
+    "video_duration": 22.7,
+    "fps": 30.0,
+    "width": 1080,
+    "height": 1920,
+    "video_frames": 681,
+    "audio_duration": 22.7,
+    "sample_rate": 48000,
+    "channels": 2
+  },
+  "cap_heights_px": {
+    "hook": 68,
+    "caption": 62
+  },
+  "b_audio_after_freeze_s": 19.3,
+  "synthetic": true
+}
