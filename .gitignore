@@ -10,7 +10,9 @@ renders/
 cuts/
 audio/
 cache/
+.cache/
 assets/models/
+*whisper*cache*
 *.onnx
 *.bin
 *.mp4

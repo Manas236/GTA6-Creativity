@@ -119,3 +119,4 @@ def test_render_variant_b_synthetic(tmp_path: Path):
     is_valid, dur = verify_video_file(out_path)
     assert is_valid is True
     assert 0.8 <= dur <= 1.5
+

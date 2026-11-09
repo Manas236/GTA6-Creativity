@@ -52,3 +52,4 @@ def test_run_voiceover_for_item(tmp_db: Path, tmp_path: Path):
     assert item["voiceover_audio_path"] is not None
     assert Path(item["voiceover_audio_path"]).exists()
     Path(item["voiceover_audio_path"]).unlink(missing_ok=True)
+

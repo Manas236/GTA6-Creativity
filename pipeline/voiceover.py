@@ -127,3 +127,4 @@ def run_voiceover_for_item(
         db_path=db_path,
     )
     return True, f"Voiceover synthesized ({dur:.2f}s)"
+
