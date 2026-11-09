@@ -1,0 +1,127 @@
+{
+  "hook_text": "The craziest GTA 6 leak yet?",
+  "speech_words": [
+    {
+      "word": "NO",
+      "start": 0.6,
+      "end": 0.9
+    },
+    {
+      "word": "WAY",
+      "start": 0.95,
+      "end": 1.35
+    },
+    {
+      "word": "THIS",
+      "start": 1.4,
+      "end": 1.7
+    },
+    {
+      "word": "IS",
+      "start": 1.75,
+      "end": 1.95
+    },
+    {
+      "word": "REAL",
+      "start": 2.0,
+      "end": 2.5
+    },
+    {
+      "word": "LOOK",
+      "start": 4.0,
+      "end": 4.35
+    },
+    {
+      "word": "AT",
+      "start": 4.4,
+      "end": 4.55
+    },
+    {
+      "word": "THE",
+      "start": 4.6,
+      "end": 4.75
+    },
+    {
+      "word": "CITY",
+      "start": 4.8,
+      "end": 5.3
+    },
+    {
+      "word": "VICE",
+      "start": 8.0,
+      "end": 8.4
+    },
+    {
+      "word": "CITY",
+      "start": 8.45,
+      "end": 8.9
+    },
+    {
+      "word": "LOOKS",
+      "start": 9.0,
+      "end": 9.4
+    },
+    {
+      "word": "INSANE",
+      "start": 9.45,
+      "end": 10.1
+    },
+    {
+      "word": "THE",
+      "start": 13.0,
+      "end": 13.15
+    },
+    {
+      "word": "DETAIL",
+      "start": 13.2,
+      "end": 13.7
+    },
+    {
+      "word": "ON",
+      "start": 13.75,
+      "end": 13.9
+    },
+    {
+      "word": "THOSE",
+      "start": 13.95,
+      "end": 14.3
+    },
+    {
+      "word": "CARS",
+      "start": 14.35,
+      "end": 14.9
+    },
+    {
+      "word": "WAIT",
+      "start": 16.6,
+      "end": 17.0
+    },
+    {
+      "word": "FOR",
+      "start": 17.05,
+      "end": 17.25
+    },
+    {
+      "word": "IT",
+      "start": 17.3,
+      "end": 17.5
+    },
+    {
+      "word": "RIGHT",
+      "start": 18.4,
+      "end": 18.75
+    },
+    {
+      "word": "THERE",
+      "start": 18.8,
+      "end": 19.1
+    },
+    {
+      "word": "BOOM",
+      "start": 19.5,
+      "end": 20.4
+    }
+  ],
+  "voiceover_script": "Is this the craziest GTA six moment yet?",
+  "synthetic": true
+}
