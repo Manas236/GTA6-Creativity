@@ -81,3 +81,45 @@ def test_dedupe_download_workflow(synthetic_video: Path, tmp_db: Path) -> None:
     assert is_dup2 is True
     assert match2 == "item_orig"
     assert cov2 == 1.0
+
+
+def test_letterboxed_synthetic_video_caught_as_duplicate(tmp_path: Path, tmp_db: Path) -> None:
+    import subprocess
+    base_mp4 = tmp_path / "base_16_9.mp4"
+    padded_9_16 = tmp_path / "padded_9_16.mp4"
+    padded_4_3 = tmp_path / "padded_4_3.mp4"
+
+    # Generate 5-second 16:9 dynamic synthetic video (mandelbrot so it has non-black visual content across frame)
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "mandelbrot=size=320x180:rate=10", "-t", "5", "-c:v", "libx264", str(base_mp4)],
+        capture_output=True,
+        check=True,
+    )
+    # Pad to 9:16 (320x568) with black bars
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(base_mp4), "-vf", "pad=320:568:0:(568-180)/2:black", "-c:v", "libx264", str(padded_9_16)],
+        capture_output=True,
+        check=True,
+    )
+    # Pad to 4:3 (320x240) with black bars
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(base_mp4), "-vf", "pad=320:240:0:(240-180)/2:black", "-c:v", "libx264", str(padded_4_3)],
+        capture_output=True,
+        check=True,
+    )
+
+    # 1. Download base video into DB
+    is_dup_base, _, _ = dedupe.dedupe_download("item_base", base_mp4, db_path=tmp_db)
+    assert is_dup_base is False
+
+    # 2. Test 9:16 padded copy - smart cropdetect must remove black bars and flag duplicate
+    is_dup_9_16, match_id_9_16, cov_9_16 = dedupe.dedupe_download("item_padded_9_16", padded_9_16, db_path=tmp_db)
+    assert is_dup_9_16 is True
+    assert match_id_9_16 == "item_base"
+    assert cov_9_16 >= 0.65
+
+    # 3. Test 4:3 padded copy - smart cropdetect must remove black bars and flag duplicate
+    is_dup_4_3, match_id_4_3, cov_4_3 = dedupe.dedupe_download("item_padded_4_3", padded_4_3, db_path=tmp_db)
+    assert is_dup_4_3 is True
+    assert match_id_4_3 == "item_base"
+    assert cov_4_3 >= 0.65

@@ -134,6 +134,15 @@ def run_live_crash_test() -> dict:
     }
 
 
+import pytest
+
+
+@pytest.mark.live
+def test_live_crash_recovery() -> None:
+    results = run_live_crash_test()
+    assert all(results.values()), f"Crash test failed: {results}"
+
+
 if __name__ == "__main__":
     results = run_live_crash_test()
     print("Test summary:", results)

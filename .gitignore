@@ -10,6 +10,9 @@ renders/
 cuts/
 audio/
 cache/
+assets/models/
+*.onnx
+*.bin
 *.mp4
 *.mkv
 *.webm

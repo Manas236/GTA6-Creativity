@@ -127,3 +127,46 @@ def test_paused_source_skipped(tmp_db: Path) -> None:
     rate_limit.record_error("youtube", "Testing cooldown pause", pause_hours=1.0, db_path=tmp_db)
     items = discover.discover_youtube(db_path=tmp_db)
     assert items == []
+
+
+def test_score_formula_reproduces_by_hand() -> None:
+    """Verifies that the score reproduces exactly from its formula columns computed by hand."""
+    cfg = config.get_config()
+    disc_cfg = cfg.get("discovery", {})
+    formula_str = disc_cfg.get("score_formula")
+    assert formula_str is not None
+
+    half_life = float(disc_cfg.get("half_life_hours", 36.0))
+    vel_power = float(disc_cfg.get("velocity_power", 1.2))
+
+    # Known values from GamingBolt discovery item
+    p_rank = 0.9032258064516129
+    age_h = 23.1375
+    eff_weight = 1.0
+
+    # Hand calculation:
+    # Term 1: (p_rank ** vel_power)
+    pct_term = p_rank ** vel_power
+    # Term 2: decay factor (0.5 ** (age / half_life))
+    decay = 0.5 ** (age_h / half_life)
+    # Term 3: effective weight
+    hand_computed_score = pct_term * decay * eff_weight
+
+    ctx = {
+        "percentile_rank": p_rank,
+        "velocity_power": vel_power,
+        "age_hours": age_h,
+        "half_life_hours": half_life,
+        "effective_weight": eff_weight,
+        "source_weight": eff_weight,
+    }
+    evaluated_score = config.evaluate_formula(formula_str, ctx)
+
+    assert evaluated_score == pytest.approx(hand_computed_score, rel=1e-7)
+    assert round(evaluated_score, 3) == 0.567 or round(evaluated_score, 3) == 0.579 or abs(evaluated_score - hand_computed_score) < 1e-9
+
+    # Check official channel down-weighting reproduction
+    ctx_official = dict(ctx, effective_weight=0.20)
+    eval_official = config.evaluate_formula(formula_str, ctx_official)
+    hand_official = pct_term * decay * 0.20
+    assert eval_official == pytest.approx(hand_official, rel=1e-7)

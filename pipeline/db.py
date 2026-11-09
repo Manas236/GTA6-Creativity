@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS items (
     hook_style TEXT,
     hook_text TEXT,
     hook_grounded INTEGER DEFAULT 1,
+    authenticity TEXT DEFAULT 'unverified',
     voiceover_script TEXT,
     voiceover_audio_path TEXT,
     caption_text TEXT,
@@ -102,6 +103,7 @@ CREATE TABLE IF NOT EXISTS posts (
     variant TEXT NOT NULL,
     hook_style TEXT NOT NULL,
     source TEXT NOT NULL,
+    authenticity TEXT DEFAULT 'unverified',
     slot_datetime TEXT NOT NULL,
     status TEXT NOT NULL,
     remote_container_id TEXT,
@@ -207,10 +209,15 @@ def init_db(db_path: Path | str | None = None) -> None:
     """Initialize SQLite database with schema in WAL mode."""
     with db(db_path) as conn:
         conn.executescript(SCHEMA)
-        # Migrate channel_id if missing in existing table
+        # Migrate channel_id and authenticity if missing in existing table
         cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
         if "channel_id" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN channel_id TEXT")
+        if "authenticity" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN authenticity TEXT DEFAULT 'unverified'")
+        post_cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
+        if "authenticity" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN authenticity TEXT DEFAULT 'unverified'")
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +258,7 @@ def insert_discovered_item(item_data: dict[str, Any], db_path: Path | str | None
                 "source_id": item_data["source_id"],
                 "channel_id": item_data.get("channel_id", ""),
                 "source_url": item_data["source_url"],
-                "author_name": item_data["author_name"],
+                "author_name": item_data.get("author_name", "Creator"),
                 "original_title": item_data.get("original_title", ""),
                 "original_duration": item_data.get("original_duration", 0.0),
                 "view_count": item_data.get("view_count", 0),

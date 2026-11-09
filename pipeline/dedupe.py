@@ -1,6 +1,7 @@
 """Perceptual video fingerprinting with black-bar cropping, 1 fps dHash, and coverage-based deduplication."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -13,26 +14,84 @@ log = logging.getLogger(__name__)
 
 
 def detect_crop(video_path: Path | str) -> str:
-    """Run ffmpeg cropdetect to find active picture area (removing black bars)."""
+    """Run ffmpeg cropdetect to find active picture area (removing black bars).
+
+    Rejects intro logos/rating cards that crop both width and height.
+    Only allows true aspect letterboxing (x == 0, w == stream_w) or
+    true pillarboxing (y == 0, h == stream_h).
+    """
+    video_path_str = str(video_path)
+    probe_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,duration",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        video_path_str,
+    ]
+    try:
+        p_res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        pj = json.loads(p_res.stdout)
+        stream = pj.get("streams", [{}])[0]
+        sw = int(stream.get("width", 0))
+        sh = int(stream.get("height", 0))
+        dur = float(stream.get("duration") or pj.get("format", {}).get("duration") or 5.0)
+    except Exception as e:
+        log.debug("ffprobe failed in detect_crop for %s: %s", video_path, e)
+        return ""
+
+    if sw <= 0 or sh <= 0:
+        return ""
+
+    # Sample into main video content to avoid intro bumpers / splash screens
+    sample_ss = min(30.0, max(1.0, dur * 0.3))
+
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-nostats",
-        "-ss", "2",
-        "-i", str(video_path),
-        "-vframes", "10",
-        "-vf", "cropdetect=24:16:0",
-        "-f", "null",
+        "-ss",
+        f"{sample_ss:.2f}",
+        "-i",
+        video_path_str,
+        "-vframes",
+        "15",
+        "-vf",
+        "cropdetect=24:2:0",
+        "-f",
+        "null",
         "-",
     ]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        matches = re.findall(r"crop=(\d+:\d+:\d+:\d+)", res.stderr)
-        if matches:
-            return f"crop={matches[-1]}"
+        matches = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", res.stderr)
+        if not matches:
+            return ""
+        w, h, x, y = [int(v) for v in matches[-1]]
+
+        # Rejection rule: If both x > 0 and y > 0, and w < sw and h < sh,
+        # it is a centered logo, title card, or rating card box, NOT letterboxing/pillarboxing.
+        if x > 0 and y > 0 and w < sw and h < sh:
+            return ""
+
+        # True letterbox: width matches stream width, height is reduced
+        if x == 0 and abs(w - sw) <= 16 and h < sh - 8:
+            return f"crop={sw}:{h}:0:{y}"
+
+        # True pillarbox: height matches stream height, width is reduced
+        if y == 0 and abs(h - sh) <= 16 and w < sw - 8:
+            return f"crop={w}:{sh}:{x}:0"
+
+        return ""
     except Exception as e:
         log.warning("Crop detection failed for %s: %s", video_path, e)
-    return ""
+        return ""
 
 
 def dhash_from_raw_gray_9x8(raw_bytes: bytes) -> int:
@@ -65,6 +124,7 @@ def extract_1fps_hashes(video_path: Path | str, crop: bool = True) -> list[tuple
         "-hide_banner",
         "-nostats",
         "-i", str(video_path),
+        "-an",
         "-vf", vf_arg,
         "-f", "rawvideo",
         "-pix_fmt", "gray",
@@ -72,7 +132,7 @@ def extract_1fps_hashes(video_path: Path | str, crop: bool = True) -> list[tuple
     ]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=90)
+        proc = subprocess.run(cmd, capture_output=True, timeout=180)
         raw_data = proc.stdout
     except Exception as e:
         log.error("Failed to extract frames from %s: %s", video_path, e)

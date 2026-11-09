@@ -201,9 +201,10 @@ def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> lis
     disc_cfg = cfg.get("discovery", {})
     formula_str = disc_cfg.get(
         "score_formula",
-        "percentile_rank * (0.5 ** (age_hours / half_life_hours)) * effective_weight",
+        "(percentile_rank ** velocity_power) * (0.5 ** (age_hours / half_life_hours)) * effective_weight",
     )
     half_life = float(disc_cfg.get("half_life_hours", 36.0))
+    velocity_power = float(disc_cfg.get("velocity_power", 1.2))
 
     # Rolling pool for percentile rank calculation
     db_velocities = db.get_recent_source_velocities("youtube", limit=100, db_path=db_path)
@@ -218,6 +219,7 @@ def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> lis
 
         ctx = {
             "percentile_rank": p_rank,
+            "velocity_power": velocity_power,
             "age_hours": age_h,
             "half_life_hours": half_life,
             "effective_weight": eff_weight,

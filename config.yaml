@@ -43,9 +43,10 @@ sources:
 discovery:
   min_age_hours: 0.5
   half_life_hours: 36.0
+  velocity_power: 1.2
   rolling_pool_size: 100
   score_formula: >
-    percentile_rank * (0.5 ** (age_hours / half_life_hours)) * effective_weight
+    (percentile_rank ** velocity_power) * (0.5 ** (age_hours / half_life_hours)) * effective_weight
 
 dedupe:
   crop_black_bars: true

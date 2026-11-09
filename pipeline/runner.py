@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any
 
-from . import config, db, discover, download
+from . import config, cut, db, discover, download, hooks, render, voiceover
 
 logging.basicConfig(
     level=logging.INFO,
@@ -182,12 +182,26 @@ def run_single_cycle(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
         downloaded = download.run_download_pipeline(cfg=cfg, db_path=db_path)
         log.info("Downloaded & verified %d items", len(downloaded))
 
+        cut_ids = cut.run_cut_pipeline(cfg=cfg, db_path=db_path)
+        log.info("Cut %d items", len(cut_ids))
+
+        rendered_count = 0
+        for cid in cut_ids:
+            ok, msg, stats = render.run_render_item(cid, cfg=cfg, db_path=db_path)
+            if ok:
+                rendered_count += 1
+                log.info("Rendered %s successfully (%s)", cid, stats)
+            else:
+                log.warning("Render failed for %s: %s", cid, msg)
+
         elapsed = time.time() - t0
         log.info("Cycle finished in %.2fs", elapsed)
         return {
             "status": "success",
             "discovered_count": len(discovered),
             "downloaded_count": len(downloaded),
+            "cut_count": len(cut_ids),
+            "rendered_count": rendered_count,
             "duration_s": elapsed,
         }
     finally:
@@ -201,7 +215,11 @@ def main() -> None:
 
     subparsers.add_parser("discover", help="Run discovery stage only")
     subparsers.add_parser("download", help="Run download & dedupe stage only")
-    subparsers.add_parser("cycle", help="Run complete cycle (discover + download + dedupe)")
+    subparsers.add_parser("cut", help="Run audio loudness & scene cut stage only")
+    subparsers.add_parser("hooks", help="Run Gemini hook generation stage only")
+    subparsers.add_parser("voiceover", help="Run Kokoro TTS voiceover stage only")
+    subparsers.add_parser("render", help="Run full vertical 9:16 video render (Variants A & B)")
+    subparsers.add_parser("cycle", help="Run complete pipeline cycle")
     subparsers.add_parser("status", help="Print current database status and stage counts")
 
     args = parser.parse_args()
@@ -223,6 +241,49 @@ def main() -> None:
         try:
             items = download.run_download_pipeline(db_path=db_p)
             print(f"Downloaded {len(items)} items.")
+        finally:
+            release_lock(db_path=db_p)
+    elif args.command == "cut":
+        if not acquire_lock(db_path=db_p):
+            print("Locked: another runner active")
+            sys.exit(1)
+        try:
+            cut_ids = cut.run_cut_pipeline(db_path=db_p)
+            print(f"Cut {len(cut_ids)} items.")
+        finally:
+            release_lock(db_path=db_p)
+    elif args.command == "hooks":
+        if not acquire_lock(db_path=db_p):
+            print("Locked: another runner active")
+            sys.exit(1)
+        try:
+            items = db.get_items_by_stage("cut", db_path=db_p)
+            for itm in items:
+                ok, msg = hooks.run_hooks_for_item(itm["id"], db_path=db_p)
+                print(f"Hooks {itm['id']}: {ok} - {msg}")
+        finally:
+            release_lock(db_path=db_p)
+    elif args.command == "voiceover":
+        if not acquire_lock(db_path=db_p):
+            print("Locked: another runner active")
+            sys.exit(1)
+        try:
+            items = db.get_items_by_stage("cut", db_path=db_p)
+            for itm in items:
+                ok, msg = voiceover.run_voiceover_for_item(itm["id"], db_path=db_p)
+                print(f"Voiceover {itm['id']}: {ok} - {msg}")
+        finally:
+            release_lock(db_path=db_p)
+    elif args.command == "render":
+        if not acquire_lock(db_path=db_p):
+            print("Locked: another runner active")
+            sys.exit(1)
+        try:
+            items = db.get_items_by_stage("cut", db_path=db_p)
+            print(f"Found {len(items)} items ready for render.")
+            for itm in items:
+                ok, msg, stats = render.run_render_item(itm["id"], db_path=db_p)
+                print(f"Render {itm['id']}: {ok} - {msg} ({stats})")
         finally:
             release_lock(db_path=db_p)
     elif args.command == "cycle":
