@@ -140,3 +140,4 @@ def evaluate_formula(formula: str, context: dict[str, Any]) -> float:
     parsed = ast.parse(clean_formula, mode="eval")
     result = _eval_node(parsed, context)
     return float(result)
+

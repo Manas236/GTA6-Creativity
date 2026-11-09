@@ -45,3 +45,4 @@ def synthetic_video(tmp_path: Path) -> Path:
     ]
     subprocess.run(cmd, capture_output=True, check=True)
     return video_path
+

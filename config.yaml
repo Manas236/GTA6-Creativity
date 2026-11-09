@@ -11,16 +11,24 @@ sources:
       - "GTA 6 gameplay"
       - "GTA 6 leak"
       - "Grand Theft Auto VI secret"
+      - "GTA 6 reaction breakdown"
+    date_queries:
+      - "GTA 6"
+      - "GTA VI gameplay"
+      - "GTA 6 leak"
     max_results_per_query: 10
     max_duration_seconds: 600
-  reddit:
-    enabled: true
-    weight: 1.25
-    subreddits:
-      - "GTA6"
-      - "GTA"
-    listing: "hot"
-    limit: 25
+    metadata_fetch_gap_seconds: 0.5
+  official_channels:
+    weight: 0.20 # Official publishers/platforms down-weighted so creator videos rank higher
+    channel_ids:
+      - "UC6VcWc1rAoWdBCM0JxrRQ3A" # Rockstar Games
+      - "UCqjhXNy3aa-j3vXNf_Hq1jw" # Rockstar Games (alt)
+      - "UC-2Y8dQb0S6DtpxNgAKoJKA" # PlayStation
+      - "UCjBp_7RuDBUYbd1LegWEJ8g" # Xbox
+      - "UCWOA1ZGywLbqmigxE4Qlvvw" # Netflix
+      - "UCKy1dAqELo0zrOtPkf0eTMw" # IGN
+      - "UCbu2SsF-Or3Rsn3NxBNL00g" # GameSpot
   twitch:
     enabled: false # Active from launch (19 Nov 2026)
     game_name: "Grand Theft Auto VI"
@@ -37,13 +45,14 @@ discovery:
   half_life_hours: 36.0
   rolling_pool_size: 100
   score_formula: >
-    percentile_rank * (0.5 ** (age_hours / half_life_hours)) * source_weight
+    percentile_rank * (0.5 ** (age_hours / half_life_hours)) * effective_weight
 
 dedupe:
   crop_black_bars: true
   fps: 1
   hamming_threshold: 8 # Max bit difference per frame
-  consecutive_frames: 3 # N consecutive frame matches constitutes duplicate
+  download_coverage_threshold: 0.65 # Fraction of shorter video duration that must match
+  consecutive_frames: 3 # Frames sequence window for Hamming comparison
 
 buffer:
   target_ready_items: 6 # Pull-based cap: process only enough to maintain 6 ready items
@@ -57,6 +66,7 @@ cut:
   audio_weight: 0.75
   scene_weight: 0.25
   intro_outro_penalty_pct: 0.05
+  min_scene_change_density: 0.05 # Minimum scene cut density to reject static videos
 
 render:
   width: 1080
@@ -109,4 +119,5 @@ retention:
 
 orchestrator:
   loop_interval_seconds: 60
-  stale_lock_seconds: 600
+  heartbeat_interval_seconds: 30
+  heartbeat_stale_seconds: 120

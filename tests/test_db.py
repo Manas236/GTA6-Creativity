@@ -113,3 +113,4 @@ def test_buffer_counts(tmp_db: Path) -> None:
 
     db.transition_stage("buf_item", "rendered", db_path=tmp_db)
     assert db.get_ready_buffer_count(tmp_db) == 1
+

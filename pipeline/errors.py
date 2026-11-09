@@ -44,3 +44,4 @@ class RateLimitError(PipelineError):
         super().__init__(f"Rate limit / block on {source}: {message} (pause {pause_seconds:.0f}s)")
         self.source = source
         self.pause_seconds = pause_seconds
+

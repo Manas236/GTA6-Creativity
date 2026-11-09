@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS items (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     source_id TEXT NOT NULL,
+    channel_id TEXT,
     source_url TEXT NOT NULL,
     author_name TEXT NOT NULL,
     original_title TEXT,
@@ -206,6 +207,10 @@ def init_db(db_path: Path | str | None = None) -> None:
     """Initialize SQLite database with schema in WAL mode."""
     with db(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Migrate channel_id if missing in existing table
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
+        if "channel_id" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN channel_id TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -219,17 +224,18 @@ def insert_discovered_item(item_data: dict[str, Any], db_path: Path | str | None
         cursor = conn.execute(
             """
             INSERT INTO items (
-                id, source, source_id, source_url, author_name, original_title,
+                id, source, source_id, channel_id, source_url, author_name, original_title,
                 original_duration, view_count, upvote_count, comment_count,
                 upload_time, discovered_at, raw_velocity, percentile_rank,
                 discovery_score, stage, stage_updated_at, created_at, updated_at
             ) VALUES (
-                :id, :source, :source_id, :source_url, :author_name, :original_title,
+                :id, :source, :source_id, :channel_id, :source_url, :author_name, :original_title,
                 :original_duration, :view_count, :upvote_count, :comment_count,
                 :upload_time, :discovered_at, :raw_velocity, :percentile_rank,
                 :discovery_score, 'discovered', :stage_updated_at, :created_at, :updated_at
             )
             ON CONFLICT(source, source_id) DO UPDATE SET
+                channel_id = COALESCE(excluded.channel_id, items.channel_id),
                 view_count = excluded.view_count,
                 upvote_count = excluded.upvote_count,
                 comment_count = excluded.comment_count,
@@ -243,6 +249,7 @@ def insert_discovered_item(item_data: dict[str, Any], db_path: Path | str | None
                 "id": item_data["id"],
                 "source": item_data["source"],
                 "source_id": item_data["source_id"],
+                "channel_id": item_data.get("channel_id", ""),
                 "source_url": item_data["source_url"],
                 "author_name": item_data["author_name"],
                 "original_title": item_data.get("original_title", ""),

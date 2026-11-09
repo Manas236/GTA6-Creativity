@@ -6,10 +6,10 @@
 ## 1. System Overview & Core Principles
 
 This pipeline automates the end-to-end lifecycle of short vertical videos (Reels) covering Grand Theft Auto VI:
-1. **Discover**: Find viral, trending content from YouTube and Reddit (and Twitch post-launch).
-2. **Download & Dedupe**: Fetch source media idempotently to a temp file with atomic rename; deduplicate by source ID and multi-frame 1 fps perceptual hashing with black-bar cropping and consecutive subsequence matching.
+1. **Discover**: Find viral, trending content from YouTube pre-launch (and Twitch post-launch from 19 Nov 2026). Reddit is completely dropped per Decision A (Reddit ended unauthenticated `.json` access globally in 2026 and new developer API apps are closed).
+2. **Download & Dedupe**: Fetch source media idempotently to a temp file with atomic rename; deduplicate by source ID and multi-frame 1 fps perceptual hashing with coverage-based temporal alignment ($Coverage \ge 0.65$).
 3. **Pull-Based Buffer**: Maintain a capped buffer of ready items (default 6), pulling and processing the highest-scoring items first to conserve disk and API quotas.
-4. **Cut**: Select optimal ~20s highlight windows via audio loudness peak analysis and scene-change density. Re-check perceptual deduplication at the cut level.
+4. **Cut**: Select optimal ~20s highlight windows via audio loudness peak analysis and scene-change density (rejecting static videos with $< 0.05$ scene changes/s). Re-check perceptual deduplication at the cut level ($N=3$ consecutive frames).
 5. **Enrich & Render**:
    - Generate curiosity, question, or hype/analysis hooks via Gemini free tier, strictly grounded in the video (verified by a yes/no grounding check against transcript, 4 frames, and title; falling back to a plain question hook after 2 failures).
    - Hook burned via ASS subtitle file (not drawtext) to support line wrapping and special characters.
@@ -30,7 +30,7 @@ This pipeline automates the end-to-end lifecycle of short vertical videos (Reels
    - Dead-man switch ping to healthchecks.io on every successful runner cycle.
    - Failure-only Telegram alerts.
    - Disk cleanup daemon (source deleted post-render; renders deleted 7 days post-post; rejected/failed media deleted after 3 days).
-   - Crash resilience via SQLite WAL mode and atomic file swaps.
+   - Crash resilience via SQLite WAL mode, heartbeat-based lock with immediate dead PID detection, and atomic file swaps.
 
 ---
 
@@ -116,15 +116,16 @@ Any stage may transition to `failed` (with `error_stage` and `error_message`) or
 -- 1. Main Pipeline Items
 CREATE TABLE IF NOT EXISTS items (
     id TEXT PRIMARY KEY,                       -- UUID / ULID
-    source TEXT NOT NULL,                      -- 'youtube', 'reddit', 'twitch'
-    source_id TEXT NOT NULL,                   -- e.g. YouTube video ID or Reddit submission ID
+    source TEXT NOT NULL,                      -- 'youtube', 'twitch' (Reddit dropped per Decision A)
+    source_id TEXT NOT NULL,                   -- e.g. YouTube video ID
     source_url TEXT NOT NULL,                  -- Original URL
     author_name TEXT NOT NULL,                 -- Original creator/channel for credit
+    channel_id TEXT,                           -- Channel identifier for official channel weighting
     original_title TEXT,                       -- Source title
     original_duration REAL,                    -- Duration in seconds
     view_count INTEGER DEFAULT 0,              -- Raw view count at discovery
-    upvote_count INTEGER DEFAULT 0,            -- Reddit upvotes / YT likes
-    comment_count INTEGER DEFAULT 0,           -- Reddit / YT comments
+    upvote_count INTEGER DEFAULT 0,            -- Upvotes / likes
+    comment_count INTEGER DEFAULT 0,           -- Comments
     upload_time TEXT NOT NULL,                 -- ISO-8601 UTC timestamp of creation
     discovered_at TEXT NOT NULL,               -- ISO-8601 UTC when discovered
     raw_velocity REAL NOT NULL,                -- Source-specific engagement velocity
@@ -269,20 +270,20 @@ CREATE INDEX IF NOT EXISTS idx_stage_log_item ON stage_log(item_id);
 
 ---
 
-## 4. Discovery Score Formula (Normalized Percentile & Single Source Weight)
+## 4. Discovery Score Formula (Normalized Percentile & Source / Official Channel Weights)
 
-Per user requirements:
-- Raw velocity is computed per source.
-- Raw velocity is converted to a percentile rank within that source's recent items (last 100 items discovered from that source).
-- Recency decay and the source weight (`sources.<name>.weight`) are applied.
-- Source weights live in ONE place: `sources.<name>.weight`.
+Per user requirements and decisions:
+- **Sources**: YouTube pre-launch; Twitch from 19 Nov 2026. (Reddit is dropped completely per Decision A: Reddit ended unauthenticated public `.json` globally in 2026 and new developer apps are closed).
+- **Search Queries**: Combines standard relevance search with date-sorted search (`sp=CAI%253D`) to ensure fresh creator uploads surface alongside top trending videos.
+- **Real Metadata Fetching**: Flat-playlist search omits upload timestamps and views; discovery executes rate-limited individual metadata extraction (0.5s pause) to pull true `upload_date` and `view_count`.
+- **Official Channel Down-Weighting (Decision B)**: Official publisher channels (Rockstar Games, PlayStation, Xbox, Netflix) are identified by `channel_id` (not display name) and assigned a down-weight of `0.20` so high-velocity creator videos rank above platform trailers.
+- **Percentile Normalization**: Raw velocity is converted to a percentile rank within that source's recent rolling pool (last 100 items).
+- **Recency Decay**: True exponential half-life decay ($36\text{ h}$) applied against real item age.
 
 ### Velocity Formulas by Source
 - **YouTube**:
   $$\text{RawVelocity} = \frac{\text{views}}{\max(\text{age\_hours}, \text{min\_age\_hours})}$$
-- **Reddit**:
-  $$\text{RawVelocity} = \frac{\text{upvotes} + (\text{comments} \times 2.0)}{\max(\text{age\_hours}, \text{min\_age\_hours})}$$
-- **Twitch**:
+- **Twitch (post-launch)**:
   $$\text{RawVelocity} = \frac{\text{views}}{\max(\text{age\_hours}, \text{min\_age\_hours})}$$
 
 ### Percentile Rank Calculation
@@ -294,25 +295,38 @@ $$\text{PercentileRank} = \frac{\text{rank of item's RawVelocity in pool}}{N_{\t
 discovery:
   min_age_hours: 0.5
   half_life_hours: 36.0
-  # Formula evaluated dynamically via safe expression evaluator:
+  velocity_power: 1.2
+  official_channel_weight: 0.20
+  official_channels:
+    - "UC6VcWc1rAoWdBCM0JxrRQ3A" # Rockstar Games
+    - "UC-2Y8dQb0S6DtpxNgAKoJKA" # PlayStation
+    - "UCjBp_7RuDBUYbd1LegWEJ8g" # Xbox
+    - "UCWOA1ZGywLbqmigxE4Qlvvw" # Netflix
+  # Formula evaluated dynamically via safe AST expression evaluator:
   score_formula: >
-    percentile_rank * (0.5 ** (age_hours / half_life_hours)) * source_weight
+    (percentile_rank ** velocity_power) * (0.5 ** (age_hours / half_life_hours)) * source_weight
 ```
 
 ---
 
-## 5. Deduplication: Black-Bar Cropping, 1 fps Hashing & Consecutive Matching
+## 5. Deduplication: Coverage-Based Download Dedupe & Cut-Level Matching
 
-Per user requirements:
-1. **Black-Bar Cropping**: Run ffmpeg `cropdetect=24:16:0` on sample frames to identify letterboxing/pillarboxing, and crop active video content before generating hashes.
-2. **1 fps Fingerprinting**: Extract frames at 1 frame per second (`fps=1`).
-3. **64-bit dHash Generation**: Convert cropped frame to $9\times8$ grayscale; calculate difference between adjacent pixels to yield a 64-bit integer hash.
-4. **Consecutive Subsequence Matching**:
-   - Compare the candidate sequence of hashes against stored sequences.
-   - If there exist $N$ consecutive frames ($N=3$ by default, configurable) where every corresponding frame has a Hamming distance $\le \text{hamming\_threshold}$ (8 bits by default), the candidate is flagged as a duplicate.
-5. **Two-Level Application**:
-   - **Download-Level (CP1)**: Run on the full downloaded video against all previously seen download fingerprints. If duplicate, mark item `rejected: duplicate_download`.
-   - **Cut-Level (CP2)**: Run on the chosen 20s cut window against all previously rendered/queued/posted cuts. If duplicate, attempt the next-best 20s cut window. If all candidate windows match prior cuts, mark item `rejected: duplicate_cut`.
+Per user requirements and review fixes:
+1. **Download-Level Duplicate Detection (Coverage-Based)**:
+   - At the download level, duplicate must mean the *same video*, not merely sharing a brief segment.
+   - For candidate sequence $C$ and target sequence $T$ with lengths $L_C, L_T$ and $L_{\min} = \min(L_C, L_T)$:
+     $$M^* = \max_{\Delta} \sum_{i} \mathbb{I}(\text{Hamming}(C[i], T[i+\Delta]) \le 8)$$
+     $$\text{Coverage} = \frac{M^*}{L_{\min}}$$
+   - If $\text{Coverage} \ge 0.65$ (configurable via `dedupe.download_coverage_threshold`), the item is flagged as `rejected: duplicate_download`.
+   - **Verification**: Caught real reposts (Trailer 2 Rockstar vs PlayStation at 99.4% coverage; Launch Trailer Rockstar vs Xbox at 95.6% coverage). Did NOT flag Trailer 1 vs Trailer 2 (11.1% coverage) or GamingBolt creator reaction video containing trailer footage (10.8% coverage).
+2. **Cut-Level Duplicate Detection (CP2)**:
+   - Partial overlap is handled at the cut level.
+   - Uses consecutive matching subsequence: $N=3$ consecutive frames matching a previously rendered/queued/posted cut. If matched, the next-best 20s candidate window is selected.
+3. **1 fps Fingerprinting**: Extract frames at 1 frame per second (`fps=1`) using ffmpeg raw gray pipe.
+4. **64-bit dHash Generation**: Grayscale frame converted to $9\times8$ resolution; horizontal difference between adjacent pixels generates a 64-bit unsigned integer hash.
+5. **Crop Handling**:
+   - `crop_black_bars` in `config.yaml` defaults to `false` because 9x8 downscaled dHash gradients are naturally robust across minor border differences.
+   - If enabled, crop detection validates stream dimensions and rejects boxes where both width and height are smaller than stream dimensions (preventing ESRB rating cards or intro logos from masquerading as letterboxing).
 
 ---
 
@@ -535,7 +549,8 @@ retention:
 
 orchestrator:
   loop_interval_seconds: 60
-  stale_lock_seconds: 600
+  stale_lock_seconds: 120.0
+  heartbeat_interval_seconds: 30.0
 ```
 
 ---
@@ -546,35 +561,86 @@ orchestrator:
 Kick does provide an official public API (`api.kick.com/public`) requiring application credentials, but it currently lacks a clips endpoint. Clips are only served via undocumented website endpoints, which constitutes scraping. Per project rules (*"do not scrape around it"*), Kick remains disabled until official clips support is released.
 
 ### Cloud Server IP Blocking Note
-Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube and Reddit frequently block datacenter IP ranges (HTTP 429 / CAPTCHA). Per project rules (*"do not add cookies or proxies to get around it"*), the pipeline must detect blocking, pause the affected source, emit a single Telegram alert, and continue operating autonomously using remaining unblocked sources (e.g. Reddit JSON or Twitch Helix).
+Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequently blocks datacenter IP ranges (HTTP 429 / CAPTCHA). Per project rules (*"do not add cookies or proxies to get around it"*), the pipeline detects blocking, records rate-limit cooldown in the database, emits a Telegram alert, and gracefully pauses affected calls while remaining crash-safe and resumable.
 
 ---
 
 ## 13. Calls I Made (Comprehensive Engineering Audit)
 
-1. **Virtual Environment Python Version**: Selected `Python 3.11` for `.venv` because `Kokoro TTS` requires `numpy 1.26.4` which lacks binary wheels for Python 3.14 on Windows and triggers C-compilation failures, whereas Python 3.11 provides fully compatible prebuilt binary wheels for Kokoro, Torch, and faster-whisper.
-2. **Audio/Scene Cut Weights**: Standardized cut scoring to 0.75 audio loudness weight and 0.25 visual scene-cut density.
-3. **Intro/Outro Penalty Window**: Applied a 5% duration penalty to the beginning and end of long-form videos to avoid channel intros and outro slates.
-4. **Target Cut Duration Range**: Hard-bounded between 18.0s and 22.0s with a 20.0s target window.
-5. **YouTube Query Duration Ceiling**: Capped search results at 600s (10 minutes) to avoid downloading multi-hour livestreams.
-6. **Local Whisper Model**: Selected `base.en` as default for sub-second CPU transcription latency while retaining high word-timestamp accuracy.
-7. **Font Choice**: Bundled open-source `Montserrat-Bold.ttf` for high vertical readability.
-8. **Audio Loudness Target**: Standardized at $-14.0\text{ LUFS}$ per Instagram and Facebook Reels ingest specs.
-9. **Audio Ducking Depth**: Standardized at $-14.0\text{ dB}$ attenuation during the 3–6s voiceover line.
-10. **Ready Buffer Size**: Fixed at 6 ready rendered items to prevent unbounded disk usage and conserve Gemini API calls.
-11. **Deduplication Thresholds**: Set consecutive matching frames $N=3$ at 1 fps with Hamming distance $\le 8$ bits on cropped frames.
-12. **Bandit Exploration Floor**: Set minimum exploration floor at 20% for each variant to guarantee ongoing statistical validation.
-13. **Stale Lock Timeout**: Set orchestrator lock timeout at 600 seconds (10 minutes) to safely recover from unexpected process crashes.
-14. **Failed Media Retention**: Set retention for rejected and failed item media at 3 days before disk purge.
+1. **Virtual Environment Python Version**: Selected `Python 3.11` for `.venv` because `Kokoro TTS` requires `numpy 1.26.4` which lacks binary wheels for Python 3.14 on Windows and triggers C-compilation failures, whereas Python 3.11 provides fully compatible prebuilt binary wheels for Kokoro, Torch, and faster-whisper. (Server README explicitly notes Python 3.11 requirement).
+2. **Reddit Dropped as Source (Decision A)**: Reddit ended unauthenticated public `.json` access globally in 2026, returning `403 Blocked by network security`, and developer API applications are closed. Dropped entirely from config, discovery, and `.env.example`.
+3. **Official Channel Down-Weighting (Decision B)**: Assigned `official_channel_weight: 0.20` to official publisher/platform channels (Rockstar Games, PlayStation, Xbox, Netflix) matched strictly by channel ID, ensuring fresh creator videos rank higher.
+4. **YouTube Real Metadata Fetching**: Rate-limited individual video extraction (0.5s pause) to pull true `upload_date` and `view_count` instead of flat-playlist estimation.
+5. **YouTube Date-Sorted Search**: Added `sp=CAI%253D` search queries alongside relevance search to surface fresh creator uploads.
+6. **Download Dedupe Coverage Threshold**: Set to `0.65` (65% temporal alignment overlap of shorter video) to catch full reposts while preventing reaction videos sharing brief trailer footage from being falsely flagged.
+7. **Crop Detection Logic**: Set `crop_black_bars: false` by default for raw 9x8 gradients; smart cropdetect rejects boxes where both width and height are smaller than stream dimensions (preventing ESRB rating cards or intro logos from masquerading as letterboxing).
+8. **Heartbeat Lock Timing**: Configured a 30s heartbeat refresh interval and 120s stale remote timeout, with immediate dead PID termination check.
+9. **Audio/Scene Cut Weights**: Standardized cut scoring to 0.75 audio loudness weight and 0.25 visual scene-cut density.
+10. **Intro/Outro Penalty Window**: Applied a 5% duration penalty to the beginning and end of long-form videos to avoid channel intros and outro slates.
+11. **Static Video Density Floor**: Added 0.05 scene changes/second minimum floor (CP2) to reject static podcast/cover art uploads.
+12. **Target Cut Duration Range**: Hard-bounded between 18.0s and 22.0s with a 20.0s target window.
+13. **YouTube Query Duration Ceiling**: Capped search results at 600s (10 minutes) to avoid downloading multi-hour livestreams.
+14. **Local Whisper Model**: Selected `base.en` as default for sub-second CPU transcription latency while retaining high word-timestamp accuracy.
+15. **Voiceover Line**: 3–6s via local Kokoro TTS near video start with -14 dB audio ducking.
+16. **Font Choice**: Bundled open-source `Montserrat-Bold.ttf` for high vertical readability.
+17. **Audio Loudness Target**: Standardized at $-14.0\text{ LUFS}$ per Instagram and Facebook Reels ingest specs.
+18. **Ready Buffer Size**: Fixed at 6 ready rendered items to prevent unbounded disk usage and conserve Gemini API calls.
+19. **Bandit Exploration Floor**: Set minimum exploration floor at 20% for each variant to guarantee ongoing statistical validation.
+20. **Failed Media Retention**: Set retention for rejected and failed item media at 3 days before disk purge.
 
 ---
 
-## 14. Checklist of Required Items from User by Checkpoint
+## 14. Checkpoint 1 Re-Proof Verification Data
+
+### Discovery Top 10 with Real Recency Decay
+| Video Title | Channel | Views | Age (h) | Velocity | Pct Rank | Decay | Weight | Final Score |
+|---|---|---|---|---|---|---|---|---|
+| GTA 6 Is All Set To Do The Unbelievable | GamingBolt | 160,484 | 22.0h | 7,284.9/h | 0.90 | 0.654 | 1.00 | 0.579 |
+| BREAKING: GTA 6 ONLINE MULTIPLAYER LEAKED.. | Tridzo GTA | 4,622 | 1.5h | 3,038.1/h | 0.65 | 0.971 | 1.00 | 0.574 |
+| 15 Things YOU NEED TO DO Before GTA 6 Releases | Hazard | 35,154 | 12.4h | 2,824.4/h | 0.61 | 0.787 | 1.00 | 0.437 |
+| I Became A "HITMAN" In GTA 6 VR! (Shiesty) | Kexi | 17,463 | 11.3h | 1,538.9/h | 0.55 | 0.804 | 1.00 | 0.391 |
+| GTA 6 Box has Leaked (Poster Included) | GameRiot | 28,411 | 35.5h | 799.5/h | 0.45 | 0.504 | 1.00 | 0.194 |
+| GTA 6 "Gas" Leaked Gameplay \| 1080p HDR | CYBERLEEK | 13,705 | 27.9h | 490.5/h | 0.35 | 0.584 | 1.00 | 0.168 |
+| Rockstar Updated the GTA 6 Release Time | TmarTn2 | 544,103 | 134.1h | 4,056.4/h | 0.71 | 0.076 | 1.00 | 0.050 |
+| GTA 6 GAMEPLAY & LEAKS \| CLIP ESCLUSIVE | GtaVI Clip | 5,973 | 48.0h | 124.3/h | 0.16 | 0.397 | 1.00 | 0.044 |
+| GTA 6 - Dev. Build LEAKED (CyberLeek Update!) | GTA6Videos | 26,272 | 102.7h | 255.7/h | 0.29 | 0.138 | 1.00 | 0.031 |
+| GTA 6 Gameplay: Jason Free Roam in Vice City | Gar Studio | 199,610 | 148.2h | 1,346.8/h | 0.48 | 0.058 | 1.00 | 0.024 |
+
+*Note: Evergreen Trailer 1 (Rockstar Games, Dec 2023, ~25,000h old) receives decay $0.5^{25000/36} \approx 0.0$ and final score $0.000$, allowing fresh creator uploads to dominate the top ranks.*
+
+### Real Repost Deduplication Proofs
+| Comparison Pair | Video Types | Matching Frames | Min Length | Coverage | Result |
+|---|---|---|---|---|---|
+| Trailer 2 Rockstar vs Trailer 2 PlayStation | Same Trailer (Repost) | 166 | 167 | 99.4% | **CAUGHT AS DUPLICATE** ($\ge 65\%$) |
+| Launch Trailer Rockstar vs Launch Trailer Xbox | Same Trailer (Repost) | 86 | 90 | 95.6% | **CAUGHT AS DUPLICATE** ($\ge 65\%$) |
+| Trailer 1 Rockstar vs Trailer 2 Rockstar | Different Trailers | 10 | 90 | 11.1% | **NOT FLAGGED** ($< 65\%$) |
+| GamingBolt Breakdown vs Trailer 2 Rockstar | Creator video using trailer footage | 18 | 167 | 10.8% | **NOT FLAGGED** ($< 65\%$) |
+| GamingBolt Breakdown vs Launch Trailer Rockstar | Creator video using trailer footage | 7 | 90 | 7.8% | **NOT FLAGGED** ($< 65\%$) |
+
+### Real Crash & Resume Test Results
+- **Process Spawned**: PID `14592` via CLI `python -m pipeline.runner --db crash_proof.db download`.
+- **Intervention**: Killed mid-download via `proc.kill()` during active network payload.
+- **Immediate State Post-Crash**:
+  - Item row count: `1` (unchanged).
+  - Duplicate rows: `0`.
+  - Item stage: `discovered`.
+  - Stale temp file: `tmp_crash_test_item.f401.mp4.part`.
+- **Immediate Rerun**:
+  - Dead PID detected on host: `Breaking stale lock: process PID 14592 on host is dead`.
+  - Rerun acquired lock in `0.02s` without waiting 600s.
+  - Stale temp file cleaned up.
+  - Download resumed and completed successfully in 39.15s.
+  - Final item stage: `downloaded`.
+  - Final media verified on disk via ffprobe.
+
+---
+
+## 15. Checklist of Required Items from User by Checkpoint
 
 | Checkpoint | Item Needed from User | Where to Provide | Status |
 |---|---|---|---|
 | **CP 0** | Plan approval ("go") | Chat response | Completed. |
-| **CP 1** | None (public YouTube and Reddit JSON) | N/A | Current checkpoint. |
+| **CP 1** | None (public YouTube) | N/A | **Re-Proof Completed & Passing.** |
 | **CP 2** | `GEMINI_API_KEY` | `.env` | Needed for hook generation and VO scripting. |
 | **CP 3** | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IG_USER_ID`, `IG_ACCESS_TOKEN`, `FB_PAGE_ID` | `.env` | Needed for Telegram card & social publishing. |
 | **CP 4** | `HEALTHCHECK_URL` (optional), `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET` (before 19 Nov) | `.env` | Needed for dead-man switch and Twitch Helix. |

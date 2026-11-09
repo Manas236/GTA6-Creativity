@@ -132,13 +132,24 @@ def download_single_item(
 
     duration_s = time.time() - t0
 
-    # Run Level-2 Perceptual Deduplication against all prior downloads
-    is_dup, matching_id = dedupe.dedupe_download(item_id, final_path, cfg=cfg, db_path=db_path)
+    # Run Level-2 Perceptual Deduplication against all prior downloads (coverage-based)
+    is_dup, matching_id, cov = dedupe.dedupe_download(item_id, final_path, cfg=cfg, db_path=db_path)
     if is_dup:
-        db.mark_rejected(item_id, f"duplicate_download: matches {matching_id}", is_duplicate=True, db_path=db_path)
-        db.log_stage(item_id, "download", "rejected", message=f"Duplicate of {matching_id}", duration_s=duration_s, db_path=db_path)
-        # We can keep the downloaded file or delete it; retention cleanup handles it
-        return False, f"Rejected: Duplicate of {matching_id}"
+        db.mark_rejected(
+            item_id,
+            f"duplicate_download: matches {matching_id} (coverage {cov*100:.1f}%)",
+            is_duplicate=True,
+            db_path=db_path,
+        )
+        db.log_stage(
+            item_id,
+            "download",
+            "rejected",
+            message=f"Duplicate of {matching_id} ({cov*100:.1f}% coverage)",
+            duration_s=duration_s,
+            db_path=db_path,
+        )
+        return False, f"Rejected: Duplicate of {matching_id} ({cov*100:.1f}%)"
 
     # Transition item to 'downloaded' stage
     db.transition_stage(

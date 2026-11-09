@@ -64,3 +64,4 @@ def record_success(source: str, db_path: Any = None) -> None:
             """,
             (ts, source),
         )
+

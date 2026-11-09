@@ -12,7 +12,7 @@ def test_config_loads_and_has_required_sections() -> None:
     cfg = config.get_config(reload=True)
     assert "sources" in cfg
     assert "youtube" in cfg["sources"]
-    assert "reddit" in cfg["sources"]
+    assert "official_channels" in cfg["sources"]
     assert "discovery" in cfg
     assert "score_formula" in cfg["discovery"]
     assert "buffer" in cfg
@@ -34,7 +34,6 @@ def test_env_example_contains_all_keys() -> None:
         "HEALTHCHECK_URL",
         "TWITCH_CLIENT_ID",
         "TWITCH_CLIENT_SECRET",
-        "REDDIT_USER_AGENT",
     ]
     for k in expected_keys:
         assert f"{k}=" in content, f"Missing key in .env.example: {k}"
@@ -62,3 +61,4 @@ def test_evaluate_formula_functions_and_division() -> None:
 def test_evaluate_formula_blocks_unsafe_ast() -> None:
     with pytest.raises(ValueError):
         config.evaluate_formula("__import__('os').system('ls')", {})
+

@@ -85,3 +85,4 @@ def test_crash_recovery_missing_file_requeues(tmp_db: Path) -> None:
     download.run_download_pipeline(max_items=0, db_path=tmp_db)
     rechecked = db.get_item("crashed_item", db_path=tmp_db)
     assert rechecked["stage"] == "discovered"
+

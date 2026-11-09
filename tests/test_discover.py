@@ -1,4 +1,4 @@
-"""Unit tests for discovery stage with zero network requests."""
+"""Unit tests for YouTube discovery, recency decay, and official channel down-weighting."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,134 +11,116 @@ from pipeline import config, db, discover, rate_limit
 
 
 def test_discover_youtube_mocked(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_yt_response = {
+    fake_flat_entries = {
         "entries": [
-            {
-                "id": "yt_mock_1",
-                "title": "GTA 6 Leaked Gameplay Vice City",
-                "duration": 40.0,
-                "view_count": 250000,
-                "like_count": 12000,
-                "channel": "GTA Leaks Official",
-                "upload_date": "20261108",
-                "url": "https://www.youtube.com/watch?v=yt_mock_1",
-            },
-            {
-                "id": "yt_mock_2_toolong",
-                "title": "GTA 6 2-Hour Livestream Breakdown",
-                "duration": 7200.0,  # Exceeds max 600s
-                "view_count": 10000,
-                "channel": "Streamer",
-                "url": "https://www.youtube.com/watch?v=yt_mock_2_toolong",
-            },
+            {"id": "yt_creator_1", "title": "GTA 6 Gameplay"},
+            {"id": "yt_official_1", "title": "GTA 6 Trailer"},
         ]
     }
 
     mock_ydl = MagicMock()
-    mock_ydl.extract_info.return_value = fake_yt_response
-    monkeypatch.setattr(discover.yt_dlp, "YoutubeDL", lambda *args, **kwargs: MagicMock(__enter__=lambda s: mock_ydl, __exit__=lambda *a: None))
+    mock_ydl.extract_info.return_value = fake_flat_entries
+
+    # Mock metadata calls
+    def mock_meta_extract(url: str, download: bool = False) -> dict[str, Any]:
+        if "yt_creator_1" in url:
+            return {
+                "id": "yt_creator_1",
+                "title": "GTA 6 Secret Gameplay Breakdown",
+                "duration": 45.0,
+                "view_count": 50000,
+                "timestamp": 1794100000,
+                "channel_id": "UC_creator_normal",
+                "uploader": "GTA Creator",
+            }
+        else:
+            return {
+                "id": "yt_official_1",
+                "title": "GTA 6 Official Trailer",
+                "duration": 90.0,
+                "view_count": 100000000,
+                "timestamp": 1701731230,  # Dec 2023
+                "channel_id": "UC6VcWc1rAoWdBCM0JxrRQ3A",  # Rockstar Games official
+                "uploader": "Rockstar Games",
+            }
+
+    mock_meta_ydl = MagicMock()
+    mock_meta_ydl.extract_info.side_effect = mock_meta_extract
+
+    def ydl_factory(opts: dict[str, Any]) -> Any:
+        if opts.get("extract_flat"):
+            return MagicMock(__enter__=lambda s: mock_ydl, __exit__=lambda *a: None)
+        return MagicMock(__enter__=lambda s: mock_meta_ydl, __exit__=lambda *a: None)
+
+    monkeypatch.setattr(discover.yt_dlp, "YoutubeDL", ydl_factory)
 
     items = discover.discover_youtube(db_path=tmp_db)
-    assert len(items) == 1
-    assert items[0]["source_id"] == "yt_mock_1"
-    assert items[0]["view_count"] == 250000
-    assert items[0]["raw_velocity"] > 0
+    assert len(items) == 2
+
+    creator_item = next(i for i in items if i["source_id"] == "yt_creator_1")
+    official_item = next(i for i in items if i["source_id"] == "yt_official_1")
+
+    assert creator_item["is_official"] is False
+    assert creator_item["effective_weight"] == 1.0
+
+    assert official_item["is_official"] is True
+    assert official_item["effective_weight"] == 0.20
 
 
-def test_discover_reddit_mocked(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_reddit_payload = {
-        "data": {
-            "children": [
-                {
-                    "data": {
-                        "id": "red_mock_1",
-                        "title": "Found this secret building in GTA 6 trailer!",
-                        "author": "LuciaFan",
-                        "is_video": True,
-                        "media": {"reddit_video": {"duration": 15}},
-                        "score": 450,
-                        "num_comments": 80,
-                        "created_utc": 1794100000.0,
-                        "permalink": "/r/GTA6/comments/red_mock_1",
-                        "over_18": False,
-                    }
-                },
-                {
-                    "data": {
-                        "id": "red_mock_text",
-                        "title": "Discussion: when will trailer 2 drop?",
-                        "author": "DiscussionPoster",
-                        "is_video": False,
-                        "media": None,
-                        "over_18": False,
-                    }
-                },
-            ]
-        }
-    }
-
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = fake_reddit_payload
-    monkeypatch.setattr(discover.requests, "get", lambda *args, **kwargs: mock_resp)
-
-    items = discover.discover_reddit(db_path=tmp_db)
-    # The duplicate red_mock_1 across r/GTA6 and r/GTA is properly deduped by ID
-    assert len(items) == 1
-    assert items[0]["source"] == "reddit"
-    assert items[0]["source_id"] == "red_mock_1"
-    assert items[0]["upvote_count"] == 450
-    assert items[0]["comment_count"] == 80
-
-
-def test_run_discovery_end_to_end_mocked(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    mock_yt = [
+def test_decay_ordering_with_known_ages(tmp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Item A: Fresh creator upload (24h old, 50,000 views)
+    # Item B: Old viral trailer (25,000h old, 200,000,000 views)
+    mock_candidates = [
         {
-            "id": "item_yt",
+            "id": "item_fresh_creator",
             "source": "youtube",
-            "source_id": "yt1",
-            "source_url": "https://yt.com/1",
-            "author_name": "YT Creator",
-            "original_title": "Video 1",
+            "source_id": "fresh_1",
+            "channel_id": "UC_creator",
+            "source_url": "https://yt.com/fresh_1",
+            "author_name": "Fresh Creator",
+            "original_title": "GTA 6 Fresh Breakdown",
             "original_duration": 30.0,
-            "view_count": 100000,
-            "upvote_count": 5000,
-            "comment_count": 200,
-            "upload_time": "2026-11-09T00:00:00Z",
-            "raw_velocity": 10000.0,
-            "age_hours": 10.0,
-        }
-    ]
-    mock_red = [
+            "view_count": 50000,
+            "upload_time": "2026-11-08T00:00:00Z",
+            "raw_velocity": 50000 / 24.0,  # ~2083 vph
+            "age_hours": 24.0,
+            "is_official": False,
+            "effective_weight": 1.0,
+        },
         {
-            "id": "item_red",
-            "source": "reddit",
-            "source_id": "r1",
-            "source_url": "https://reddit.com/r1",
-            "author_name": "Redditor",
-            "original_title": "Reddit Video",
-            "original_duration": 20.0,
-            "view_count": 600,
-            "upvote_count": 500,
-            "comment_count": 50,
-            "upload_time": "2026-11-09T05:00:00Z",
-            "raw_velocity": 120.0,
-            "age_hours": 5.0,
-        }
+            "id": "item_old_trailer",
+            "source": "youtube",
+            "source_id": "old_trailer",
+            "channel_id": "UC6VcWc1rAoWdBCM0JxrRQ3A",
+            "source_url": "https://yt.com/old_trailer",
+            "author_name": "Rockstar Games",
+            "original_title": "Grand Theft Auto VI Trailer 1",
+            "original_duration": 91.0,
+            "view_count": 200000000,
+            "upload_time": "2023-12-04T00:00:00Z",
+            "raw_velocity": 200000000 / 25000.0,  # ~8000 vph
+            "age_hours": 25000.0,
+            "is_official": True,
+            "effective_weight": 0.20,
+        },
     ]
 
-    monkeypatch.setattr(discover, "discover_youtube", lambda cfg, db_path: mock_yt)
-    monkeypatch.setattr(discover, "discover_reddit", lambda cfg, db_path: mock_red)
+    monkeypatch.setattr(discover, "discover_youtube", lambda cfg, db_path: mock_candidates)
 
-    results = discover.run_discovery(db_path=tmp_db)
-    assert len(results) == 2
+    scored = discover.run_discovery(db_path=tmp_db)
+    assert len(scored) == 2
 
-    # Verify both exist in DB with discovery scores
-    items_in_db = db.get_items_by_stage("discovered", db_path=tmp_db)
-    assert len(items_in_db) == 2
-    for it in items_in_db:
-        assert it["discovery_score"] > 0
-        assert 0.0 < it["percentile_rank"] <= 1.0
+    fresh_res = next(s for s in scored if s["id"] == "item_fresh_creator")
+    old_res = next(s for s in scored if s["id"] == "item_old_trailer")
+
+    # Due to exponential decay (0.5 ** (25000 / 36)), old trailer decay factor is ~0.0
+    assert old_res["decay_factor"] < 1e-10
+    assert old_res["discovery_score"] < 1e-10
+
+    # Fresh creator has substantial decay factor and scores much higher
+    assert fresh_res["decay_factor"] > 0.5
+    assert fresh_res["discovery_score"] > 0.1
+    assert fresh_res["discovery_score"] > old_res["discovery_score"]
 
 
 def test_paused_source_skipped(tmp_db: Path) -> None:
