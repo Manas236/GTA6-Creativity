@@ -217,8 +217,8 @@ style:
       MAP: "1f5fa"
       CITY: "1f3d9"
       BEACH: "1f3d6"
-      LEAK: "1f4a7"
-      LEAKED: "1f4a7"
+      LEAK: "1f440" # eyes: in GTA context a leak is leaked info, not a water droplet
+      LEAKED: "1f440"
       TRAILER: "1f3ac"
       GAMEPLAY: "1f3ae"
       INSANE: "1f92f"

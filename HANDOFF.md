@@ -157,6 +157,12 @@ ffmpeg/libass: the F1 band really resizes, the bar really fills, the hook outlin
 clear, the bed really ducks 8 dB, dead air really shortens the render) and
 `tests/test_scripts.py` (both laptop scripts, fully mocked).
 
+**Windows note:** Pillow's Windows wheels ship without libraqm, so `text_width_px` measures
+*without* GPOS kerning (Montserrat kerns only via GPOS; libass still kerns when it draws).
+Near-tie hook wraps can therefore differ from Linux, e.g. `IS THIS REALLY / GTA 6?` vs
+`IS THIS / REALLY GTA 6?` (792 vs 793 px). `test_build_ass_subtitles_no_speech` accepts
+either split when they are within 2 px.
+
 ### Live Network Integration Tests
 Runs live crash-recovery and network tests:
 ```bash

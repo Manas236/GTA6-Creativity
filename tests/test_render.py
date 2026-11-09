@@ -108,9 +108,22 @@ def test_build_ass_subtitles_no_speech():
     ass_text = render.build_ass_subtitles("IS THIS REALLY GTA 6?", video_duration=20.0, words=[])
     assert "PlayResX: 1080" in ass_text and "PlayResY: 1920" in ass_text
     assert "Style: Hook" in ass_text
-    dialogue_styles = [l.split(",")[3] for l in ass_text.splitlines() if l.startswith("Dialogue:")]
+    dialogue = [l for l in ass_text.splitlines() if l.startswith("Dialogue:")]
+    dialogue_styles = [l.split(",")[3] for l in dialogue]
     assert dialogue_styles and set(dialogue_styles) == {"Hook"}
-    assert "IS THIS" in ass_text and "REALLY GTA 6?" in ass_text
+
+    # The two 2-line wraps are a near-tie (~1 px apart). Pillow on Windows ships without
+    # libraqm and measures without GPOS kerning, Linux Pillow kerns, so the narrower split
+    # can flip between platforms. Accept either split while they are within 2 px; beyond
+    # that, the layout must pick the narrower one.
+    lines = [re.sub(r"\{[^}]*\}", "", l.split(",", 9)[9]) for l in dialogue]
+    size = RS["hook"]["font_size"]
+    splits = [["IS THIS", "REALLY GTA 6?"], ["IS THIS REALLY", "GTA 6?"]]
+    widths = [max(render.text_width_px(s, size, RS["font_path"]) for s in sp) for sp in splits]
+    if abs(widths[0] - widths[1]) <= 2.0:
+        assert lines in splits, lines
+    else:
+        assert lines == splits[widths.index(min(widths))], (lines, widths)
 
 
 def test_build_ass_subtitles_with_speech_highlight_and_chunks():
