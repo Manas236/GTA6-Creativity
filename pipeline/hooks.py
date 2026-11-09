@@ -1,4 +1,16 @@
-"""Stage 5: Gemini multimodal hook generation, authenticity classification, and grounding verification."""
+"""Stage 5: Gemini multimodal hook generation, authenticity classification, and grounding verification.
+
+Failure policy (no silent placeholders):
+  * Gemini answers that are truncated (finishReason MAX_TOKENS), not valid JSON, or missing
+    hook_text / voiceover_script raise GeminiError: that attempt failed, nothing is defaulted.
+  * Calls are spaced to the free-tier limit (gemini.requests_per_minute) and an HTTP 429 is
+    retried after the server's retryDelay.
+  * A grounding check that errors (429, network, odd reply) means NOT grounded.
+  * Only when Gemini answered but the hook got `grounding_fail_limit` FAIL verdicts is the
+    fixed question hook used (saved with hook_grounded = 0).
+  * No valid Gemini hook after `max_attempts` -> the hooks stage is marked failed, and any
+    previously stored hook fields are cleared.
+"""
 from __future__ import annotations
 
 import base64
@@ -6,6 +18,7 @@ import json
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +29,52 @@ from . import config, db, keywords
 log = logging.getLogger(__name__)
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+GEMINI_DEFAULTS: dict[str, Any] = {
+    "model": "gemini-2.5-flash",
+    "thinking_budget": 0,
+    "max_output_tokens": 2048,
+    "requests_per_minute": 5,
+    "rate_limit_retries": 2,
+    "max_attempts": 3,
+    "grounding_fail_limit": 2,
+    "fallback_hook": "IS THIS REALLY GTA 6?",
+}
+FALLBACK_VOICEOVER = "Check out this crazy GTA 6 moment right now!"
+
+# Free-tier pacing state (per process). _sleep/_now are module attributes so tests can fake them.
+_LAST_CALL_T: float | None = None
+_sleep = time.sleep
+_now = time.monotonic
+
+
+class GeminiError(RuntimeError):
+    """A Gemini call did not produce a usable answer (the attempt failed)."""
+
+
+class GeminiRateLimitError(GeminiError):
+    """HTTP 429 persisted after the configured retries."""
+
+
+class GeminiTruncatedError(GeminiError):
+    """finishReason MAX_TOKENS: the answer was cut off."""
+
+
+class GeminiBadResponseError(GeminiError):
+    """Empty, blocked, or unparseable answer, or required fields missing."""
+
+
+def gemini_settings(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = cfg or config.get_config()
+    out = dict(GEMINI_DEFAULTS)
+    out.update({k: v for k, v in (cfg.get("gemini") or {}).items()})
+    return out
+
+
+def _redact(text: str) -> str:
+    """Never let the API key (it rides in the request URL) reach logs or the DB."""
+    text = re.sub(r"key=[^&\s\"']+", "key=REDACTED", str(text))
+    return re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "REDACTED", text)
 
 
 def extract_sample_frames(video_path: Path | str, count: int = 4) -> list[bytes]:
@@ -63,13 +122,49 @@ def extract_sample_frames(video_path: Path | str, count: int = 4) -> list[bytes]
     return frames
 
 
+# --------------------------------------------------------------------------------------
+# Gemini transport: pacing, 429 handling, truncation detection
+# --------------------------------------------------------------------------------------
+
+def _throttle(min_interval_s: float) -> None:
+    """Keep consecutive Gemini calls at least min_interval_s apart."""
+    global _LAST_CALL_T
+    if _LAST_CALL_T is not None:
+        wait = float(min_interval_s) - (_now() - _LAST_CALL_T)
+        if wait > 0:
+            log.info("Gemini pacing: waiting %.1fs (free-tier rate limit)", wait)
+            _sleep(wait)
+    _LAST_CALL_T = _now()
+
+
+def _retry_delay_s(res: Any) -> float | None:
+    """Server-requested wait for a 429: Retry-After header or RetryInfo.retryDelay ("54s")."""
+    try:
+        ra = (res.headers or {}).get("Retry-After")
+        if ra:
+            return float(ra)
+    except Exception:
+        pass
+    try:
+        for d in res.json().get("error", {}).get("details", []) or []:
+            m = re.match(r"^\s*([\d.]+)s\s*$", str(d.get("retryDelay", "")))
+            if m:
+                return float(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def _call_gemini(
     prompt: str,
     images: list[bytes] | None = None,
     model: str = "gemini-2.5-flash",
     api_key: str | None = None,
+    json_mode: bool = False,
+    cfg: dict[str, Any] | None = None,
 ) -> str:
-    """Call Gemini API generateContent endpoint with text and optional inline images."""
+    """Call Gemini generateContent with text and optional inline images. Raises GeminiError."""
+    gs = gemini_settings(cfg)
     if not api_key:
         env = config.load_env()
         api_key = env.get("GEMINI_API_KEY", "")
@@ -90,25 +185,61 @@ def _call_gemini(
             })
     parts.append({"text": prompt})
 
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 1024,
-        },
+    gen_cfg: dict[str, Any] = {
+        "temperature": 0.4,
+        "maxOutputTokens": int(gs["max_output_tokens"]),
     }
+    if gs.get("thinking_budget") is not None:
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": int(gs["thinking_budget"])}
+    if json_mode:
+        gen_cfg["responseMimeType"] = "application/json"
+    payload = {"contents": [{"parts": parts}], "generationConfig": gen_cfg}
 
-    res = requests.post(url, json=payload, timeout=60)
+    min_interval = 60.0 / max(1e-6, float(gs["requests_per_minute"]))
+    retries = max(0, int(gs["rate_limit_retries"]))
+    res = None
+    for i in range(retries + 1):
+        _throttle(min_interval)
+        try:
+            res = requests.post(url, json=payload, timeout=60)
+        except requests.RequestException as e:
+            raise GeminiError(_redact(f"Gemini request failed: {e}")) from None
+        if res.status_code != 429:
+            break
+        delay = _retry_delay_s(res)
+        if i >= retries:
+            raise GeminiRateLimitError(f"Gemini HTTP 429 after {i + 1} tries (retryDelay {delay}s)")
+        wait = (delay if delay is not None else min_interval) + 1.0
+        log.warning("Gemini HTTP 429: waiting %.0fs as requested, then retrying (%d/%d)", wait, i + 1, retries)
+        _sleep(wait)
+
     if res.status_code != 200:
-        raise RuntimeError(f"Gemini API HTTP {res.status_code}: {res.text}")
+        raise GeminiError(_redact(f"Gemini API HTTP {res.status_code}: {res.text[:300]}"))
 
     resp_json = res.json()
-    candidates = resp_json.get("candidates", [])
+    candidates = resp_json.get("candidates") or []
     if not candidates:
-        raise RuntimeError(f"No candidates returned from Gemini: {resp_json}")
+        raise GeminiBadResponseError(_redact(f"No candidates returned from Gemini: {str(resp_json)[:300]}"))
 
-    return candidates[0]["content"]["parts"][0]["text"].strip()
+    cand = candidates[0]
+    finish = cand.get("finishReason")
+    if finish == "MAX_TOKENS":
+        raise GeminiTruncatedError(
+            f"Gemini answer truncated (finishReason MAX_TOKENS, usage {resp_json.get('usageMetadata')})"
+        )
+    if finish not in (None, "STOP"):
+        raise GeminiBadResponseError(f"Gemini finishReason {finish}")
+    text = "".join(
+        p.get("text", "") for p in (cand.get("content") or {}).get("parts") or [] if not p.get("thought")
+    ).strip()
+    if not text:
+        raise GeminiBadResponseError("Gemini returned an empty answer")
+    return text
 
+
+# --------------------------------------------------------------------------------------
+# Hook generation + grounding
+# --------------------------------------------------------------------------------------
 
 def generate_hook_and_voiceover(
     video_path: Path | str,
@@ -116,8 +247,12 @@ def generate_hook_and_voiceover(
     transcript_text: str = "",
     model: str = "gemini-2.5-flash",
     api_key: str | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Generate hook, authenticity tag, and voiceover line using multimodal Gemini call."""
+    """Generate hook, authenticity tag, voiceover line and keywords with one multimodal call.
+
+    Raises GeminiError when the answer is unusable; never substitutes defaults.
+    """
     sample_frames = extract_sample_frames(video_path, count=4)
 
     prompt = f"""You are a content strategist for high-performing, authentic GTA 6 short-form vertical videos (Reels).
@@ -157,35 +292,27 @@ Return ONLY a valid JSON object with EXACTLY this structure:
   "keywords": ["WORD", "WORD", "WORD"]
 }}
 """
-    raw_response = _call_gemini(prompt, images=sample_frames, model=model, api_key=api_key)
+    raw_response = _call_gemini(prompt, images=sample_frames, model=model, api_key=api_key,
+                                json_mode=True, cfg=cfg)
 
-    # Parse JSON from response (handling potential markdown code blocks and partial wrappers)
+    # Tolerate a markdown fence around the JSON, nothing else.
     clean = re.sub(r"^```(?:json)?\s*", "", raw_response.strip())
     clean = re.sub(r"\s*```$", "", clean)
     try:
         data = json.loads(clean)
     except Exception:
-        data = {}
-        # Try extracting JSON object via regex
-        m = re.search(r"\{[^{}]*\}", raw_response, re.DOTALL)
-        if m:
-            try:
-                data = json.loads(m.group(0))
-            except Exception:
-                pass
-        if not data:
-            auth_m = re.search(r'"authenticity"\s*:\s*"([^"]+)"', raw_response)
-            style_m = re.search(r'"hook_style"\s*:\s*"([^"]+)"', raw_response)
-            hook_m = re.search(r'"hook_text"\s*:\s*"([^"]+)"', raw_response)
-            vo_m = re.search(r'"voiceover_script"\s*:\s*"([^"]+)"', raw_response)
-            if hook_m:
-                data = {
-                    "authenticity": auth_m.group(1) if auth_m else "unverified",
-                    "hook_style": style_m.group(1) if style_m else "question",
-                    "hook_text": hook_m.group(1),
-                    "voiceover_script": vo_m.group(1) if vo_m else "Check out this crazy GTA 6 moment!",
-                }
+        raise GeminiBadResponseError(f"Gemini answer is not valid JSON: {raw_response[:160]!r}") from None
+    if not isinstance(data, dict):
+        raise GeminiBadResponseError(f"Gemini answer is not a JSON object: {raw_response[:160]!r}")
 
+    hook_raw = data.get("hook_text")
+    vo_raw = data.get("voiceover_script")
+    if not isinstance(hook_raw, str) or not hook_raw.strip():
+        raise GeminiBadResponseError("Gemini answer has no hook_text")
+    if not isinstance(vo_raw, str) or not vo_raw.strip():
+        raise GeminiBadResponseError("Gemini answer has no voiceover_script")
+
+    # Classification normalisation (conservative): anything unrecognised is 'unverified'.
     auth = data.get("authenticity", "unverified")
     if auth not in ("official", "unverified"):
         auth = "unverified"
@@ -194,19 +321,22 @@ Return ONLY a valid JSON object with EXACTLY this structure:
     if hook_style not in ("curiosity", "question", "hype_analysis"):
         hook_style = "question"
 
-    hook_text = data.get("hook_text", "IS THIS REALLY GTA 6?").strip().upper()
-    vo_script = data.get("voiceover_script", "Wait until you see this GTA 6 detail!").strip()
+    hook_text = hook_raw.strip().upper()
+    vo_script = vo_raw.strip()
 
     # Guarantee unverified clips have question framing
     if auth == "unverified" and not hook_text.endswith("?"):
         hook_text = f"{hook_text}?"
 
-    # C1: 3-6 caption keywords; falls back to the rule extractor when absent/unusable.
-    kw = keywords.clean_keywords(data.get("keywords"))
+    # C1: 3-6 caption keywords. If Gemini gave fewer than 3, top up from the rule
+    # extractor over the same transcript/title - and say so in keywords_source.
+    kw = keywords.clean_keywords(data.get("keywords"), cfg)
+    kw_source = "gemini"
     if len(kw) < 3:
-        extra = keywords.rule_keywords(f"{transcript_text} {source_title} {hook_text}")
+        extra = keywords.rule_keywords(f"{transcript_text} {source_title} {hook_text}", cfg)
         kw += [k for k in extra if k not in kw]
         kw = kw[:6]
+        kw_source = "gemini+rules"
 
     return {
         "authenticity": auth,
@@ -214,6 +344,7 @@ Return ONLY a valid JSON object with EXACTLY this structure:
         "hook_text": hook_text,
         "voiceover_script": vo_script,
         "keywords": kw,
+        "keywords_source": kw_source,
     }
 
 
@@ -224,13 +355,16 @@ def verify_hook_grounding(
     transcript_text: str = "",
     model: str = "gemini-2.5-flash",
     api_key: str | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Verification check call to Gemini ensuring hook is grounded and honest.
 
     Checks:
     1. Does the clip/transcript actually show or discuss what the hook claims?
     2. Does the hook falsely claim this is real GTA 6 when it is unverified?
-    Returns (passed: bool, reason: str).
+    Returns (passed, reason). reason starts with "FAIL" for a FAIL verdict and with
+    "ERROR" when no verdict was obtained (429, network, unexpected reply) - both are
+    NOT grounded.
     """
     check_prompt = f"""You are a strict quality control auditor for short-form video hooks.
 
@@ -249,15 +383,45 @@ or
 FAIL: <one-sentence specific reason>
 """
     try:
-        reply = _call_gemini(check_prompt, images=None, model=model, api_key=api_key)
-        first_line = reply.strip().splitlines()[0]
-        if first_line.startswith("PASS"):
-            return True, "Passed grounding and honesty verification"
-        return False, first_line
+        reply = _call_gemini(check_prompt, images=None, model=model, api_key=api_key, cfg=cfg)
     except Exception as e:
-        log.warning("Hook verification call error: %s", e)
-        # On network/API glitch in check, don't crash
-        return True, f"Check bypassed due to API error: {e}"
+        log.warning("Hook verification call error (treated as NOT grounded): %s", _redact(e))
+        return False, _redact(f"ERROR: grounding check failed: {e}")
+    first_line = (reply.strip().splitlines() or [""])[0].strip()
+    if first_line.startswith("PASS"):
+        return True, "Passed grounding and honesty verification"
+    if first_line.startswith("FAIL"):
+        return False, first_line
+    return False, f"ERROR: unexpected grounding reply: {first_line[:120]!r}"
+
+
+def _clear_hook_fields(item_id: str, db_path: Any = None) -> None:
+    """Drop any previously stored hook so a failed item cannot render a stale/placeholder one."""
+    with db.db(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE items SET hook_style = NULL, hook_text = NULL, hook_grounded = 0,
+                authenticity = 'unverified', voiceover_script = NULL, keywords = NULL,
+                updated_at = :now
+            WHERE id = :id
+            """,
+            {"id": item_id, "now": db.now()},
+        )
+
+
+def _cut_transcript(item: dict[str, Any], cut_path: Path, cfg: dict[str, Any], db_path: Any) -> list[dict[str, Any]]:
+    """faster-whisper words for the cut window, cached on the item for render to reuse."""
+    from . import render  # lazy: render imports this module
+
+    model_name = render.render_settings(cfg)["whisper_model"]
+    words = render.cached_cut_words(item, model_name)
+    if words is not None:
+        return words
+    log.info("Transcribing cut %s with faster-whisper (%s)...", cut_path.name, model_name)
+    words = render.transcribe_words(cut_path, model_name=model_name)
+    if words:  # an empty result may be a transcription failure: do not cache it
+        render.store_cut_words(item["id"], item, words, model_name, db_path=db_path)
+    return words
 
 
 def run_hooks_for_item(
@@ -278,55 +442,71 @@ def run_hooks_for_item(
 
     cut_path = Path(cut_path_str)
     source_title = item.get("original_title") or "GTA 6"
-    model = cfg.get("gemini", {}).get("model", "gemini-2.5-flash")
+    gs = gemini_settings(cfg)
+    model = gs["model"]
 
-    # Transcribe audio for grounding context
-    transcript = item.get("caption_text") or ""
+    # Transcript of the cut window (PLAN §8): Gemini gets it with the 4 frames and title.
+    words = _cut_transcript(item, cut_path, cfg, db_path)
+    transcript = " ".join(str(w.get("word", "")).strip() for w in words).strip()
+    log.info("Cut transcript for %s: %d words", item_id, len(words))
 
-    max_attempts = 3
+    max_attempts = max(1, int(gs["max_attempts"]))
+    fail_limit = max(1, int(gs["grounding_fail_limit"]))
+    problems: list[str] = []
+    grounding_fails = 0
     final_data: dict[str, Any] | None = None
     passed_grounding = False
+    used_fallback = False
 
     for attempt in range(1, max_attempts + 1):
         log.info("Generating hook for item %s (attempt %d/%d)...", item_id, attempt, max_attempts)
         try:
             data = generate_hook_and_voiceover(
-                cut_path,
-                source_title,
-                transcript_text=transcript,
-                model=model,
+                cut_path, source_title, transcript_text=transcript, model=model, cfg=cfg,
             )
         except Exception as e:
-            log.warning("Gemini generation failed on attempt %d: %s", attempt, e)
+            msg = _redact(f"attempt {attempt}: {type(e).__name__}: {e}")
+            log.warning("Gemini generation failed: %s", msg)
+            problems.append(msg)
             continue
 
         is_grounded, reason = verify_hook_grounding(
-            data["hook_text"],
-            data["authenticity"],
-            source_title,
-            transcript_text=transcript,
-            model=model,
+            data["hook_text"], data["authenticity"], source_title,
+            transcript_text=transcript, model=model, cfg=cfg,
         )
-
         if is_grounded:
             log.info("Hook passed verification: %s (%s)", data["hook_text"], data["authenticity"])
             passed_grounding = True
             final_data = data
             break
-        else:
-            log.warning("Hook failed grounding (attempt %d): %s. Reason: %s", attempt, data["hook_text"], reason)
 
-    # If verification failed 2 times, fall back to safe question hook
-    if not final_data:
-        log.warning("Falling back to safe question hook for item %s", item_id)
-        final_data = {
-            "authenticity": "unverified",
-            "hook_style": "question",
-            "hook_text": "IS THIS THE CRAZIEST GTA 6 DETAIL?",
-            "voiceover_script": "Check out this crazy GTA 6 moment right now!",
-            "keywords": keywords.rule_keywords(f"{transcript} {source_title}", cfg=cfg),
-        }
-        passed_grounding = False
+        problems.append(f"attempt {attempt}: hook {data['hook_text']!r} not grounded: {reason}")
+        if reason.startswith("FAIL"):
+            grounding_fails += 1
+            log.warning("Hook failed grounding (%d/%d): %s. Reason: %s",
+                        grounding_fails, fail_limit, data["hook_text"], reason)
+            if grounding_fails >= fail_limit:
+                # Gemini answered, but its hooks failed grounding: the designed fallback.
+                log.warning("Falling back to the plain question hook for item %s", item_id)
+                final_data = {
+                    "authenticity": "unverified",
+                    "hook_style": "question",
+                    "hook_text": str(gs["fallback_hook"]),
+                    "voiceover_script": FALLBACK_VOICEOVER,
+                    "keywords": keywords.rule_keywords(f"{transcript} {source_title}", cfg=cfg),
+                    "keywords_source": "rules",
+                }
+                used_fallback = True
+                break
+        else:
+            log.warning("Hook not grounded (no verdict) on attempt %d: %s", attempt, reason)
+
+    if final_data is None:
+        reason = f"No valid Gemini hook after {max_attempts} attempts: " + " | ".join(problems)
+        _clear_hook_fields(item_id, db_path=db_path)
+        db.mark_failed(item_id, "hooks", reason, db_path=db_path)
+        db.log_stage(item_id, "hooks", "failed", message=reason, db_path=db_path)
+        return False, reason
 
     # Save hook, authenticity and the C1 keyword cache to the database
     with db.db(db_path) as conn:
@@ -354,12 +534,15 @@ def run_hooks_for_item(
             },
         )
 
+    source = "fallback (grounding failed)" if used_fallback else "gemini"
     db.log_stage(
         item_id,
         "hooks",
-        "success",
-        message=f"Hook: '{final_data['hook_text']}' [{final_data['authenticity']}, grounded={passed_grounding}]",
+        "fallback" if used_fallback else "success",
+        message=(
+            f"Hook: '{final_data['hook_text']}' [{final_data['authenticity']}, grounded={passed_grounding}, "
+            f"source={source}, keywords={final_data.get('keywords_source')}, transcript_words={len(words)}]"
+        ),
         db_path=db_path,
     )
-    return True, f"Hook generated [{final_data['authenticity']}]"
-
+    return True, f"Hook generated [{final_data['authenticity']}, source={source}]"

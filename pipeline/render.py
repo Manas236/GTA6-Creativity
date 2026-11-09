@@ -16,6 +16,7 @@ render.av_duration_tolerance_s and fps / sample rate / channels / resolution mus
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import subprocess
@@ -53,7 +54,8 @@ _WHISPER_INSTANCE: Any = None
 
 __all__ = [
     "RENDER_DEFAULTS", "RenderVerificationError", "render_settings", "escape_filter_path",
-    "format_ass_timestamp", "transcribe_words", "em_px", "cap_height_px", "text_width_px",
+    "format_ass_timestamp", "transcribe_words", "cached_cut_words", "store_cut_words",
+    "cut_speech_words", "em_px", "cap_height_px", "text_width_px",
     "layout_hook", "hook_line_centers", "chunk_caption_words", "build_ass_subtitles",
     "build_variant_b_words", "estimate_words_from_script", "has_audio_stream", "probe_streams",
     "verify_render", "media_duration", "freeze_duration", "render_variant_a", "render_variant_b",
@@ -121,6 +123,57 @@ def transcribe_words(audio_or_video_path: Path | str, model_name: str = "base.en
     except Exception as e:
         log.warning("Whisper transcription failed for %s: %s", path_str, e)
         return []
+
+
+# The hooks stage transcribes the cut once (Gemini needs the transcript) and caches the
+# words on the item; render reuses them. The cache is keyed on the cut window and the
+# whisper model, so a re-cut (new cut_start/cut_end) silently invalidates it.
+
+def cached_cut_words(item: dict[str, Any] | None, model_name: str) -> list[dict[str, Any]] | None:
+    """Cut-timeline words cached on the item, or None when absent/stale/corrupt."""
+    raw = (item or {}).get("transcript_words")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if data.get("model") != model_name:
+            return None
+        for k in ("cut_start", "cut_end"):
+            if item.get(k) is None or abs(float(data[k]) - float(item[k])) > 1e-6:
+                return None
+        words = data["words"]
+        return [dict(w) for w in words] if isinstance(words, list) else None
+    except Exception:
+        return None
+
+
+def store_cut_words(
+    item_id: str, item: dict[str, Any], words: Sequence[dict[str, Any]], model_name: str, db_path: Any = None
+) -> None:
+    """Cache the cut transcript on the item (tagged with the cut window it belongs to)."""
+    payload = {
+        "cut_start": item.get("cut_start"),
+        "cut_end": item.get("cut_end"),
+        "model": model_name,
+        "words": list(words),
+    }
+    with db.db(db_path) as conn:
+        conn.execute(
+            "UPDATE items SET transcript_words = :tw, updated_at = :now WHERE id = :id",
+            {"id": item_id, "tw": json.dumps(payload), "now": db.now()},
+        )
+
+
+def cut_speech_words(item: dict[str, Any], cut_path: Path | str, model_name: str) -> list[dict[str, Any]]:
+    """Render-side read: the cached cut words when valid, else a fresh transcription.
+
+    Render never writes the cache; the hooks stage owns it.
+    """
+    cached = cached_cut_words(item, model_name)
+    if cached is not None:
+        log.info("Reusing %d cached cut words for %s (no re-transcription).", len(cached), item.get("id"))
+        return cached
+    return transcribe_words(cut_path, model_name=model_name)
 
 
 # --------------------------------------------------------------------------------------
@@ -830,9 +883,8 @@ def run_render_item(
 
     rs = render_settings(cfg)
     whisper_model = rs["whisper_model"]
-    log.info("Transcribing cut clip speech for item %s...", item_id)
-    speech_words = transcribe_words(cut_path, model_name=whisper_model)
-    log.info("Transcribed %d speech words from cut clip.", len(speech_words))
+    speech_words = cut_speech_words(item, cut_path, whisper_model)
+    log.info("%d speech words on the cut timeline.", len(speech_words))
 
     # VO words on the VO timeline (VO starts at 0 in Variant B's freeze).
     vo_words = transcribe_words(vo_path, model_name=whisper_model)

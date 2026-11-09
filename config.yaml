@@ -69,6 +69,18 @@ cut:
   intro_outro_penalty_pct: 0.05
   min_scene_change_density: 0.05 # Minimum scene cut density to reject static videos
 
+gemini:
+  model: "gemini-2.5-flash"
+  # 2.5-flash "thinking" tokens count against maxOutputTokens: at the old 1024 cap they
+  # used ~920 and truncated the JSON (finishReason MAX_TOKENS). Thinking off, roomier cap.
+  thinking_budget: 0 # set to null to omit thinkingConfig (models that cannot disable thinking)
+  max_output_tokens: 2048
+  requests_per_minute: 5 # free tier: calls are spaced 60/5 = 12 s apart
+  rate_limit_retries: 2 # per call: on HTTP 429, wait the server's retryDelay, then retry
+  max_attempts: 3 # hook generation attempts per item before the hooks stage fails
+  grounding_fail_limit: 2 # grounding FAIL verdicts before the plain question-hook fallback
+  fallback_hook: "IS THIS REALLY GTA 6?"
+
 render:
   width: 1080
   height: 1920

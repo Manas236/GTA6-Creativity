@@ -201,3 +201,29 @@ python scripts/fetch_assets.py --prefer-download     # try the Kenney CC0 SFX pa
 python scripts/render_previews.py
 python scripts/render_previews.py --presets P0 P3 --skip-download
 ```
+
+---
+
+## 6. Hooks stage: failure policy (laptop pass, 2026-11-10)
+At the old `maxOutputTokens: 1024`, gemini-2.5-flash spent ~920 tokens thinking, the JSON
+came back truncated (`finishReason: MAX_TOKENS`) and the parser silently saved its
+defaults (`IS THIS REALLY GTA 6?` / "Wait until you see this GTA 6 detail!"). Now
+(`config.yaml -> gemini:`): thinking off, JSON response mode, 2048-token cap; truncated or
+unparseable answers are failed attempts; calls are spaced 12 s apart (free tier, 5/min)
+and 429s wait the server's `retryDelay`; a grounding check that errors is NOT grounded.
+No valid hook after 3 attempts -> the item is marked `failed` at `hooks` and its hook
+fields are cleared. The fixed `IS THIS REALLY GTA 6?` hook (`hook_grounded = 0`) is used
+only when Gemini answered but the hook got 2 grounding FAIL verdicts. The hooks stage now
+transcribes the cut (faster-whisper `base.en`), sends that transcript to Gemini, and caches
+the words in `items.transcript_words` (keyed on the cut window + model) for render to reuse.
+
+## 7. Known issues (logged, not fixed)
+1. **Dedupe/scene-detection timeouts on AV1 1440p sources.** yt-dlp's
+   `bestvideo[ext=mp4]` picks AV1 1440p60; the gyan.dev "essentials" ffmpeg only has the
+   libaom AV1 decoder (~13 s per 30 s of source here). Download dedupe (180 s timeout)
+   timed out on all three 9-10 min sources, so no fingerprints were stored and dedupe
+   was effectively skipped; scene detection took ~240-270 s of its 300 s limit (a timeout
+   would reject the clip as `static_source`). Planned fix: cap downloads at 1080p H.264.
+2. **The test suite writes into the real project folder** (e.g.
+   `media/downloads/dl_item_1.mp4` from `tests/test_download.py`). Tests should use
+   `tmp_path` for media as they do for the DB.

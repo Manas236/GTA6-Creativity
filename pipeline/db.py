@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS items (
     authenticity TEXT DEFAULT 'unverified',
     keywords TEXT,                             -- C1: JSON array of 3-6 caption keywords
     style_preset TEXT,                          -- style preset the renders were made with
+    transcript_words TEXT,                      -- JSON {cut_start, cut_end, model, words}: cut transcript cached by the hooks stage
     voiceover_script TEXT,
     voiceover_audio_path TEXT,
     caption_text TEXT,
@@ -222,6 +223,9 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE items ADD COLUMN keywords TEXT")
         if "style_preset" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN style_preset TEXT")
+        # Cut-window transcript cached by the hooks stage and reused by render
+        if "transcript_words" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN transcript_words TEXT")
         post_cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "authenticity" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN authenticity TEXT DEFAULT 'unverified'")

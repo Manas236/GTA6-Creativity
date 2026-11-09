@@ -212,8 +212,8 @@ def render_item(
     result.hook, result.channel = hook, channel
 
     rs = render.render_settings(cfg)
-    log.info("  transcribing ...")
-    words = render.transcribe_words(cut_path, model_name=rs["whisper_model"])
+    # Cut words cached by the hooks stage when they match this cut window; else transcribe.
+    words = render.cut_speech_words(item, cut_path, rs["whisper_model"])
 
     vo_path = item.get("voiceover_audio_path")
     if not vo_path or not Path(vo_path).exists():

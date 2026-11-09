@@ -301,6 +301,39 @@ def test_render_previews_a_failed_preset_does_not_stop_the_others(tmp_path):
     assert "guard failed" in render_previews.write_readme(tmp_path, [r], ["P0", "P1", "P2"]).read_text()
 
 
+def test_render_previews_reuses_the_hooks_stage_cut_words(tmp_path):
+    """Cached cut words (matching window + model) are used; only the VO is transcribed."""
+    import json
+    cut, vo = tmp_path / "cut.mp4", tmp_path / "vo.wav"
+    cut.write_bytes(b"0")
+    vo.write_bytes(b"0")
+    words = [{"word": "VICE", "start": 0.1, "end": 0.5}]
+    model = render_previews.render.render_settings()["whisper_model"]
+    item = {"id": "i", "download_path": str(cut), "cut_path": str(cut), "voiceover_audio_path": str(vo),
+            "hook_text": "H", "author_name": "C", "keywords": '["VICE","CITY","MAP"]',
+            "cut_start": 5.0, "cut_end": 25.0,
+            "transcript_words": json.dumps({"cut_start": 5.0, "cut_end": 25.0, "model": model, "words": words})}
+
+    def ok_variants(*a, **k):
+        subs = Path(a[7])
+        subs.mkdir(parents=True, exist_ok=True)
+        for v in "AB":
+            (subs / f"{k['name']}_{v}.ass").write_text("x")
+        return {"probe_a": {"video_duration": 1.0}, "probe_b": {"video_duration": 1.0},
+                "elapsed_a_s": 1.0, "elapsed_b_s": 1.0,
+                "ass_a": str(subs / f"{k['name']}_A.ass"), "ass_b": str(subs / f"{k['name']}_B.ass"),
+                "style_a": {}}
+
+    with patch.object(render_previews.db, "get_item", return_value=item), \
+         patch.object(render_previews.render, "transcribe_words", return_value=[{"word": "HI", "start": 0, "end": 1}]) as tw, \
+         patch.object(render_previews.render, "render_item_variants", side_effect=ok_variants) as rv, \
+         patch.object(render_previews, "build_grid", return_value=(True, 1.0)):
+        r = render_previews.render_item("i", config.get_config(), ["P0"], tmp_path)
+    assert r.ok
+    assert [Path(c.args[0]) for c in tw.call_args_list] == [vo]
+    assert rv.call_args.args[3] == words
+
+
 def test_render_previews_rejects_an_unknown_preset_before_rendering(tmp_path):
     with patch.object(render_previews.db, "init_db"), \
          patch.object(render_previews, "render_item") as ri:

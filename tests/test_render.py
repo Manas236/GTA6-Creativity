@@ -376,3 +376,57 @@ def test_render_item_variants_snaps_end_to_pause(tmp_path: Path):
     assert pb["video_duration"] == pytest.approx(res["freeze_s"] + res["end_s"], abs=0.05)
     for p in (pa, pb):
         assert abs(p["video_duration"] - p["audio_duration"]) <= 0.1
+
+
+# ----------------------------------------------------------------------------- cached cut words
+
+CACHED_WORDS = [{"word": "VICE", "start": 0.5, "end": 0.9, "prob": 0.9},
+                {"word": "CITY", "start": 0.9, "end": 1.3, "prob": 0.9}]
+
+
+def _cached_item(cut_start=10.0, cut_end=30.0, model=None, words=CACHED_WORDS):
+    import json
+    payload = {"cut_start": 10.0, "cut_end": 30.0, "model": model or RS["whisper_model"], "words": words}
+    return {"id": "item_r", "cut_start": cut_start, "cut_end": cut_end, "transcript_words": json.dumps(payload)}
+
+
+def test_cached_cut_words_only_valid_for_the_same_cut_window_and_model():
+    assert render.cached_cut_words(_cached_item(), RS["whisper_model"]) == CACHED_WORDS
+    assert render.cached_cut_words(_cached_item(cut_start=12.0), RS["whisper_model"]) is None    # re-cut
+    assert render.cached_cut_words(_cached_item(model="small.en"), RS["whisper_model"]) is None  # other model
+    assert render.cached_cut_words({"id": "x", "cut_start": 1, "cut_end": 2}, RS["whisper_model"]) is None
+    assert render.cached_cut_words({"transcript_words": "{not json"}, RS["whisper_model"]) is None
+
+
+def test_run_render_item_reuses_the_cached_cut_words(tmp_db: Path, tmp_path: Path):
+    """The render stage transcribes only the VO; the cut words come from the hooks-stage cache."""
+    from unittest.mock import patch
+
+    from pipeline import db
+
+    cut, vo = tmp_path / "cut.mp4", tmp_path / "vo.wav"
+    cut.write_bytes(b"0")
+    vo.write_bytes(b"0")
+    db.insert_discovered_item({"id": "item_r", "source": "youtube", "source_id": "vid_r",
+                               "source_url": "https://example.invalid/r", "author_name": "Creator",
+                               "raw_velocity": 1.0}, db_path=tmp_db)
+    db.transition_stage("item_r", "cut", extra_fields={
+        "cut_path": str(cut), "cut_start": 10.0, "cut_end": 30.0, "cut_duration": 20.0,
+        "hook_text": "IS THIS VICE CITY?", "voiceover_script": "Is this Vice City?",
+        "voiceover_audio_path": str(vo), "keywords": '["VICE", "CITY", "GTA"]',
+    }, db_path=tmp_db)
+    render.store_cut_words("item_r", db.get_item("item_r", db_path=tmp_db), CACHED_WORDS,
+                           RS["whisper_model"], db_path=tmp_db)
+
+    fake = {"elapsed_a_s": 1.0, "elapsed_b_s": 1.0, "probe_a": {"video_duration": 20.0},
+            "probe_b": {"video_duration": 23.0}, "preset": "P0"}
+    with patch.object(render.config, "media_dir", side_effect=lambda sub="": tmp_path / sub), \
+         patch.object(render, "verify_video_file", return_value=(True, 20.0)), \
+         patch.object(render, "media_duration", return_value=2.0), \
+         patch.object(render, "transcribe_words", return_value=[]) as tw, \
+         patch.object(render, "render_item_variants", return_value=fake) as riv:
+        ok, msg, _ = render.run_render_item("item_r", db_path=tmp_db)
+
+    assert ok, msg
+    assert [Path(c.args[0]) for c in tw.call_args_list] == [vo]      # VO only, never the cut
+    assert riv.call_args.args[3] == CACHED_WORDS                      # speech words = the cache
