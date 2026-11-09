@@ -21,6 +21,10 @@ assets/models/
 *.wav
 *.mp3
 
+# ...but the committed style-layer SFX (A1, CC0, see assets/sfx/LICENSES.md) stay in.
+# The CC0 music bed (A2) is NOT committed: scripts/fetch_assets.py downloads it.
+!assets/sfx/*.wav
+
 # Database & runtime state
 *.db
 *.db-wal
@@ -39,3 +43,8 @@ venv/
 *.log
 logs/
 
+
+# Style-layer verification build output: only samples/synthetic/presets_sheet.png
+# is committed (the renders themselves are mp4s and must not be in a public repo).
+samples/synthetic/presets/
+samples/synthetic/style_report.json

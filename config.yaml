@@ -109,10 +109,171 @@ render:
     outline: 8
     shadow: 3
     max_lines: 2
-    band_top_y: 280
-    band_bottom_y: 560
-    line_spacing: 1.45 # line pitch as a multiple of cap height
+    # Band moved up (was 280-560) so the 2 hook lines clear the zoom-to-fill video top
+    # edge at y=534; only used when the style layer does not re-place the band itself.
+    band_top_y: 260
+    band_bottom_y: 500
+    # 1.75 x cap height -> ~118 px pitch, ~29 px between the two lines' outlines
+    # (1.45 left only ~9 px, so the outlines nearly touched).
+    line_spacing: 1.75
+    # Floor on the gap: outline/shadow are absolute px, so on a hook that had to shrink
+    # a cap-height multiple alone collapses to ~3 px between the outlines.
+    min_line_gap_px: 18
     color: "&H0000FFFF" # yellow
+
+# ======================================================================================
+# Style layer: edit effects as independently toggleable flags, grouped into presets.
+# The pipeline renders `style.preset` (P0). P1-P3 are opt-in until a preset is picked.
+#   F1 zoom_fill | C1 keyword_color | C2 keyword_emoji | C3 progress_bar | C4 credit_tag
+#   M1 caption_pop | M2 hook_pop | M3 punch_ins | M4 slow_push
+#   A1 sfx | A2 music_bed | A3 dead_air | A4 loop_end
+# ======================================================================================
+style:
+  preset: "P0" # pipeline default; do not change without a decision
+  presets:
+    P0: # Control: the CP2 renders plus zoom-to-fill framing
+      base: null
+      enable: ["zoom_fill"]
+    P1: # Clean
+      base: "P0"
+      enable:
+        - "keyword_color"
+        - "keyword_emoji"
+        - "progress_bar"
+        - "credit_tag"
+        - "caption_pop"
+        - "dead_air"
+        - "loop_end"
+    P2: # Punchy
+      base: "P1"
+      enable: ["hook_pop", "punch_ins", "sfx"]
+    P3: # Full hype
+      base: "P2"
+      enable: ["slow_push", "music_bed"]
+
+  # F1 -- zoom-to-fill framing -------------------------------------------------------
+  zoom_fill:
+    fill_scale: 1.40 # foreground band 608 px -> 852 px tall, sides centre-cropped
+    supersample: 1.5 # working canvas 1620x1278, so the fill never upscales the source
+    crossfade_s: 0.25 # cross-scale when a segment changes framing mode
+    motion_threshold: 0.018 # mean frame difference; below this a segment stays full-width fit
+    motion_step_s: 0.2 # frame-difference sampling step
+    min_segment_s: 1.2 # scene cuts closer than this do not start a new segment
+    edge_clearance_px: 40 # text must clear every video edge by this much
+
+  # M1 -- caption pop-in --------------------------------------------------------------
+  caption_pop:
+    from_scale: 80
+    peak_scale: 115
+    peak_ms: 60
+    settle_ms: 160
+
+  # M2 -- hook pop + shake ------------------------------------------------------------
+  hook_pop:
+    from_scale: 55
+    scale_ms: 250
+    shake_deg: 1.5
+    shake_ms: 400
+    shake_steps: 4
+
+  # M3 -- punch-ins -------------------------------------------------------------------
+  punch_ins:
+    zoom: 1.12
+    ease_in_s: 0.12
+    hold_s: 0.8 # inside the 0.6-1.0 s window
+    ease_out_s: 0.12
+    min_gap_s: 3.0
+    max_count: 4
+    first_at_least_s: 1.5
+
+  # M4 -- slow push-in across static segments and the B freeze -----------------------
+  slow_push:
+    zoom_to: 1.06
+
+  # C1 -- keyword colour --------------------------------------------------------------
+  keyword_color:
+    color: "&H0000FF00" # green (ASS is &HAABBGGRR); yellow stays the spoken word
+    min_keywords: 3
+    max_keywords: 6
+    extra_terms: ["JASON", "LUCIA", "LEONIDA", "VICE", "AMBROSIA", "TRAILER", "LEAK", "MAP", "HEIST"]
+
+  # C2 -- keyword emojis (Twemoji PNGs; libass cannot draw colour emoji) -------------
+  keyword_emoji:
+    assets_dir: "assets/emoji"
+    size_px: 110
+    min_gap_s: 4.0 # at most one emoji per 4 s
+    hold_s: 1.6
+    rise_px: 24
+    rise_ms: 120
+    gap_above_caption_px: 28
+    map:
+      CAR: "1f697"
+      CARS: "1f697"
+      BIKE: "1f3cd"
+      MONEY: "1f4b0"
+      CASH: "1f4b0"
+      POLICE: "1f693"
+      CHASE: "1f6a8"
+      MAP: "1f5fa"
+      CITY: "1f3d9"
+      BEACH: "1f3d6"
+      LEAK: "1f4a7"
+      LEAKED: "1f4a7"
+      TRAILER: "1f3ac"
+      GAMEPLAY: "1f3ae"
+      INSANE: "1f92f"
+      CRAZY: "1f92f"
+      FIRE: "1f525"
+      REAL: "1f440"
+
+  # C3 -- progress bar ----------------------------------------------------------------
+  progress_bar:
+    height_px: 10
+    color: "&H0000FFFF" # yellow
+
+  # C4 -- credit tag ------------------------------------------------------------------
+  credit_tag:
+    text: "via {channel}"
+    font_size: 71 # -> ~32 px caps measured
+    color: "&H00FFFFFF" # white
+    alpha: "&H33&" # ~80% opacity
+    outline: 3
+    shadow: 2
+    inset_x_px: 0 # from safe_area.x_min
+    inset_y_px: 16 # above the video band bottom
+    gap_from_caption_px: 24 # minimum clearance from the caption ink
+
+  # A1 -- SFX --------------------------------------------------------------------------
+  sfx:
+    dir: "assets/sfx"
+    boom_file: "boom.wav"
+    whoosh_file: "whoosh.wav"
+    headroom_db: 6.0 # every SFX peak sits at least this far under the speech peak
+    boom_at_s: 0.0 # the hook's first frame
+    whoosh_lead_s: 0.06 # whoosh starts just before the punch-in
+
+  # A2 -- music bed (no sidechaincompress; volume automation from word timestamps) ----
+  music_bed:
+    file: "assets/music/bed.mp3" # CC0; downloaded by scripts/fetch_assets.py
+    level_db: -24.0
+    duck_db: -8.0 # a further 8 dB down during speech
+    duck_ramp_s: 0.08
+    speech_merge_gap_s: 0.3
+
+  # A3 -- dead-air removal -------------------------------------------------------------
+  dead_air:
+    min_silence_s: 0.4
+    loudness_threshold_lufs: -45.0
+    motion_threshold: 0.012 # must ALSO be visually still before a stretch is cut
+    keep_pad_s: 0.12
+    min_output_s: 15.0 # hard floor: never cut below this
+    loudness_lag_s: 0.2 # ebur128 momentary covers the 400 ms ENDING at t; re-centre it
+
+  # A4 -- loop-friendly ending ---------------------------------------------------------
+  loop_end:
+    search_step_s: 0.2
+    pause_bonus_bits: 6 # a speech pause is worth 6 bits of dHash distance
+    audio_fade_s: 0.15 # no video fade; audio fade capped at 0.15 s
 
 approval:
   mode: "telegram" # 'telegram' or 'auto'

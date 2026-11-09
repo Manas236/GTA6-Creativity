@@ -11,7 +11,7 @@ from typing import Any
 
 import requests
 
-from . import config, db
+from . import config, db, keywords
 
 log = logging.getLogger(__name__)
 
@@ -141,12 +141,20 @@ TASK 3: WRITE VOICEOVER LINE
 - Must play near the start of the video.
 - Conversational, high energy. If unverified, keep it speculative.
 
+TASK 4: PICK CAPTION KEYWORDS
+- 3 to 6 single words that are the most important things said or shown in this clip
+  (names, places, objects, numbers - e.g. "LUCIA", "VICE", "MAP", "POLICE", "2026").
+- ALL-CAPS, one word each, no punctuation, no duplicates.
+- They must be words that actually appear in the transcript or are clearly visible in
+  the frames; these get highlighted inside the burned-in captions.
+
 Return ONLY a valid JSON object with EXACTLY this structure:
 {{
   "authenticity": "official" or "unverified",
   "hook_style": "curiosity" or "question" or "hype_analysis",
   "hook_text": "HOOK TEXT IN ALL CAPS",
-  "voiceover_script": "Short 3-6 second spoken line."
+  "voiceover_script": "Short 3-6 second spoken line.",
+  "keywords": ["WORD", "WORD", "WORD"]
 }}
 """
     raw_response = _call_gemini(prompt, images=sample_frames, model=model, api_key=api_key)
@@ -193,11 +201,19 @@ Return ONLY a valid JSON object with EXACTLY this structure:
     if auth == "unverified" and not hook_text.endswith("?"):
         hook_text = f"{hook_text}?"
 
+    # C1: 3-6 caption keywords; falls back to the rule extractor when absent/unusable.
+    kw = keywords.clean_keywords(data.get("keywords"))
+    if len(kw) < 3:
+        extra = keywords.rule_keywords(f"{transcript_text} {source_title} {hook_text}")
+        kw += [k for k in extra if k not in kw]
+        kw = kw[:6]
+
     return {
         "authenticity": auth,
         "hook_style": hook_style,
         "hook_text": hook_text,
         "voiceover_script": vo_script,
+        "keywords": kw,
     }
 
 
@@ -308,10 +324,11 @@ def run_hooks_for_item(
             "hook_style": "question",
             "hook_text": "IS THIS THE CRAZIEST GTA 6 DETAIL?",
             "voiceover_script": "Check out this crazy GTA 6 moment right now!",
+            "keywords": keywords.rule_keywords(f"{transcript} {source_title}", cfg=cfg),
         }
         passed_grounding = False
 
-    # Save hook and authenticity to database
+    # Save hook, authenticity and the C1 keyword cache to the database
     with db.db(db_path) as conn:
         conn.execute(
             """
@@ -321,6 +338,7 @@ def run_hooks_for_item(
                 hook_grounded = :hook_grounded,
                 authenticity = :authenticity,
                 voiceover_script = :voiceover_script,
+                keywords = :keywords,
                 updated_at = :now
             WHERE id = :id
             """,
@@ -331,6 +349,7 @@ def run_hooks_for_item(
                 "hook_grounded": 1 if passed_grounding else 0,
                 "authenticity": final_data["authenticity"],
                 "voiceover_script": final_data["voiceover_script"],
+                "keywords": json.dumps(final_data.get("keywords") or []),
                 "now": db.now(),
             },
         )

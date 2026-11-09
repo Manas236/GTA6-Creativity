@@ -43,34 +43,74 @@ def extract_scene_cuts(video_path: Path | str, threshold: float = 0.3) -> list[f
 
 
 def extract_audio_loudness_profile(video_path: Path | str) -> list[tuple[float, float]]:
-    """Extract momentary LUFS energy profile (timestamp_s, lufs) using ffmpeg ebur128."""
+    """Extract the momentary LUFS profile [(timestamp_s, lufs)] every 100 ms via ebur128.
+
+    `ebur128` emits one measurement per 100 ms block; `M` is the momentary loudness of the
+    400 ms window ENDING at `t` (callers that need sample-accurate boundaries re-centre it,
+    see style.dead_air.loudness_lag_s).
+
+    NOTE: this used to pass `meter=100`, but ebur128's `meter` is the visual meter's LU
+    range and only accepts 9-18, so the filter failed to initialise and the profile came
+    back EMPTY on every call - silently making the cut window's audio-energy term a
+    constant and disabling every loudness-trough fallback. Both the log lines and the
+    frame metadata are parsed now, and an empty result is logged.
+
+    Digital silence makes ebur128 report `nan` / `-inf`; those are mapped to the -70 LUFS
+    floor rather than skipped, because dropping them would punch a hole in the profile at
+    exactly the moments dead-air detection cares about.
+    """
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-nostats",
+        "-loglevel", "info",
         "-i", str(video_path),
         "-vn",
-        "-af", "ebur128=meter=100",
+        "-af", "ebur128=metadata=1,ametadata=print:key=lavfi.r128.M",
         "-f", "null",
         "-",
     ]
+    num = r"(-?(?:\d+\.?\d*|inf|nan))"
+
+    def clamp(raw: str) -> float:
+        try:
+            val = float(raw)
+        except ValueError:
+            return -70.0
+        if val != val or val == float("-inf"):   # nan / -inf == digital silence
+            return -70.0
+        return max(-70.0, min(0.0, val))
+
     points: list[tuple[float, float]] = []
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        # Output lines look like: [Parsed_ebur128_0 @ ...] t: 0.1     TARGET:... M: -24.5 ...
+        pending: float | None = None
         for line in res.stderr.splitlines():
-            if "t:" in line and "M:" in line:
+            # ebur128's own log line: "t: 0.1  TARGET:-23 LUFS  M: -24.5  S: ..."
+            if "t:" in line and " M:" in line:
                 m_time = re.search(r"t:\s*(\d+\.?\d*)", line)
-                m_lufs = re.search(r"M:\s*(-?\d+\.?\d*)", line)
+                m_lufs = re.search(rf"M:\s*{num}", line)
                 if m_time and m_lufs:
-                    t = float(m_time.group(1))
-                    val = float(m_lufs.group(1))
-                    # Clamp LUFS to [-70.0, 0.0]
-                    val = max(-70.0, min(0.0, val))
-                    points.append((t, val))
+                    points.append((float(m_time.group(1)), clamp(m_lufs.group(1))))
+                continue
+            # ametadata fallback: "pts_time:5.1" then "lavfi.r128.M=-43.810"
+            m = re.search(r"pts_time:(-?\d+\.?\d*)", line)
+            if m:
+                pending = float(m.group(1))
+                continue
+            m = re.search(rf"lavfi\.r128\.M={num}", line)
+            if m and pending is not None:
+                points.append((pending, clamp(m.group(1))))
+                pending = None
     except Exception as e:
         log.warning("Audio loudness extraction error for %s: %s", video_path, e)
-    return points
+    if not points:
+        log.warning("ebur128 returned no loudness samples for %s", video_path)
+    # Both parsers may fire on the same run; de-duplicate on the timestamp.
+    seen: dict[float, float] = {}
+    for t, v in points:
+        seen.setdefault(round(t, 3), v)
+    return sorted(seen.items())
 
 
 def _word_pauses(words: list[dict[str, Any]], min_gap: float) -> list[tuple[float, float]]:

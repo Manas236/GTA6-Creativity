@@ -1,10 +1,12 @@
 {
+  "preset": "P0",
   "cut_duration_s": 20.003,
   "end_s": 19.3,
+  "source_end_s": 19.3,
   "vo_duration_s": 3.1,
   "freeze_s": 3.4,
-  "elapsed_a_s": 14.52,
-  "elapsed_b_s": 17.05,
+  "elapsed_a_s": 12.27,
+  "elapsed_b_s": 13.7,
   "probe_a": {
     "path": "A_v2.mp4",
     "format_duration": 19.3,
@@ -28,6 +30,130 @@
     "audio_duration": 22.7,
     "sample_rate": 48000,
     "channels": 2
+  },
+  "style_a": {
+    "preset": "P0",
+    "flags": {
+      "zoom_fill": true
+    },
+    "modes": [
+      "fit"
+    ],
+    "segments": [
+      [
+        0.0,
+        19.3,
+        "fit",
+        0.00464
+      ]
+    ],
+    "zoom_constant": true,
+    "zoom_values": {
+      "0.0": 1.0,
+      "9.65": 1.0,
+      "19.2": 1.0
+    },
+    "punches": [],
+    "emoji": [],
+    "sfx": [],
+    "sfx_gains_db": {},
+    "music": null,
+    "keywords": [],
+    "dead_air_dropped": [],
+    "content_s": 19.3,
+    "freeze_s": 0.0,
+    "total_s": 19.3,
+    "audio_fade_s": 0.25,
+    "layout": {
+      "caption_center_y": 1345,
+      "caption_ink": [
+        1304,
+        1386
+      ],
+      "hook_center_y": 433,
+      "hook_ink": [
+        332,
+        534
+      ],
+      "credit": [
+        95,
+        1248
+      ],
+      "credit_ink": [
+        1185,
+        1248
+      ],
+      "video_edges": [
+        656,
+        1264
+      ]
+    },
+    "notes": [
+      "F1 1 segment(s) ['fit'], fill_zoom=1.4013, bands fill=(534, 1386) fit=(656, 1264)",
+      "captions moved 1300 -> 1345 to clear the video edges [656, 1264]"
+    ]
+  },
+  "style_b": {
+    "preset": "P0",
+    "flags": {
+      "zoom_fill": true
+    },
+    "modes": [
+      "fit"
+    ],
+    "segments": [
+      [
+        0.0,
+        22.7,
+        "fit",
+        0.0
+      ]
+    ],
+    "zoom_constant": true,
+    "zoom_values": {
+      "0.0": 1.0,
+      "11.35": 1.0,
+      "22.6": 1.0
+    },
+    "punches": [],
+    "emoji": [],
+    "sfx": [],
+    "sfx_gains_db": {},
+    "music": null,
+    "keywords": [],
+    "dead_air_dropped": [],
+    "content_s": 19.3,
+    "freeze_s": 3.4,
+    "total_s": 22.7,
+    "audio_fade_s": 0.25,
+    "layout": {
+      "caption_center_y": 1345,
+      "caption_ink": [
+        1304,
+        1386
+      ],
+      "hook_center_y": 433,
+      "hook_ink": [
+        332,
+        534
+      ],
+      "credit": [
+        95,
+        1248
+      ],
+      "credit_ink": [
+        1185,
+        1248
+      ],
+      "video_edges": [
+        656,
+        1264
+      ]
+    },
+    "notes": [
+      "F1 1 segment(s) ['fit'], fill_zoom=1.4013, bands fill=(534, 1386) fit=(656, 1264)",
+      "captions moved 1300 -> 1345 to clear the video edges [656, 1264]"
+    ]
   },
   "cap_heights_px": {
     "hook": 68,

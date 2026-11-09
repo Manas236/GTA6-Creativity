@@ -3,6 +3,7 @@ yt-dlp>=2026.10.26
 requests>=2.32.0
 pyyaml>=6.0.0
 pillow>=10.0.0
+numpy>=1.26.0 # imported directly by the tests and the verification scripts
 pytest>=8.0.0
 kokoro-onnx>=0.6.0
 faster-whisper>=1.0.0

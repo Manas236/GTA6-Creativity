@@ -382,6 +382,177 @@ Per user requirements and review fixes:
 
 ---
 
+## 7B. Style Layer — Edit Effects as Config-Toggled Presets (P0–P3)
+
+Every edit effect is an **independently toggleable flag**; presets are declared in
+`config.yaml` as deltas over a base preset and resolved into a flat `{flag: bool}` map.
+**All numbers live in `config.yaml` → `style:`** (code defaults in `pipeline/style.py`
+keep an older config loading). The pipeline default is **P0** and does not change until a
+preset is picked.
+
+| Preset | Base | Adds | Meaning |
+|---|---|---|---|
+| **P0** Control | — | `zoom_fill` | the CP2 renders plus F1 framing |
+| **P1** Clean | P0 | `keyword_color`, `keyword_emoji`, `progress_bar`, `credit_tag`, `caption_pop`, `dead_air`, `loop_end` | C1–C4, M1, A3, A4 |
+| **P2** Punchy | P1 | `hook_pop`, `punch_ins`, `sfx` | M2, M3, A1 |
+| **P3** Full hype | P2 | `slow_push`, `music_bed` | M4, A2 |
+
+A test asserts P0 ⊂ P1 ⊂ P2 ⊂ P3, that P0 enables **only** `zoom_fill`, and that
+`style.preset` is still `P0`.
+
+### Module layout and why it is split this way
+
+| Module | Owns |
+|---|---|
+| `pipeline/style.py` | flags, presets, every style number, F1 geometry, safe-area placement |
+| `pipeline/edits.py` | timeline analysis: segments (F1), punch-ins (M3), dead air + `Timeline` (A3), loop end (A4), the zoom program |
+| `pipeline/overlay.py` | ASS tags (C1, C4, M1, M2), the C3 progress-bar event, the C2 emoji plan and overlay chain |
+| `pipeline/audio_mix.py` | A1 SFX synthesis/cues/gain staging, A2 music chain and ducking |
+| `pipeline/keywords.py` | C1 keywords: Gemini cache + rule fallback |
+| `pipeline/plan.py` | `analyze_clip` (probe once) → `StylePlan` (one per variant) |
+| `pipeline/rendercore.py` | render settings, libass font metrics, text layout, ffprobe readers — shared by the planner and the renderer (re-exported from `render`) |
+| `pipeline/render.py` | ASS assembly and the filtergraph; consumes a `StylePlan` and never re-derives a timestamp |
+
+**Why:** planning and graph-building have different failure modes. Planning is pure
+arithmetic over probed data, so it is unit-testable with synthetic numbers and no ffmpeg;
+the filtergraph is where label collisions and ordering bugs live, so `render.py` owns
+**all** stream labels and the helpers return fragments with the in/out labels passed in.
+**Where this could have gone wrong, and what covers it:**
+1. *Timeline drift* — A3 and the Variant B freeze both move time, and captions, punch-ins,
+   SFX, emojis, music ducking and the progress bar all carry timestamps. One `Timeline`
+   object is computed once and **everything** maps through `Timeline.remap` plus the same
+   freeze offset; the existing ffprobe guard catches any residual A/V mismatch.
+2. *Filtergraph fragility* — the helper modules emit `{IDXn}` placeholders that only
+   `render.py` resolves to real ffmpeg input indices, and all 8 preset × variant
+   combinations are really rendered in the synthetic verification.
+3. *Config sprawl* (≈70 new numbers) — one `style:` block, one sub-block per flag, named
+   exactly after the flag, deep-merged over code defaults.
+4. *Preset drift* — presets are deltas, resolved by one function, with the subset test
+   above.
+
+### F1 — Zoom-to-fill framing (on in every preset)
+
+- Foreground sizes, derived (not hand-placed): fit `1080×608`; fill
+  `1080×852` = `even(608 × fill_scale 1.40)`. Bands: **fill y 534–1386**, **fit y 656–1264**.
+- The source sits on a **supersampled transparent canvas** (`supersample 1.5` →
+  `1620×1278`, content `1620×912`) in `yuva420p`; `zoompan` zooms between
+  **z = 1.0 (full-width fit)** and **z = `fill_zoom` = 1278/912 = 1.40132** (fills the band,
+  sides centre-cropped). At `fill_zoom` the visible width is 1/1.4013 = 71.4 % of the frame
+  and nothing is upscaled past the source. A **constant** zoom (the common P0 case) skips
+  `zoompan` entirely and uses `crop`+`scale`.
+- **Per-segment decision**: split at scene cuts (ignoring cuts closer than
+  `min_segment_s 1.2`), take the mean frame-difference per segment
+  (`motion_step_s 0.2`), and label it `fit` below `motion_threshold 0.018`, else `fill`.
+  Adjacent same-mode segments merge. A short **cross-scale** of `crossfade_s 0.25` sits on
+  every mode change. The Variant B freeze is a static segment (`fit`, and M4 pushes across it).
+- **Safe-area re-placement** (`edge_clearance_px 40`): the caption centre is the **nearest
+  valid y to `caption.center_y` 1300** whose ink box is entirely clear of *every* video edge
+  the clip uses and inside the safe area; the hook band is centred in the room above the
+  highest edge; the credit tag goes to the bottom-left of the video band and is pushed
+  below (then above) the captions if it would touch them. Resulting placements:
+
+  | Modes in the clip | Video edges | Caption centre (ink) | Hook centre (2-line ink) | Credit baseline (ink) |
+  |---|---|---|---|---|
+  | fill only | 534, 1386 | 1300 (1254–1346) | 372 (269–475) | 1421 (1370–1421) |
+  | fit only | 656, 1264 | 1350 (1304–1396) | 433 (330–536) | 1248 (1197–1248) |
+  | fill + fit | 534, 656, 1264, 1386 | **1178 (1132–1224)** | 372 (269–475) | 1311 (1248–1311) |
+
+  In a mixed clip there is no y that is both below the fit edge (1264) and 40 px clear of
+  the fill edge (1386) inside the safe area, so the captions move **up** to 1178 — on the
+  footage in both modes, which reads better than sitting half on the blurred background.
+- **Hook line spacing**: `line_spacing 1.75` (≈118 px pitch, ≈29 px between the two
+  outlines; 1.45 left only ≈9 px) **plus** a floor of `min_line_gap_px 18`, because
+  outline/shadow are absolute pixels — on a hook that had to shrink to size 68 a pure
+  cap-height multiple collapsed the gap to **3 px**.
+
+### C1–C4 caption extras (P1–P3)
+
+- **C1 keyword colour**: the Gemini hook call now also returns `keywords` (3–6), cached in
+  `items.keywords` as JSON. Yellow `&H0000FFFF` always marks the word being spoken; other
+  keywords in the chunk are green `&H0000FF00`; the rest stay white. Zero-network fallback:
+  tokens containing a digit, the baked GTA name/place list, plus
+  `style.keyword_color.extra_terms`.
+- **C2 keyword emojis**: `keyword → Twemoji codepoint` map in config; **max one per
+  `min_gap_s 4.0`**, `size_px 110`, held `hold_s 1.6`, rising `rise_px 24` over
+  `rise_ms 120`, `gap_above_caption_px 28` above the caption ink. Composited as PNG
+  overlays because **libass cannot draw colour emoji**; only the 14 codepoints the map uses
+  are committed (CC-BY 4.0, credited in `README.md`). `overlay` must use
+  `repeatlast=1` — `eof_action=pass` drops a single-frame PNG after one frame.
+- **C3 progress bar**: a `height_px 10` yellow bar at y 0, drawn as an **ASS rectangle**
+  scaled by `\t(0, duration_ms, \fscx100)`, because `drawbox`'s `t` is its *thickness*
+  parameter, not a time variable — there is no way to animate a box width in ffmpeg 6.1.
+- **C4 credit tag**: `via {channel}`, Fontsize 71 → **32 px caps measured**, white at
+  `\alpha&H33&` (≈80 % opacity), `\an1` at the bottom-left of the video band, inset by
+  outline+shadow so the ink stays inside x ≥ 90. Its box is measured **ascender-to-descender**
+  (mixed case), which is ≈20 px taller than a cap-height box — using cap height broke the
+  "never overlaps the captions" guarantee.
+
+### M1–M4 motion
+
+- **M1 caption pop-in**: `\fscx80\fscy80\t(0,60,\fscx115\fscy115)\t(60,160,\fscx100\fscy100)`
+  on the **first event of each chunk** (not every word). The 115 % peak is fed into the
+  safe-area placement, so the transient size respects the edges too.
+- **M2 hook pop + shake**: `\fscx55 → 100` over `scale_ms 250`, plus a decaying
+  `\frz` shake of `±shake_deg 1.5°` in `shake_steps 4` over `shake_ms 400`, rotating about
+  `\org(540, hook_centre)` so both lines move together instead of scissoring.
+- **M3 punch-ins**: `zoom 1.12`, `ease_in_s 0.12` / `hold_s 0.8` / `ease_out_s 0.12`
+  (cosine ease, not a step), at least `min_gap_s 3.0` apart, `max_count 4`, never before
+  `first_at_least_s 1.5`, ranked by ebur128 momentary loudness with scene cuts as
+  secondary candidates.
+- **M4 slow push-in**: `1.00 → zoom_to 1.06` across each static segment and the B freeze.
+- All three fold into **one zoompan `z` expression**, `z(t) = base(t) × (1 + 0.12·env(t))`,
+  built as half-open gated linear pieces; `edits.zoom_value` is the Python mirror the
+  tests assert against.
+
+### A1–A4 audio
+
+- **A1 SFX**: boom on the hook's first frame, whoosh `whoosh_lead_s 0.06` before each
+  punch-in. Each cue is gain-staged so its peak lands `headroom_db 6.0` **under the clip's
+  measured speech peak** (`volumedetect`). The CC0 sources (Kenney.nl, OpenGameArt,
+  Freesound, Pixabay) are all blocked from the build sandbox (proxy `403` on `CONNECT`), so
+  both cues were **synthesized with ffmpeg** and committed at −1.0 dBFS; see
+  `assets/sfx/LICENSES.md`.
+- **A2 music bed**: CC0 track at `level_db −24.0`, ducked a further `duck_db −8.0` during
+  speech with `duck_ramp_s 0.08` ramps, from whisper word timestamps merged into spans
+  (`speech_merge_gap_s 0.3`). **No `sidechaincompress`** anywhere — it is `volume` automation
+  (`eval=frame`). The bed is `apad=whole_len=N,atrim=end_sample=N` to the clip's **exact**
+  sample count. freepd.com is blocked from the sandbox, so A2 was built and tested against a
+  generated tone and **no synthetic "music" track is committed**;
+  `scripts/fetch_assets.py` downloads the real CC0 bed on the laptop.
+- **A3 dead-air removal**: drop stretches over `min_silence_s 0.4` that are **both** below
+  `loudness_threshold_lufs −45.0` **and** below `motion_threshold 0.012`, shrunk by
+  `keep_pad_s 0.12` at each end, longest first, stopping before the output would fall below
+  `min_output_s 15.0`. Cuts are made with `trim`/`atrim` + `concat` (frame- and
+  sample-exact) and every timestamp is remapped through `Timeline.remap`; words inside a cut
+  span are dropped. `loudness_lag_s 0.2` re-centres ebur128's momentary window, which
+  reports the 400 ms **ending** at `t`.
+- **A4 loop-friendly ending**: inside `[cut.min_duration, min(cut.max_duration, cut length)]`,
+  pick the frame whose **dHash is closest to frame 1** (`search_step_s 0.2`), subtracting
+  `pause_bonus_bits 6` for a candidate in a speech pause. **No video fade**; the audio fade
+  drops to `audio_fade_s 0.15` (from 0.25) when A4 is on.
+
+### Synthetic verification
+
+`python scripts/style_check.py` builds a 22 s source that exercises everything — 0–8 s a
+static, text-heavy card; 8–12 / 12–16 / 16–22 s moving footage with scene cuts at 8/12/16 s;
+speech-like bursts with a **1.0 s silent gap at 5.0–6.0 s** over the still card; loud peaks
+at 9.4 / 13.4 / 17.4 s — then renders **P0–P3 × A/B** and checks every output against the
+existing ffprobe guard.
+
+| Preset | A (video/audio s) | B (video/audio s) | Segments | Punch-ins | Emoji | SFX | Dead air dropped | Audio fade |
+|---|---|---|---|---|---|---|---|---|
+| P0 | 22.000 / 22.000 | 25.500 / 25.500 | fit + fill | 0 | 0 | 0 | — | 0.25 s |
+| P1 | 21.167 / 21.200 | 24.667 / 24.700 | fit + fill | 0 | 3 | 0 | 5.12–5.78 s | 0.15 s |
+| P2 | 21.167 / 21.200 | 24.667 / 24.700 | fit + fill | 4 | 3 | 5 | 5.12–5.78 s | 0.15 s |
+| P3 | 21.167 / 21.200 | 24.667 / 24.700 | fit + fill | 4 | 3 | 5 | 5.12–5.78 s | 0.15 s |
+
+All 8 outputs: 30 fps, 48 kHz stereo, 1080×1920, |audio − video| ≤ 0.033 s (tolerance 0.1 s).
+F1 split the source at the real boundary (static card → `fit`, motion 0.000; moving footage
+→ `fill`, motion 0.041). `samples/synthetic/presets_sheet.png` is the committed evidence;
+the mp4s are not committed.
+
+---
+
 ## 8. Grounded Hooks Specification (CP2)
 
 1. **Context Provided to Gemini**:
@@ -641,6 +812,36 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 30. **Safe Area**: x 90-990, y 250-1440. Captions centred at y 1300 (ink ≈ 1258-1340); hook centred in band y 280-560 (2-line ink ≈ 328-510).
 31. **Lazy ML Imports**: `faster_whisper`, `kokoro_onnx` and `soundfile` are imported inside the functions that use them, so the pipeline and the zero-network tests import without the ML stack.
 32. **Config Key Fix**: `cut.select_best_cut_window` now reads `min_duration` / `max_duration` / `target_duration` (the keys in config.yaml), falling back to the old `*_seconds` names.
+
+### Style layer (see §7B)
+
+33. **Bug found and fixed — ebur128 never produced a loudness profile.** `extract_audio_loudness_profile` passed `ebur128=meter=100`, but `meter` is the **visual meter's LU range and only accepts 9–18**, so the filter failed to initialise and the function returned an **empty list on every call** — silently. Consequences across CP1/CP2: the cut window's audio-energy term (weight **0.75**) fell back to a constant `0.5` for every window, and every loudness-trough end-snap fallback was dead. Now `ebur128=metadata=1,ametadata=print:key=lavfi.r128.M` with both the log line and the frame metadata parsed (221 samples over 22 s), and an empty result is logged instead of swallowed.
+34. **Bug found and fixed — `nan` during digital silence.** ebur128 reports `lavfi.r128.M=nan` (and `-inf`) over exact silence, which the numeric regex skipped, punching a hole in the profile at precisely the moments A3 looks for. `nan`/`-inf` now map to the **−70 LUFS** floor.
+35. **Style layer architecture**: planning (`style`/`edits`/`plan`/`keywords`) is separated from graph-building (`render`), with the shared primitives in `rendercore` so the planner can measure text and probe media without importing the renderer. `render.py` owns **every** stream label; helper modules return fragments with in/out labels passed in and `{IDXn}` placeholders only `render.py` resolves. Rationale and the four failure modes this covers are in §7B.
+36. **Presets as deltas**: each preset names a `base` and an `enable` list; one resolver walks the chain into a flat flag map. A test asserts **P0 ⊂ P1 ⊂ P2 ⊂ P3** and that `style.preset` is still **P0**, so the default cannot drift.
+37. **F1 fill scale 1.40, supersample 1.5**: foreground band 608 px → **852 px**, i.e. `fill_zoom` = 1278/912 = **1.40132**, showing **71.4 %** of the frame width. The 1.5× working canvas (1620×1278) means even the fill state is a *downscale* of a 1920-wide source, so zooming never softens the picture.
+38. **`zoompan` over `crop` for animated zoom**: `scale`/`crop` output sizes are fixed at filter-configuration time, so only `zoompan` can animate a zoom. It is fed a `yuva420p` canvas (alpha verified to survive it) so the blurred background shows through in fit segments, and it is **skipped entirely for a constant zoom** (the common P0 case) in favour of `crop`+`scale`. Its clock is `it`; `t` is not a zoompan variable.
+39. **F1 per-segment thresholds**: `motion_threshold 0.018` mean frame difference, sampled every `motion_step_s 0.2`, segments no shorter than `min_segment_s 1.2`, `crossfade_s 0.25` cross-scale on a mode change. Measured on the synthetic source: static text card **0.000**, moving footage **0.041**.
+40. **Safe-area re-placement rule**: nearest valid caption centre to the configured 1300 with `edge_clearance_px 40` from every video edge. In a mixed-mode clip no y is both below the fit edge (1264) and 40 px clear of the fill edge (1386) inside the safe area, so captions move **up to 1178** (ink 1132–1224) — on the footage in both modes rather than half on the blurred background. Fill-only clips keep 1300; fit-only clips get 1350. Full table in §7B.
+41. **Hook line spacing 1.75 plus a `min_line_gap_px 18` floor**: 1.45 left only ≈9 px between the two outlines. A cap-height multiple alone is not enough because outline (8) and shadow (3) are **absolute pixels** — on a long hook that shrank to Fontsize 68 the gap measured **3 px**; the floor restores ≈28 px at any size.
+42. **Credit tag box measured ascender-to-descender**: `via GamingBolt` is mixed case, so a cap-height box under-read it by ≈20 px and the "never overlaps the captions" guarantee would have failed. Fontsize **71 → 32 px caps measured**, `\alpha&H33&` (≈80 % opacity), inset by outline+shadow so the ink stays inside x ≥ 90.
+43. **M1 caption pop 80 → 115 → 100 % over 160 ms**, fired once per caption **chunk**, not per word. The **115 % peak is fed into the safe-area placement**, so the transient size also respects the edges.
+44. **M2 hook pop 55 % → 100 % in 250 ms, shake ±1.5° in 4 steps over 400 ms**, rotating about `\org(540, hook_centre)` so a 2-line hook moves as one block instead of scissoring. Rotation was chosen over a pixel shake because ASS cannot animate `\pos` (only a single linear `\move`).
+45. **M3 punch-ins 1.12×, 120 ms cosine ease in, 0.8 s hold, 120 ms out, ≥3.0 s apart, max 4, never before 1.5 s**, ranked by ebur128 momentary loudness with scene cuts as secondary candidates. 0.8 s sits in the middle of the 0.6–1.0 s window.
+46. **M4 slow push 1.00 → 1.06** across static segments and the B freeze. The freeze is merged into a following static segment so the push runs once instead of resetting at the freeze boundary.
+47. **One zoom expression for F1 + M3 + M4**: `z(t) = base(t) × (1 + 0.12·env(t))` as half-open gated linear pieces, with `edits.zoom_value` as the Python mirror the unit tests assert against and the real renders verified by measuring the band height on screen.
+48. **C1 keyword colour**: the Gemini hook JSON gained a `keywords` field (3–6 words), cached in a new `items.keywords` column. **Yellow always wins for the spoken word**; other keywords are green `&H0000FF00`. Rule fallback (used here, no API key): digit-bearing tokens, a baked GTA name/place list, plus `style.keyword_color.extra_terms`.
+49. **C2 emoji as PNG overlays**: libass cannot rasterise colour emoji, so Twemoji 72×72 PNGs (CC-BY 4.0, credited in `README.md`) are composited with `overlay`. **Max one per 4.0 s**, 110 px, held 1.6 s, rising 24 px over 120 ms, 28 px above the caption ink. Only the **14** codepoints the config map uses are committed. `repeatlast=1` is required — `eof_action=pass` drops a single-frame PNG after one frame.
+50. **C3 progress bar drawn in ASS, not with `drawbox`**: `drawbox`'s `t` is its *thickness* parameter, and ffmpeg 6.1 exposes no time variable to it, so an animated bar width is impossible there. A 1080×10 ASS rectangle scaled by `\t(0, duration_ms, \fscx100)` fills exactly linearly and costs nothing extra (verified: 26 px → 1052 px over 4 s).
+51. **A1 SFX synthesized, not downloaded**: Kenney.nl, OpenGameArt, Freesound and Pixabay are **all blocked from the cloud sandbox** (egress proxy answers `403` to `CONNECT`). Both cues were generated with ffmpeg `aevalsrc`, peak-normalized to **−1.0 dBFS**, and committed with their provenance in `assets/sfx/LICENSES.md`. `scripts/fetch_assets.py --prefer-download` can swap in the Kenney CC0 originals on the laptop.
+52. **A1 gain staging `headroom_db 6.0`**: each cue's gain is computed from the clip's **measured** speech peak (`volumedetect`) so its peak lands at least 6 dB under the voice, rather than using a fixed dB value that would be wrong for every clip.
+53. **A2 ducking by `volume` automation, never `sidechaincompress`**: speech spans (words merged across gaps ≤ `speech_merge_gap_s 0.3`) drive a per-frame `volume` expression — bed at **−24 dB**, a further **−8 dB** under speech, with **80 ms** ramps so the duck does not click. The bed is `apad=whole_len=N,atrim=end_sample=N` to the clip's **exact** sample count (pad then trim, so a short bed is padded and a long one trimmed).
+54. **A2 track not committed**: freepd.com is blocked from the sandbox, so per the brief the code was built and tested against a **generated test tone** and no synthetic "music" track was committed; `scripts/fetch_assets.py` downloads a real CC0 FreePD track on the laptop and writes `assets/music/LICENSES.md`. A missing bed is logged and skipped, not fatal.
+55. **A3 dead-air gate needs silence AND stillness**: over `min_silence_s 0.4`, below `−45.0 LUFS` **and** below motion `0.012`, shrunk by `keep_pad_s 0.12` at each end, longest candidate first, stopping before the output would drop under **`min_output_s 15.0`**. Cuts use `trim`/`atrim` + `concat` (frame- and sample-exact) rather than `select`, and every timestamp remaps through one `Timeline`.
+56. **A3 `loudness_lag_s 0.2`**: ebur128's momentary value describes the 400 ms window **ending** at `t`, so an uncorrected profile cuts ≈0.2 s late and clips the start of the next sound.
+57. **A4 loop end: dHash distance with a 6-bit pause bonus**, searched every `0.2 s` inside `[cut.min_duration, min(cut.max_duration, cut length)]`, reusing the existing `dedupe.dhash_from_raw_gray_9x8`. **No video fade**; the audio fade drops from 0.25 s to **0.15 s** when A4 is on (the brief's cap).
+58. **New DB columns**: `items.keywords` (JSON array, the C1 cache) and `items.style_preset` (which preset produced the renders), both added by the existing idempotent migration in `init_db`.
+59. **Default preset unchanged**: `style.preset: "P0"`, so the pipeline's behaviour changes only by gaining F1 framing until a preset is chosen.
 
 ---
 

@@ -1,11 +1,37 @@
 # Project Handoff: GTA 6 Clipping Pipeline
 
+## 0. Laptop: what to run next
+
+```bash
+git pull
+pip install -r requirements.txt
+python scripts/fetch_assets.py        # CC0 music bed for A2 + asset/license verification
+python scripts/render_previews.py     # P0-P3 x A/B for the 3 CP2 items, plus 2x2 grids
+```
+
+Then look at `media/previews/<item_id>/grid_A.mp4` and `grid_B.mp4` (2x2, tiles labelled
+P0-P3), pick a preset, and set `style.preset` in `config.yaml`. **The pipeline default is
+still `P0`** and nothing changes until that choice is made.
+`media/previews/README.txt` lists every file, its hook, its keywords and its render time.
+
+`scripts/render_previews.py` is one command with no prompts: it re-downloads and re-cuts
+`item_a35aead652d3`, `item_763c2e191a1f` and `item_4622278cd0fc`, reuses their stored
+hooks and voiceover scripts, generates the C1 keywords with Gemini when `GEMINI_API_KEY`
+is set (and the rule fallback otherwise), and renders into
+`media/previews/<id>/P{n}_{A,B}.mp4`.
+
+---
+
 ## 1. Project State
 - **Checkpoints 0 - 2**: Completed and committed.
   - CP0: Architecture plan, database schema, configuration, environment setup.
   - CP1: Discovery (YouTube/official channels), pull-based download, perceptual deduplication (pHash/Hamming), crash recovery.
   - CP2: Cut detection (loudness + scene changes), Gemini grounded hooks, Kokoro TTS voiceover, ASS subtitle generation, vertical 9:16 rendering (Variants A & B).
-- **Checkpoint 3**: Telegram review bot + Meta (Instagram & Facebook Reels) posting has **not** been started.
+- **Style layer**: Completed and committed. Edit effects as independently toggleable
+  flags grouped into presets **P0-P3**, all numbers under `style:` in `config.yaml`,
+  verified on a synthetic clip (`samples/synthetic/presets_sheet.png`). See **PLAN.md
+  §7B** and *Calls I made* #33-59. **The default preset stays P0.**
+- **Checkpoint 3**: Telegram review bot + Meta (Instagram & Facebook Reels) posting has **not** been started (another session is building it on a branch).
 - **Safety Defaults**: `dry_run: true` remains active by default in `config.yaml`.
 
 ---
@@ -64,6 +90,58 @@ The remote repository is **public** (`https://github.com/Manas236/GTA6-Creativit
 
 ---
 
+## 4B. Style Layer: state, assets and what is left for the laptop
+
+### Presets (pick one, then set `style.preset`)
+| Preset | Adds | Elements |
+|---|---|---|
+| **P0** Control | zoom-to-fill framing | F1 — **the current default** |
+| **P1** Clean | + keyword colour/emoji, progress bar, credit tag, caption pop, dead-air removal, loop end | C1-C4, M1, A3, A4 |
+| **P2** Punchy | + hook pop/shake, punch-ins, SFX | M2, M3, A1 |
+| **P3** Full hype | + slow push-in, music bed | M4, A2 |
+
+### Assets
+| Asset | State |
+|---|---|
+| `assets/emoji/*.png` (14 Twemoji, CC-BY 4.0) | **committed**, credited in `README.md` |
+| `assets/sfx/boom.wav`, `whoosh.wav` (CC0) | **committed**, synthesized with ffmpeg — see `assets/sfx/LICENSES.md` |
+| `assets/music/bed.mp3` (CC0) | **NOT committed** — `python scripts/fetch_assets.py` downloads it |
+
+### What could not be done in the cloud sandbox (and why)
+The build sandbox's egress proxy answers **403 to `CONNECT`** for every asset host except
+GitHub, so:
+1. **A2's CC0 music bed could not be fetched** (`freepd.com` blocked). The music code was
+   built and verified against a **generated test tone**; per the brief no synthetic
+   "music" track was committed. `scripts/fetch_assets.py` fetches a real FreePD CC0 track
+   on the laptop and writes `assets/music/LICENSES.md`. Until then **P3 renders fine and
+   simply skips A2**, with a warning.
+2. **A1's CC0 SFX could not be downloaded** (`kenney.nl`, `opengameart.org`,
+   `freesound.org`, `cdn.pixabay.com` all blocked). Both cues were synthesized with
+   ffmpeg and committed; `python scripts/fetch_assets.py --prefer-download` will try the
+   Kenney CC0 pack and only install it if the archive carries its licence file.
+3. **No real clips exist in this public repo**, so the style layer was verified on a
+   synthetic 22 s source (static text card → moving footage with scene cuts, a 1 s silent
+   gap over the still card, loud peaks). All **8** outputs (P0-P3 × A/B) pass the existing
+   ffprobe guard. Real previews are what `scripts/render_previews.py` is for.
+
+### Verification you can re-run here
+```bash
+python scripts/style_check.py     # rebuilds the synthetic clip, renders P0-P3 x A/B,
+                                  # rewrites samples/synthetic/presets_sheet.png
+python scripts/fetch_assets.py --check   # verify assets and licences, download nothing
+```
+
+### Two latent bugs this pass found and fixed (they predate the style layer)
+1. `extract_audio_loudness_profile` passed `ebur128=meter=100`, but `meter` only accepts
+   **9-18**, so the filter never initialised and the profile was **empty on every call**.
+   The cut window's audio-energy term (weight 0.75) had silently been a constant, and every
+   loudness-trough fallback was dead. **Re-run `python -m pipeline.runner cut` on any item
+   you want re-scored with working audio energy.**
+2. ebur128 reports `nan` over digital silence, which the parser skipped — punching a hole
+   in the profile exactly where dead-air detection looks. `nan`/`-inf` now map to -70 LUFS.
+
+---
+
 ## 5. Test Commands
 
 ### Zero-Network Tests (Local / Offline)
@@ -72,6 +150,12 @@ Runs all unit and mock tests:
 pytest
 ```
 *(Default `pytest.ini` runs `-m "not live"`, passing completely offline).*
+**140 passed, 1 deselected** as of the style-layer pass — 65 pre-existing plus:
+`tests/test_style.py` (presets, F1 segments and geometry, safe-area placement, C1-C4,
+M1-M4, A1-A4 maths, graph assembly), `tests/test_style_render.py` (the same through
+ffmpeg/libass: the F1 band really resizes, the bar really fills, the hook outlines really
+clear, the bed really ducks 8 dB, dead air really shortens the render) and
+`tests/test_scripts.py` (both laptop scripts, fully mocked).
 
 ### Live Network Integration Tests
 Runs live crash-recovery and network tests:
@@ -94,4 +178,20 @@ python -m pipeline.runner render
 
 # Run a complete cycle
 python -m pipeline.runner cycle
+```
+
+### Style layer
+```bash
+# Synthetic verification: P0-P3 x A/B + the committed contact sheet
+python scripts/style_check.py
+python scripts/style_check.py --presets P0 P3 --no-sheet
+
+# Assets (idempotent; --check verifies without downloading)
+python scripts/fetch_assets.py
+python scripts/fetch_assets.py --check
+python scripts/fetch_assets.py --prefer-download     # try the Kenney CC0 SFX pack
+
+# Real previews for the 3 CP2 items (one command, no prompts)
+python scripts/render_previews.py
+python scripts/render_previews.py --presets P0 P3 --skip-download
 ```
