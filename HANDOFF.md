@@ -217,6 +217,12 @@ only when Gemini answered but the hook got 2 grounding FAIL verdicts. The hooks 
 transcribes the cut (faster-whisper `base.en`), sends that transcript to Gemini, and caches
 the words in `items.transcript_words` (keyed on the cut window + model) for render to reuse.
 
+**`items.preview_only`** (for CP3): an item flagged with `db.set_preview_only(id, True)`
+holds preview-only data (e.g. a hand-set hook for style previews). SQLite triggers refuse
+to move it into `rendered`/`awaiting_approval`/`approved`/`queued`/`posted`/`measured`
+and refuse any `posts` insert/update for it, whatever code tries. Clear the flag only
+after a real hooks run.
+
 ## 7. Known issues (logged, not fixed)
 1. **Dedupe/scene-detection timeouts on AV1 1440p sources.** yt-dlp's
    `bestvideo[ext=mp4]` picks AV1 1440p60; the gyan.dev "essentials" ffmpeg only has the

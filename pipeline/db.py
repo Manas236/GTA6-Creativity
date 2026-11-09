@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS items (
     keywords TEXT,                             -- C1: JSON array of 3-6 caption keywords
     style_preset TEXT,                          -- style preset the renders were made with
     transcript_words TEXT,                      -- JSON {cut_start, cut_end, model, words}: cut transcript cached by the hooks stage
+    preview_only INTEGER DEFAULT 0,             -- 1 = style-preview data only: triggers block approval/posting
     voiceover_script TEXT,
     voiceover_audio_path TEXT,
     caption_text TEXT,
@@ -174,6 +175,34 @@ CREATE TABLE IF NOT EXISTS stage_log (
 CREATE INDEX IF NOT EXISTS idx_stage_log_item ON stage_log(item_id);
 """
 
+#: Stages a preview_only item may never enter (anything that leads to approval/posting).
+RELEASE_STAGES = ("rendered", "awaiting_approval", "approved", "queued", "posted", "measured")
+
+# Enforced in SQLite itself so no code path (runner, CP3 bot, ad-hoc SQL) can release a
+# preview_only item: it cannot enter a release stage and cannot get a posts row.
+PREVIEW_ONLY_TRIGGERS = f"""
+CREATE TRIGGER IF NOT EXISTS items_preview_only_never_released
+BEFORE UPDATE OF stage, preview_only ON items
+WHEN NEW.preview_only = 1 AND NEW.stage IN ({", ".join(f"'{s}'" for s in RELEASE_STAGES)})
+BEGIN
+    SELECT RAISE(ABORT, 'preview_only item cannot enter an approval/posting stage');
+END;
+
+CREATE TRIGGER IF NOT EXISTS posts_block_preview_only_insert
+BEFORE INSERT ON posts
+WHEN (SELECT preview_only FROM items WHERE id = NEW.item_id) = 1
+BEGIN
+    SELECT RAISE(ABORT, 'preview_only item cannot be posted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS posts_block_preview_only_update
+BEFORE UPDATE ON posts
+WHEN (SELECT preview_only FROM items WHERE id = NEW.item_id) = 1
+BEGIN
+    SELECT RAISE(ABORT, 'preview_only item cannot be posted');
+END;
+"""
+
 
 def now() -> str:
     """Return ISO-8601 UTC timestamp."""
@@ -226,6 +255,10 @@ def init_db(db_path: Path | str | None = None) -> None:
         # Cut-window transcript cached by the hooks stage and reused by render
         if "transcript_words" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN transcript_words TEXT")
+        if "preview_only" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN preview_only INTEGER DEFAULT 0")
+        # Created after the migration: the trigger bodies reference items.preview_only.
+        conn.executescript(PREVIEW_ONLY_TRIGGERS)
         post_cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
         if "authenticity" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN authenticity TEXT DEFAULT 'unverified'")
@@ -339,6 +372,18 @@ def transition_stage(
             fields,
         )
         return cursor.rowcount > 0
+
+
+def set_preview_only(item_id: str, preview_only: bool, db_path: Path | str | None = None) -> bool:
+    """Flag (or unflag) an item as preview-only. While set, the DB triggers refuse to move it
+    into any RELEASE_STAGES stage or to create/update a posts row for it."""
+    ts = now()
+    with db(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE items SET preview_only = ?, updated_at = ? WHERE id = ?",
+            (1 if preview_only else 0, ts, item_id),
+        )
+        return cur.rowcount > 0
 
 
 def mark_failed(
