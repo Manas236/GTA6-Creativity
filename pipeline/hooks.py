@@ -36,6 +36,7 @@ GEMINI_DEFAULTS: dict[str, Any] = {
     "max_output_tokens": 2048,
     "requests_per_minute": 5,
     "rate_limit_retries": 2,
+    "max_rate_limit_wait_s": 120,
     "max_attempts": 3,
     "grounding_fail_limit": 2,
     "fallback_hook": "IS THIS REALLY GTA 6?",
@@ -44,6 +45,7 @@ FALLBACK_VOICEOVER = "Check out this crazy GTA 6 moment right now!"
 
 # Free-tier pacing state (per process). _sleep/_now are module attributes so tests can fake them.
 _LAST_CALL_T: float | None = None
+_QUOTA_BLOCKED_UNTIL: float | None = None  # set by a daily-quota 429; later calls fail fast
 _sleep = time.sleep
 _now = time.monotonic
 
@@ -54,6 +56,10 @@ class GeminiError(RuntimeError):
 
 class GeminiRateLimitError(GeminiError):
     """HTTP 429 persisted after the configured retries."""
+
+
+class GeminiQuotaExhaustedError(GeminiRateLimitError):
+    """HTTP 429 whose retryDelay is longer than max_rate_limit_wait_s (the daily quota)."""
 
 
 class GeminiTruncatedError(GeminiError):
@@ -164,7 +170,12 @@ def _call_gemini(
     cfg: dict[str, Any] | None = None,
 ) -> str:
     """Call Gemini generateContent with text and optional inline images. Raises GeminiError."""
+    global _QUOTA_BLOCKED_UNTIL
     gs = gemini_settings(cfg)
+    if _QUOTA_BLOCKED_UNTIL is not None and _now() < _QUOTA_BLOCKED_UNTIL:
+        raise GeminiQuotaExhaustedError(
+            f"Gemini daily quota exhausted (retry in {_QUOTA_BLOCKED_UNTIL - _now():.0f}s); not calling"
+        )
     if not api_key:
         env = config.load_env()
         api_key = env.get("GEMINI_API_KEY", "")
@@ -207,6 +218,14 @@ def _call_gemini(
         if res.status_code != 429:
             break
         delay = _retry_delay_s(res)
+        max_wait = float(gs["max_rate_limit_wait_s"])
+        if delay is not None and delay > max_wait:
+            # A per-minute 429 asks for < 60 s; hours means the daily quota is gone. Never
+            # sleep that long (the runner would hold its lock for half a day): fail fast.
+            _QUOTA_BLOCKED_UNTIL = _now() + delay
+            raise GeminiQuotaExhaustedError(
+                f"Gemini daily quota exhausted (HTTP 429, retryDelay {delay:.0f}s > {max_wait:.0f}s cap)"
+            )
         if i >= retries:
             raise GeminiRateLimitError(f"Gemini HTTP 429 after {i + 1} tries (retryDelay {delay}s)")
         wait = (delay if delay is not None else min_interval) + 1.0
@@ -418,8 +437,10 @@ def _cut_transcript(item: dict[str, Any], cut_path: Path, cfg: dict[str, Any], d
     if words is not None:
         return words
     log.info("Transcribing cut %s with faster-whisper (%s)...", cut_path.name, model_name)
-    words = render.transcribe_words(cut_path, model_name=model_name)
-    if words:  # an empty result may be a transcription failure: do not cache it
+    # raise_errors: a broken whisper (missing model cache, bad HF_HOME, ...) must fail the
+    # stage, not silently hand Gemini an empty transcript.
+    words = render.transcribe_words(cut_path, model_name=model_name, raise_errors=True)
+    if words:  # nothing spoken: nothing worth caching (render will simply transcribe again)
         render.store_cut_words(item["id"], item, words, model_name, db_path=db_path)
     return words
 
@@ -446,7 +467,15 @@ def run_hooks_for_item(
     model = gs["model"]
 
     # Transcript of the cut window (PLAN §8): Gemini gets it with the 4 frames and title.
-    words = _cut_transcript(item, cut_path, cfg, db_path)
+    try:
+        words = _cut_transcript(item, cut_path, cfg, db_path)
+    except Exception as e:
+        reason = _redact(f"Whisper transcription failed: {type(e).__name__}: {e}")
+        log.error("%s (item %s)", reason, item_id)
+        _clear_hook_fields(item_id, db_path=db_path)
+        db.mark_failed(item_id, "hooks", reason, db_path=db_path)
+        db.log_stage(item_id, "hooks", "failed", message=reason, db_path=db_path)
+        return False, reason
     transcript = " ".join(str(w.get("word", "")).strip() for w in words).strip()
     log.info("Cut transcript for %s: %d words", item_id, len(words))
 

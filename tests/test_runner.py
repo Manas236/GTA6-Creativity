@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import time
 from pathlib import Path
+
+import pytest
 
 from pipeline import db, runner
 
@@ -68,4 +71,26 @@ def test_stale_heartbeat_breaks_lock(tmp_db: Path) -> None:
     ok = runner.acquire_lock(db_path=tmp_db, stale_timeout_s=120.0)
     assert ok is True
     runner.release_lock(db_path=tmp_db)
+
+
+@pytest.mark.parametrize("command", ["hooks", "voiceover", "render"])
+def test_stage_commands_migrate_an_old_db_before_running(tmp_path: Path, monkeypatch, command: str) -> None:
+    """An existing pipeline.db from before items.transcript_words must be migrated, not crash."""
+    path = tmp_path / "old.db"
+    db.init_db(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE items DROP COLUMN transcript_words")   # simulate the old schema
+    monkeypatch.setattr("sys.argv", ["runner", "--db", str(path), command])
+    runner.main()
+    with sqlite3.connect(path) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(items)")]
+    assert "transcript_words" in cols
+
+
+@pytest.mark.parametrize("command", ["hooks", "voiceover", "render"])
+def test_stage_commands_work_on_a_brand_new_db(tmp_path: Path, monkeypatch, command: str) -> None:
+    path = tmp_path / "fresh.db"                                          # does not exist yet
+    monkeypatch.setattr("sys.argv", ["runner", "--db", str(path), command])
+    runner.main()                                                         # no 'no such table: kv'
+    assert path.exists()
 

@@ -253,6 +253,7 @@ def main() -> None:
         finally:
             release_lock(db_path=db_p)
     elif args.command == "hooks":
+        db.init_db(db_p)  # apply schema migrations (e.g. items.transcript_words) first
         if not acquire_lock(db_path=db_p):
             print("Locked: another runner active")
             sys.exit(1)
@@ -264,6 +265,7 @@ def main() -> None:
         finally:
             release_lock(db_path=db_p)
     elif args.command == "voiceover":
+        db.init_db(db_p)
         if not acquire_lock(db_path=db_p):
             print("Locked: another runner active")
             sys.exit(1)
@@ -275,6 +277,7 @@ def main() -> None:
         finally:
             release_lock(db_path=db_p)
     elif args.command == "render":
+        db.init_db(db_p)
         if not acquire_lock(db_path=db_p):
             print("Locked: another runner active")
             sys.exit(1)

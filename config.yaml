@@ -77,6 +77,7 @@ gemini:
   max_output_tokens: 2048
   requests_per_minute: 5 # free tier: calls are spaced 60/5 = 12 s apart
   rate_limit_retries: 2 # per call: on HTTP 429, wait the server's retryDelay, then retry
+  max_rate_limit_wait_s: 120 # a longer retryDelay = daily quota gone: fail fast, never sleep hours
   max_attempts: 3 # hook generation attempts per item before the hooks stage fails
   grounding_fail_limit: 2 # grounding FAIL verdicts before the plain question-hook fallback
   fallback_hook: "IS THIS REALLY GTA 6?"

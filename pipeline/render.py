@@ -91,10 +91,18 @@ def format_ass_timestamp(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def transcribe_words(audio_or_video_path: Path | str, model_name: str = "base.en") -> list[dict[str, Any]]:
-    """Transcribe audio with word-level timestamps using faster-whisper."""
+def transcribe_words(
+    audio_or_video_path: Path | str, model_name: str = "base.en", raise_errors: bool = False
+) -> list[dict[str, Any]]:
+    """Transcribe audio with word-level timestamps using faster-whisper.
+
+    By default a failure is logged and [] is returned. raise_errors=True re-raises instead,
+    so a caller can tell "whisper broke" from "nobody speaks" (the hooks stage needs that).
+    """
     path_str = str(audio_or_video_path)
     if not Path(path_str).exists():
+        if raise_errors:
+            raise FileNotFoundError(f"cannot transcribe, file not found: {path_str}")
         return []
 
     try:
@@ -121,6 +129,8 @@ def transcribe_words(audio_or_video_path: Path | str, model_name: str = "base.en
                     })
         return words
     except Exception as e:
+        if raise_errors:
+            raise
         log.warning("Whisper transcription failed for %s: %s", path_str, e)
         return []
 

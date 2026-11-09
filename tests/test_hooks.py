@@ -112,7 +112,27 @@ def fake_clock(monkeypatch):
     monkeypatch.setattr(hooks, "_sleep", sleep)
     monkeypatch.setattr(hooks, "_now", lambda: state["t"])
     monkeypatch.setattr(hooks, "_LAST_CALL_T", None)
+    monkeypatch.setattr(hooks, "_QUOTA_BLOCKED_UNTIL", None)
     return state
+
+
+def test_daily_quota_429_fails_fast_and_later_calls_skip_the_request(fake_clock):
+    """retryDelay 45243 s (the free-tier daily quota) must never be slept: fail fast."""
+    with patch("pipeline.hooks.requests.post", return_value=_429("45243s")) as post:
+        with pytest.raises(hooks.GeminiQuotaExhaustedError, match="daily quota exhausted"):
+            hooks._call_gemini("p", api_key="k")
+        with pytest.raises(hooks.GeminiQuotaExhaustedError, match="daily quota exhausted"):
+            hooks._call_gemini("p", api_key="k")
+    assert post.call_count == 1                                   # second call never hit the API
+    cap = hooks.gemini_settings()["max_rate_limit_wait_s"]
+    assert all(s <= cap for s in fake_clock["sleeps"])            # no half-day sleep
+    assert sum(fake_clock["sleeps"]) < 60
+
+
+def test_per_minute_429_under_the_cap_is_still_waited_out(fake_clock):
+    with patch("pipeline.hooks.requests.post", side_effect=[_429("30s"), _ok("PASS")]):
+        assert hooks._call_gemini("p", api_key="k") == "PASS"
+    assert any(30 <= s <= 32 for s in fake_clock["sleeps"])
 
 
 def test_call_gemini_turns_thinking_off_asks_for_json_and_raises_the_cap(fake_clock):
@@ -238,6 +258,43 @@ def test_hooks_stage_fails_the_item_when_no_valid_gemini_hook(tmp_db, tmp_path):
     assert item["stage"] == "failed" and item["error_stage"] == "hooks"
     assert "MAX_TOKENS" in item["error_message"]
     assert item["hook_text"] is None and item["voiceover_script"] is None and item["keywords"] is None
+
+
+def test_transcribe_words_raise_errors_reraises_instead_of_returning_empty(tmp_path):
+    clip = tmp_path / "c.mp4"
+    clip.write_bytes(b"0")
+    boom = OSError("[WinError 3] The system cannot find the path specified: 'D:\\\\'")
+    with patch.object(render, "get_whisper_model", side_effect=boom):
+        assert render.transcribe_words(clip) == []                 # default: unchanged for render
+        with pytest.raises(OSError, match="WinError 3"):
+            render.transcribe_words(clip, raise_errors=True)
+
+
+def test_hooks_stage_whisper_error_fails_the_item_without_calling_gemini(tmp_db, tmp_path):
+    iid = _cut_item(tmp_db, tmp_path, hook_text="OLD HOOK?", keywords='["GTA"]')
+    boom = OSError("[WinError 3] The system cannot find the path specified: 'D:\\\\'")
+    with patch.object(render, "get_whisper_model", side_effect=boom), \
+         patch("pipeline.hooks.generate_hook_and_voiceover") as gen:
+        ok, msg = hooks.run_hooks_for_item(iid, cfg=config.get_config(), db_path=tmp_db)
+    assert ok is False and "Whisper transcription failed" in msg
+    gen.assert_not_called()
+    item = db.get_item(iid, db_path=tmp_db)
+    assert item["stage"] == "failed" and item["error_stage"] == "hooks"
+    assert "WinError 3" in item["error_message"]
+    assert item["hook_text"] is None and item["keywords"] is None and item["transcript_words"] is None
+
+
+def test_hooks_stage_daily_quota_fails_the_item_quickly(tmp_db, tmp_path, fake_clock):
+    iid = _cut_item(tmp_db, tmp_path)
+    with patch.object(render, "transcribe_words", return_value=WORDS), \
+         patch("pipeline.hooks.extract_sample_frames", return_value=[b"f"]), \
+         patch("pipeline.hooks.config.load_env", return_value={"GEMINI_API_KEY": "k"}), \
+         patch("pipeline.hooks.requests.post", return_value=_429("45243s")) as post:
+        ok, msg = hooks.run_hooks_for_item(iid, cfg=config.get_config(), db_path=tmp_db)
+    assert ok is False and "daily quota exhausted" in msg
+    assert post.call_count == 1
+    assert db.get_item(iid, db_path=tmp_db)["stage"] == "failed"
+    assert sum(fake_clock["sleeps"]) < 60
 
 
 def test_hooks_stage_grounding_errors_never_pass_and_never_fall_back(tmp_db, tmp_path):
