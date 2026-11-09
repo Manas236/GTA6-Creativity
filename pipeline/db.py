@@ -1,0 +1,458 @@
+"""SQLite database in WAL mode for persistent pipeline state."""
+from __future__ import annotations
+
+import contextlib
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Generator, Iterator
+
+from .config import project_root
+
+DEFAULT_DB_PATH = project_root() / "pipeline.db"
+
+STAGES = [
+    "discovered",
+    "downloaded",
+    "cut",
+    "rendered",
+    "awaiting_approval",
+    "approved",
+    "queued",
+    "posted",
+    "measured",
+    "cleaned",
+    "rejected",
+    "failed",
+]
+
+SCHEMA = """
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 10000;
+
+CREATE TABLE IF NOT EXISTS items (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    author_name TEXT NOT NULL,
+    original_title TEXT,
+    original_duration REAL,
+    view_count INTEGER DEFAULT 0,
+    upvote_count INTEGER DEFAULT 0,
+    comment_count INTEGER DEFAULT 0,
+    upload_time TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    raw_velocity REAL NOT NULL,
+    percentile_rank REAL NOT NULL,
+    discovery_score REAL NOT NULL,
+    download_path TEXT,
+    downloaded_at TEXT,
+    is_duplicate INTEGER DEFAULT 0,
+    rejection_reason TEXT,
+    cut_start REAL,
+    cut_end REAL,
+    cut_duration REAL,
+    cut_path TEXT,
+    hook_style TEXT,
+    hook_text TEXT,
+    hook_grounded INTEGER DEFAULT 1,
+    voiceover_script TEXT,
+    voiceover_audio_path TEXT,
+    caption_text TEXT,
+    render_a_path TEXT,
+    render_b_path TEXT,
+    chosen_variant TEXT,
+    approval_type TEXT,
+    stage TEXT NOT NULL,
+    error_stage TEXT,
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    stage_updated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_items_stage ON items(stage);
+CREATE INDEX IF NOT EXISTS idx_items_discovery_score ON items(discovery_score DESC);
+CREATE INDEX IF NOT EXISTS idx_items_source_url ON items(source_url);
+
+CREATE TABLE IF NOT EXISTS fingerprints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    second_offset INTEGER NOT NULL,
+    phash_uint64 INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fingerprints_item_scope ON fingerprints(item_id, scope);
+CREATE INDEX IF NOT EXISTS idx_fingerprints_hash ON fingerprints(phash_uint64);
+
+CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    variant TEXT NOT NULL,
+    hook_style TEXT NOT NULL,
+    source TEXT NOT NULL,
+    slot_datetime TEXT NOT NULL,
+    status TEXT NOT NULL,
+    remote_container_id TEXT,
+    remote_id TEXT,
+    remote_url TEXT,
+    error_message TEXT,
+    posted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE,
+    UNIQUE(item_id, platform)
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status);
+CREATE INDEX IF NOT EXISTS idx_posts_slot_datetime ON posts(slot_datetime);
+
+CREATE TABLE IF NOT EXISTS metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id INTEGER NOT NULL,
+    snapshot_hours INTEGER NOT NULL,
+    views INTEGER DEFAULT 0,
+    likes INTEGER DEFAULT 0,
+    comments INTEGER DEFAULT 0,
+    shares INTEGER DEFAULT 0,
+    raw_json TEXT,
+    fetched_at TEXT NOT NULL,
+    FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE,
+    UNIQUE(post_id, snapshot_hours)
+);
+
+CREATE TABLE IF NOT EXISTS ab_learning (
+    dimension TEXT NOT NULL,
+    dimension_value TEXT NOT NULL,
+    sample_count INTEGER DEFAULT 0,
+    normalized_score REAL DEFAULT 0.0,
+    weight REAL DEFAULT 1.0,
+    rebuilt_at TEXT NOT NULL,
+    PRIMARY KEY(dimension, dimension_value)
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+    source TEXT PRIMARY KEY,
+    paused_until TEXT,
+    consecutive_errors INTEGER DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    duration_s REAL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stage_log_item ON stage_log(item_id);
+"""
+
+
+def now() -> str:
+    """Return ISO-8601 UTC timestamp."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(ts: str) -> datetime:
+    """Parse ISO-8601 UTC timestamp."""
+    clean = ts.replace("Z", "+00:00")
+    return datetime.fromisoformat(clean)
+
+
+def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
+    target_path = Path(db_path or DEFAULT_DB_PATH)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(target_path, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextlib.contextmanager
+def db(db_path: Path | str | None = None) -> Generator[sqlite3.Connection, None, None]:
+    """Context manager for SQLite connection with automatic commit/rollback."""
+    conn = get_connection(db_path)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db(db_path: Path | str | None = None) -> None:
+    """Initialize SQLite database with schema in WAL mode."""
+    with db(db_path) as conn:
+        conn.executescript(SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# Items Management
+# ---------------------------------------------------------------------------
+
+def insert_discovered_item(item_data: dict[str, Any], db_path: Path | str | None = None) -> bool:
+    """Insert newly discovered item. Returns True if inserted, False if already exists."""
+    ts = now()
+    with db(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO items (
+                id, source, source_id, source_url, author_name, original_title,
+                original_duration, view_count, upvote_count, comment_count,
+                upload_time, discovered_at, raw_velocity, percentile_rank,
+                discovery_score, stage, stage_updated_at, created_at, updated_at
+            ) VALUES (
+                :id, :source, :source_id, :source_url, :author_name, :original_title,
+                :original_duration, :view_count, :upvote_count, :comment_count,
+                :upload_time, :discovered_at, :raw_velocity, :percentile_rank,
+                :discovery_score, 'discovered', :stage_updated_at, :created_at, :updated_at
+            )
+            ON CONFLICT(source, source_id) DO UPDATE SET
+                view_count = excluded.view_count,
+                upvote_count = excluded.upvote_count,
+                comment_count = excluded.comment_count,
+                raw_velocity = excluded.raw_velocity,
+                percentile_rank = excluded.percentile_rank,
+                discovery_score = excluded.discovery_score,
+                updated_at = excluded.updated_at
+            WHERE stage = 'discovered'
+            """,
+            {
+                "id": item_data["id"],
+                "source": item_data["source"],
+                "source_id": item_data["source_id"],
+                "source_url": item_data["source_url"],
+                "author_name": item_data["author_name"],
+                "original_title": item_data.get("original_title", ""),
+                "original_duration": item_data.get("original_duration", 0.0),
+                "view_count": item_data.get("view_count", 0),
+                "upvote_count": item_data.get("upvote_count", 0),
+                "comment_count": item_data.get("comment_count", 0),
+                "upload_time": item_data.get("upload_time", ts),
+                "discovered_at": ts,
+                "raw_velocity": item_data.get("raw_velocity", 0.0),
+                "percentile_rank": item_data.get("percentile_rank", 0.5),
+                "discovery_score": item_data.get("discovery_score", 0.0),
+                "stage_updated_at": ts,
+                "created_at": ts,
+                "updated_at": ts,
+            },
+        )
+        return cursor.rowcount > 0
+
+
+def get_item(item_id: str, db_path: Path | str | None = None) -> dict[str, Any] | None:
+    with db(db_path) as conn:
+        row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_items_by_stage(
+    stage: str, limit: int | None = None, order_by_score: bool = True, db_path: Path | str | None = None
+) -> list[dict[str, Any]]:
+    order_clause = "ORDER BY discovery_score DESC" if order_by_score else "ORDER BY created_at ASC"
+    limit_clause = f"LIMIT {limit}" if limit else ""
+    with db(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM items WHERE stage = ? {order_clause} {limit_clause}", (stage,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_ready_buffer_count(db_path: Path | str | None = None) -> int:
+    """Return count of items in ready or pipeline queue stages."""
+    with db(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM items 
+            WHERE stage IN ('rendered', 'awaiting_approval', 'approved', 'queued')
+            """
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+def transition_stage(
+    item_id: str,
+    to_stage: str,
+    extra_fields: dict[str, Any] | None = None,
+    db_path: Path | str | None = None,
+) -> bool:
+    """Transition an item to a new stage."""
+    ts = now()
+    fields = {"stage": to_stage, "stage_updated_at": ts, "updated_at": ts}
+    if extra_fields:
+        fields.update(extra_fields)
+
+    set_clauses = [f"{k} = :{k}" for k in fields]
+    fields["id"] = item_id
+
+    with db(db_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE items SET {', '.join(set_clauses)} WHERE id = :id",
+            fields,
+        )
+        return cursor.rowcount > 0
+
+
+def mark_failed(
+    item_id: str, error_stage: str, error_message: str, db_path: Path | str | None = None
+) -> None:
+    ts = now()
+    with db(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE items SET 
+                stage = 'failed',
+                error_stage = ?,
+                error_message = ?,
+                retry_count = retry_count + 1,
+                stage_updated_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (error_stage, error_message[:1000], ts, ts, item_id),
+        )
+
+
+def mark_rejected(
+    item_id: str, reason: str, is_duplicate: bool = False, db_path: Path | str | None = None
+) -> None:
+    ts = now()
+    with db(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE items SET 
+                stage = 'rejected',
+                rejection_reason = ?,
+                is_duplicate = ?,
+                stage_updated_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (reason, 1 if is_duplicate else 0, ts, ts, item_id),
+        )
+
+
+def log_stage(
+    item_id: str, stage: str, status: str, message: str = "", duration_s: float = 0.0, db_path: Path | str | None = None
+) -> None:
+    ts = now()
+    with db(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO stage_log (item_id, stage, status, message, duration_s, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (item_id, stage, status, message[:500], duration_s, ts),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint Operations
+# ---------------------------------------------------------------------------
+
+def to_signed_int64(val: int) -> int:
+    """Convert unsigned 64-bit integer to signed 64-bit integer for SQLite."""
+    return val if val < (1 << 63) else val - (1 << 64)
+
+
+def to_unsigned_int64(val: int) -> int:
+    """Convert signed 64-bit integer back to unsigned 64-bit integer."""
+    return val if val >= 0 else val + (1 << 64)
+
+
+def save_fingerprints(
+    item_id: str, scope: str, hashes: list[tuple[int, int]], db_path: Path | str | None = None
+) -> None:
+    """Save (second_offset, phash_uint64) tuples for an item."""
+    ts = now()
+    records = [(item_id, scope, sec, to_signed_int64(h), ts) for sec, h in hashes]
+    with db(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO fingerprints (item_id, scope, second_offset, phash_uint64, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            records,
+        )
+
+
+def get_stored_fingerprints_by_item(
+    scope: str, exclude_item_id: str | None = None, db_path: Path | str | None = None
+) -> dict[str, list[tuple[int, int]]]:
+    """Retrieve all fingerprints for a given scope grouped by item_id: {item_id: [(sec, hash), ...]}."""
+    with db(db_path) as conn:
+        query = "SELECT item_id, second_offset, phash_uint64 FROM fingerprints WHERE scope = ?"
+        params: list[Any] = [scope]
+        if exclude_item_id:
+            query += " AND item_id != ?"
+            params.append(exclude_item_id)
+        query += " ORDER BY item_id, second_offset ASC"
+
+        rows = conn.execute(query, params).fetchall()
+        result: dict[str, list[tuple[int, int]]] = {}
+        for r in rows:
+            result.setdefault(r["item_id"], []).append(
+                (r["second_offset"], to_unsigned_int64(r["phash_uint64"]))
+            )
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiting & KV Store
+# ---------------------------------------------------------------------------
+
+def kv_get(key: str, default: str | None = None, db_path: Path | str | None = None) -> str | None:
+    with db(db_path) as conn:
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def kv_set(key: str, value: str, db_path: Path | str | None = None) -> None:
+    ts = now()
+    with db(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, value, ts),
+        )
+
+
+def get_recent_source_velocities(
+    source: str, limit: int = 100, db_path: Path | str | None = None
+) -> list[float]:
+    """Return raw velocities for recent items discovered from a source."""
+    with db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT raw_velocity FROM items
+            WHERE source = ? AND raw_velocity > 0
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (source, limit),
+        ).fetchall()
+        return [float(r["raw_velocity"]) for r in rows]

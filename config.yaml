@@ -1,0 +1,112 @@
+app:
+  brand_name: "GTA 6 Clipping Pipeline"
+  dry_run: true
+
+sources:
+  youtube:
+    enabled: true
+    weight: 1.0
+    queries:
+      - "GTA 6 trailer"
+      - "GTA 6 gameplay"
+      - "GTA 6 leak"
+      - "Grand Theft Auto VI secret"
+    max_results_per_query: 10
+    max_duration_seconds: 600
+  reddit:
+    enabled: true
+    weight: 1.25
+    subreddits:
+      - "GTA6"
+      - "GTA"
+    listing: "hot"
+    limit: 25
+  twitch:
+    enabled: false # Active from launch (19 Nov 2026)
+    game_name: "Grand Theft Auto VI"
+    weight: 1.10
+    limit: 20
+  kick:
+    enabled: false
+    # Official API at api.kick.com/public has no clips endpoint.
+    # Website clips require scraping around undocumented endpoints.
+    # Disabled until an official clips endpoint is released.
+
+discovery:
+  min_age_hours: 0.5
+  half_life_hours: 36.0
+  rolling_pool_size: 100
+  score_formula: >
+    percentile_rank * (0.5 ** (age_hours / half_life_hours)) * source_weight
+
+dedupe:
+  crop_black_bars: true
+  fps: 1
+  hamming_threshold: 8 # Max bit difference per frame
+  consecutive_frames: 3 # N consecutive frame matches constitutes duplicate
+
+buffer:
+  target_ready_items: 6 # Pull-based cap: process only enough to maintain 6 ready items
+
+cut:
+  target_duration: 20.0
+  min_duration: 18.0
+  max_duration: 22.0
+  short_clip_threshold: 30.0
+  scene_threshold: 0.3
+  audio_weight: 0.75
+  scene_weight: 0.25
+  intro_outro_penalty_pct: 0.05
+
+render:
+  width: 1080
+  height: 1920
+  fps: 30
+  font_path: "assets/fonts/Montserrat-Bold.ttf"
+  whisper_model: "base.en"
+  target_lufs: -14.0
+  ducking_attenuation_db: -14.0
+  voiceover_target_duration_s: 4.5
+
+approval:
+  mode: "telegram" # 'telegram' or 'auto'
+  auto_quality_gate:
+    require_both_renders: true
+    require_ffprobe_pass: true
+    require_grounded_hook: true
+    max_duration_seconds: 22.0
+
+posting:
+  profile: "local" # 'local' or 'server'
+  profiles:
+    local:
+      timezone: "Asia/Kolkata"
+      slots: ["13:00", "18:00"]
+    server:
+      timezone: "America/New_York"
+      slots: ["18:00", "21:00"]
+  min_gap_hours: 3.0
+  meta_min_gap_seconds: 3.0
+  daily_post_target: 2
+  platforms:
+    instagram: true
+    facebook: true
+
+telegram:
+  enabled: true
+  api_base: "https://api.telegram.org"
+  poll_timeout_s: 30
+  edit_throttle_gap_s: 2.5
+
+autopilot:
+  alert_every_hours: 12
+  bandit_min_exploration_floor: 0.20
+
+retention:
+  purge_downloads_immediately: true
+  purge_renders_after_days: 7
+  purge_rejected_failed_after_days: 3
+
+orchestrator:
+  loop_interval_seconds: 60
+  stale_lock_seconds: 600
