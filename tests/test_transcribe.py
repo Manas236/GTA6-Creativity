@@ -65,8 +65,13 @@ def test_config_carries_the_model_and_the_glossary():
     ts = transcribe.settings(CFG)
     assert ts["model"] in ("base.en", "small.en")
     for term in ("Leonida", "Lucia", "Jason", "Vice City", "Port Gellhorn", "Ambrosia", "wanted level",
-                 "Rockstar", "GTA 6", "GTA VI", "Trevor", "Michael", "Franklin", "Grassrivers", "Mount Kalaga"):
+                 "Rockstar", "GTA 6", "Trevor", "Michael", "Franklin", "Grassrivers", "Mount Kalaga"):
         assert term in ts["glossary"], term
+    # removed: as a hotword it turned a spoken "GTA 6" into "GTA VI"
+    assert "GTA VI" not in ts["glossary"]
+    with_vi = copy.deepcopy(CFG)
+    with_vi["transcribe"]["glossary"] = ts["glossary"] + ["GTA VI"]
+    assert transcribe.cache_key(with_vi) != transcribe.cache_key(CFG)      # so old transcripts are not reused
     assert transcribe.prompt_kwargs(ts)                                # the glossary is passed at all
 
 

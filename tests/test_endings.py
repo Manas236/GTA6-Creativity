@@ -132,25 +132,6 @@ def _run_cut(tmp_db, tmp_path, sc, transcriber):
         return cut.run_cut_item("item_c", db_path=tmp_db, transcriber=transcriber)
 
 
-def test_no_sentence_end_in_the_best_window_moves_to_the_next_best(tmp_db, tmp_path):
-    _seed_item(tmp_db, tmp_path)
-    sc = scan([(10.0, 0.9), (50.0, 0.8)])
-    calls = []
-
-    def transcriber(_p, a, b):
-        calls.append((a, b))
-        if a == 10.0:
-            return continuous(a, b)                              # talks straight through
-        return continuous(a, a + 19.0) + [W("finished.", a + 19.0, a + 19.4)] + continuous(a + 19.8, b)
-
-    ok, msg = _run_cut(tmp_db, tmp_path, sc, transcriber)
-    assert ok, msg
-    item = db.get_item("item_c", db_path=tmp_db)
-    assert item["stage"] == "cut" and item["cut_start"] == 50.0
-    assert 69.4 < item["cut_end"] < 69.8
-    assert calls == [(10.0, 34.0), (50.0, 74.0)]                 # window + max 22 s + 2 s tail
-
-
 def test_no_window_with_a_sentence_end_fails_with_no_clean_ending(tmp_db, tmp_path):
     _seed_item(tmp_db, tmp_path)
     sc = scan([(10.0, 0.9), (50.0, 0.8), (90.0, 0.7)])
@@ -427,20 +408,11 @@ def test_the_verified_cut_end_only_reaches_back_over_its_measured_quiet_tail():
     assert 18.8 < v.start < 18.85 and v.end == 19.0
 
 
-def test_near_copies_of_a_window_without_a_sentence_end_are_skipped(tmp_db, tmp_path):
-    _seed_item(tmp_db, tmp_path)
-    sc = scan([(10.0, 0.9), (11.0, 0.88), (11.8, 0.87), (60.0, 0.5)])
-    calls = []
 
-    def transcriber(_p, a, b):
-        calls.append(a)
-        if a < 50:
-            return continuous(a, b)
-        return continuous(a, a + 19.0) + [W("finished.", a + 19.0, a + 19.4)] + continuous(a + 19.8, b)
 
-    es = {**ES, "max_windows": 2}
-    with patch.object(cut.endings, "ending_settings", return_value=es):
-        ok, msg = _run_cut(tmp_db, tmp_path, sc, transcriber)
-    assert ok, msg
-    assert calls == [10.0, 60.0]                       # 11 and 11.8 s were near-copies of the failed 10 s
-    assert db.get_item("item_c", db_path=tmp_db)["cut_start"] == 60.0
+def test_the_whole_measured_pause_after_a_full_stop_is_safe_and_the_end_goes_in_its_middle():
+    words = continuous(0.0, 18.6) + [W("pack.", 18.6, 19.0), W("Now", 19.4, 19.6)] + continuous(19.6, 25.0)
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.0, 19.4)]))
+    assert len(spans) == 1 and spans[0].start == pytest.approx(19.01, abs=0.011)
+    assert spans[0].end == pytest.approx(19.38, abs=0.021)              # the whole pause, not a 0.1 s core
+    assert endings.choose_end(spans, 20.0, ES) == pytest.approx((spans[0].start + spans[0].end) / 2, abs=0.002)

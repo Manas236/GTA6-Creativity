@@ -8,6 +8,7 @@ next-best scored window. No window with a clean ending -> the item fails with
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -15,11 +16,12 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import config, db, dedupe, endings, transcribe
+from . import config, db, dedupe, endings, sentence_windows, transcribe
 from .download import verify_video_file
 
 log = logging.getLogger(__name__)
@@ -459,7 +461,7 @@ def clean_end_for_window(
     return EndChoice(win.start, end, "sentence", cut_words)
 
 
-def transcript_payload(choice: EndChoice, key: str) -> str:
+def transcript_payload(choice: EndChoice, key: str, selection: dict[str, Any] | None = None) -> str:
     """The items.transcript_words value for a cut: keyed on the window and on
     transcribe.cache_key() (model + glossary), so hooks and render reuse it and a changed
     window, model or glossary can never pass for it."""
@@ -472,6 +474,7 @@ def transcript_payload(choice: EndChoice, key: str) -> str:
         "ending": choice.kind,          # the cut stage checked this end: render may trust it
         "ending_rule": endings.RULE_VERSION,
         "source": "cut",
+        "selection": selection or {},     # how the window was chosen (candidates, timing, ...)
     })
 
 
@@ -498,6 +501,53 @@ def _extract_cut(download_path: Path, start_s: float, end_s: float, cut_path: Pa
     subprocess.run(cmd, capture_output=True, check=True, timeout=120)
 
 
+def source_transcript_key(item: dict[str, Any], path: Path, regions: Sequence[tuple[float, float]], tkey: str) -> str:
+    """The whole-source transcript is valid for this source file (identity + size), this
+    transcription key (model + glossary) and these regions only."""
+    size = path.stat().st_size if path.exists() else 0
+    blob = f"{item.get('source')}:{item.get('source_id')}:{size}:{tkey}:{list(regions)}"
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def load_source_transcript(
+    item: dict[str, Any], path: Path, regions: Sequence[tuple[float, float]], tkey: str,
+    transcriber: "Transcriber", db_path: Any = None,
+) -> tuple[list[dict[str, Any]], float, bool]:
+    """(words on the source timeline, wall seconds the transcription took, came from cache).
+
+    Cached in items.source_transcript, so a re-cut (dedupe, a preset re-render, a config
+    change elsewhere) never transcribes the same source twice."""
+    key = source_transcript_key(item, path, regions, tkey)
+    raw = item.get("source_transcript")
+    if raw:
+        try:
+            data = json.loads(raw)
+            if data.get("key") == key:
+                return [dict(w) for w in data.get("words") or []], float(data.get("wall_s") or 0.0), True
+        except Exception:  # noqa: BLE001 - a corrupt cache is simply rebuilt
+            pass
+    t0 = time.perf_counter()
+    words: list[dict[str, Any]] = []
+    for a, b in regions:
+        words += transcriber(path, a, b)
+    wall = time.perf_counter() - t0
+    covered = sum(b - a for a, b in regions)
+    log.info("Transcribed %.0f s of %s in %.1f s (%s, %d region(s), %d words)",
+             covered, path.name, wall, tkey, len(regions), len(words))
+    with db.db(db_path) as conn:
+        conn.execute("UPDATE items SET source_transcript = ?, updated_at = ? WHERE id = ?", (
+            json.dumps({"key": key, "transcribe_key": tkey, "regions": [list(r) for r in regions],
+                        "wall_s": round(wall, 1), "words": words}),
+            db.now(), item["id"]))
+    return words, wall, False
+
+
+def _outcome(item_id: str, status: str, message: str, db_path: Any) -> None:
+    """Every cut attempt leaves exactly one stage_log row (success / failure / rejected), which is
+    what the no_clean_ending rate in `runner status` and the alerts counts."""
+    db.log_stage(item_id, "cut", status, message=message[:1000], db_path=db_path)
+
+
 def run_cut_item(
     item_id: str,
     cfg: dict[str, Any] | None = None,
@@ -505,11 +555,13 @@ def run_cut_item(
     transcriber: Transcriber | None = None,
     envelope: EnvelopeFn | None = None,
 ) -> tuple[bool, str]:
-    """Execute cut stage for a downloaded item: a speech-safe end, then cut-level dedupe.
+    """Cut stage for a downloaded item: sentence-aligned window selection, then cut-level dedupe.
 
-    Windows are tried best score first (up to cut.ending.max_windows). A window is skipped
-    when its end range holds no sentence break, or when its cut duplicates an earlier
-    item's cut; the first window that passes both is kept.
+    The source is transcribed once (pipeline.sentence_windows); every clean sentence end that
+    admits a min..max window gives a candidate, scored with the audio/scene formula plus a soft
+    sentence-start bonus. Candidates are cut best first; one that duplicates an earlier item's
+    cut is skipped (as is any candidate overlapping it by half or more). A source with no speech
+    keeps the old loudness-trough windows. No candidate at all -> failed, `no_clean_ending`.
     """
     cfg = cfg or config.get_config()
     item = db.get_item(item_id, db_path=db_path)
@@ -519,12 +571,14 @@ def run_cut_item(
     download_path_str = item.get("download_path")
     if not download_path_str or not Path(download_path_str).exists():
         db.mark_failed(item_id, "cut", "Download path missing on disk", db_path=db_path)
+        _outcome(item_id, "failure", "Download path missing on disk", db_path)
         return False, "Download file not found"
 
     download_path = Path(download_path_str)
     consecutive_n = int(cfg.get("dedupe", {}).get("consecutive_frames", 3))
     hamming_thresh = int(cfg.get("dedupe", {}).get("hamming_threshold", 8))
     es = endings.ending_settings(cfg)
+    sw = sentence_windows.settings(cfg)
     tkey = transcribe.cache_key(cfg)
     if transcriber is None:
         def transcriber(path: Path, a: float, b: float) -> list[dict[str, Any]]:
@@ -535,63 +589,86 @@ def run_cut_item(
     if not scan:
         # Static source or duration floor failed
         db.mark_rejected(item_id, "rejected: static_source (low scene density)", db_path=db_path)
+        _outcome(item_id, "rejected", "static_source (low scene density) or too short", db_path)
         return False, "Rejected: static_source"
+
+    tail = float(es["tail_s"])
+    max_windows = max(1, int(es["max_windows"]))
+    spans = sentence_windows.transcribe_regions(scan.total_duration, scan.windows, scan.min_dur,
+                                                scan.max_dur, tail, sw)
+    try:
+        words_all, wall, cached = load_source_transcript(item, download_path, spans, tkey, transcriber, db_path)
+    except Exception as e:
+        reason = f"Whisper transcription failed at cut: {type(e).__name__}: {e}"
+        log.error("%s (item %s)", reason, item_id)
+        db.mark_failed(item_id, "cut", reason, db_path=db_path)
+        _outcome(item_id, "failure", reason, db_path)
+        return False, reason
+
+    selection: dict[str, Any] = {
+        "transcribed": [list(s) for s in spans], "transcribe_s": round(wall, 1), "transcript_cached": cached,
+        "source_s": round(scan.total_duration, 2),
+    }
+    choices: list[tuple[EndChoice, dict[str, Any]]] = []
+    if not words_all:
+        # Nobody speaks: the old audio/scene windows with a loudness-trough end.
+        for rank, win in enumerate(scan.windows[:max_windows], start=1):
+            ch = clean_end_for_window(win, scan, [], min(scan.total_duration, win.start + scan.max_dur), es)
+            if ch:
+                choices.append((ch, {"rank": rank, "score": round(win.score, 4), "mode": "no_speech"}))
+        selection.update(clean_ends=0, candidates=len(choices))
+    else:
+        regions = []
+        for a, b in spans:
+            rw = [w for w in words_all if a - 1e-6 <= float(w["start"]) < b]
+            regions.append(sentence_windows.Region(a, b, rw, envelope(download_path, a, b) if rw else None))
+        scorer = sentence_windows.Scorer(scan.total_duration, scan.loudness, scan.scene_cuts, cfg)
+        cands, n_ends = sentence_windows.candidates(regions, scorer, scan.min_dur, scan.max_dur, es, sw)
+        selection.update(clean_ends=n_ends, candidates=len(cands))
+        for rank, c in enumerate(cands, start=1):
+            cut_words = [
+                {**w, "start": round(max(0.0, float(w["start"]) - c.start), 3),
+                 "end": round(float(w["end"]) - c.start, 3)}
+                # words that finish inside the window (at a measured pause whisper may start the
+                # next word early; it is not in the cut)
+                for w in words_all if float(w["end"]) > c.start and float(w["end"]) <= c.end + 1e-6
+            ]
+            choices.append((EndChoice(c.start, round(c.end, 2), "sentence", cut_words),
+                            {"rank": rank, "score": c.score, "at_sentence_start": c.at_sentence_start,
+                             "end_rule": c.reason, "mode": "sentence"}))
+        if not cands:
+            reason = (f"no_clean_ending: {n_ends} clean sentence end(s) in {sum(b - a for a, b in spans):.0f} s "
+                      f"transcribed, none with a {scan.min_dur:.0f}-{scan.max_dur:.0f} s window "
+                      f"({len(words_all)} words, transcription {wall:.1f} s)")
+            db.mark_failed(item_id, "cut", reason, db_path=db_path)
+            _outcome(item_id, "failure", reason, db_path)
+            _alert_no_clean_ending_rate(item_id, cfg, db_path)
+            return False, reason
 
     cuts_dir = config.media_dir("cuts")
     cut_path = cuts_dir / f"{item_id}_cut.mp4"
-    tail = float(es["tail_s"])
-    max_windows = max(1, int(es["max_windows"]))
-    no_end: list[str] = []
-    duplicates: list[str] = []
-    transcribed: dict[tuple[float, float], list[dict[str, Any]]] = {}
-
-    # A window starting within `retry_spacing_s` of one that had no sentence end shares most of
-    # its 18-22 s end range, so it almost always fails the same way (item_5a67 tried 326, 327,
-    # 328, 329.3 s ...). Such near-copies are skipped and do not use up a try.
-    spacing = float(es.get("retry_spacing_s") or 0.0)
-    failed_starts: list[float] = []
-    pool = iter(scan.windows)
-    rank = 0
+    duplicates: list[tuple[str, float, float]] = []      # (prior item, start, end)
     tried = 0
-    while tried < max_windows:
-        win = next(pool, None)
-        if win is None:
+    for choice, info in choices:
+        if tried >= max_windows:
             break
-        rank += 1
-        if spacing and any(abs(win.start - f) < spacing for f in failed_starts):
+        # A candidate overlapping a duplicate window by half or more shows the same footage.
+        if any(min(choice.end, e) - max(choice.start, s) >= 0.5 * (choice.end - choice.start)
+               for _, s, e in duplicates):
             continue
         tried += 1
-        audio_end = min(scan.total_duration, win.start + scan.max_dur + tail)
-        key = (round(win.start, 2), round(audio_end, 2))
-        try:
-            if key not in transcribed:
-                transcribed[key] = transcriber(download_path, win.start, audio_end)
-            words_abs = transcribed[key]
-        except Exception as e:
-            reason = f"Whisper transcription failed at cut: {type(e).__name__}: {e}"
-            log.error("%s (item %s)", reason, item_id)
-            db.mark_failed(item_id, "cut", reason, db_path=db_path)
-            return False, reason
-
-        env = envelope(download_path, win.start, audio_end) if words_abs else None
-        choice = clean_end_for_window(win, scan, words_abs, audio_end, es, env=env)
-        if choice is None:
-            no_end.append(f"#{rank} {win.start:.1f}s")
-            failed_starts.append(win.start)
-            log.info("Cut window #%d [%.1fs +%.0f-%.0fs] has no sentence end; trying the next",
-                     rank, win.start, scan.min_dur, scan.max_dur)
-            continue
-
         try:
             _extract_cut(download_path, choice.start, choice.end, cut_path)
         except Exception as e:
             db.mark_failed(item_id, "cut", f"ffmpeg cut extraction failed: {e}", db_path=db_path)
+            _outcome(item_id, "failure", f"ffmpeg cut extraction failed: {e}", db_path)
             return False, f"ffmpeg cut extraction failed: {e}"
 
         is_valid, actual_dur = verify_video_file(cut_path)
         if not is_valid:
             cut_path.unlink(missing_ok=True)
             db.mark_failed(item_id, "cut", "Cut file failed ffprobe validation", db_path=db_path)
+            _outcome(item_id, "failure", "Cut file failed ffprobe validation", db_path)
             return False, "Cut validation failed"
 
         # Cut-level deduplication: extract 1fps hashes of the cut
@@ -607,13 +684,15 @@ def run_cut_item(
         )
         if dup_of:
             cut_path.unlink(missing_ok=True)
-            duplicates.append(dup_of)
-            log.info("Cut window #%d duplicates %s; trying the next", rank, dup_of)
+            duplicates.append((dup_of, choice.start, choice.end))
+            log.info("Cut candidate #%d [%.2f-%.2f s] duplicates %s; trying the next",
+                     info["rank"], choice.start, choice.end, dup_of)
             continue
 
         # Replace (never append to) this item's cut fingerprints: a re-cut moves the window.
         db.delete_fingerprints(item_id, "cut", db_path=db_path)
         db.save_fingerprints(item_id, "cut", cut_hashes, db_path=db_path)
+        selection.update(info, start=choice.start, end=choice.end)
         db.transition_stage(
             item_id,
             "cut",
@@ -623,29 +702,44 @@ def run_cut_item(
                 "cut_duration": actual_dur,
                 "cut_path": str(cut_path),
                 # Always rewritten, so a stale transcript of an older window is gone too.
-                "transcript_words": transcript_payload(choice, tkey),
+                "transcript_words": transcript_payload(choice, tkey, selection),
             },
             db_path=db_path,
         )
-        msg = (f"Cut window #{rank} [{choice.start:.2f}s - {choice.end:.2f}s] extracted "
-               f"({actual_dur:.1f}s, end: {choice.kind}, {len(choice.words)} words)")
-        db.log_stage(item_id, "cut", "success", message=msg, db_path=db_path)
+        msg = (f"Cut candidate #{info['rank']} of {selection['candidates']} "
+               f"[{choice.start:.2f}s - {choice.end:.2f}s] extracted ({actual_dur:.1f}s, end: {choice.kind}"
+               f"{', starts at a sentence' if info.get('at_sentence_start') else ''}; "
+               f"{selection['clean_ends']} clean sentence ends; transcription {wall:.1f}s"
+               f"{' cached' if cached else ''})")
+        _outcome(item_id, "success", msg, db_path)
         return True, msg
 
-    if duplicates and not no_end:
-        prior = duplicates[0]
+    prior = duplicates[0][0] if duplicates else "?"
+    if duplicates:
         db.mark_rejected(
             item_id,
             f"duplicate_cut: {consecutive_n} matching consecutive frames with {prior}",
             is_duplicate=True,
             db_path=db_path,
         )
+        _outcome(item_id, "rejected", f"duplicate_cut of {prior} ({len(duplicates)} candidate(s))", db_path)
         return False, f"Rejected: duplicate_cut of {prior}"
-    reason = (f"no_clean_ending: speech runs through the end range of all {tried} window(s) tried"
-              f" ({', '.join(no_end)})" + (f"; {len(duplicates)} more duplicated a prior cut" if duplicates else ""))
+    reason = f"no_clean_ending: no usable window ({selection.get('candidates', 0)} candidates)"
     db.mark_failed(item_id, "cut", reason, db_path=db_path)
-    db.log_stage(item_id, "cut", "failure", message=reason, db_path=db_path)
+    _outcome(item_id, "failure", reason, db_path)
+    _alert_no_clean_ending_rate(item_id, cfg, db_path)
     return False, reason
+
+
+def _alert_no_clean_ending_rate(item_id: str, cfg: dict[str, Any], db_path: Any) -> None:
+    """A failure alert, but only once the 24 h no_clean_ending rate is past its threshold
+    (telegram_bot.send_alert adds the rate line itself)."""
+    from . import telegram_bot   # lazy: keep the cut stage importable without the bot
+
+    if telegram_bot.no_clean_ending_line(cfg, db_path):
+        telegram_bot.send_alert(f"Cut stage: {item_id} failed with no_clean_ending.",
+                                key="cut_no_clean_ending_rate", cfg=cfg, db_path=db_path,
+                                repeat_gap_s=12 * 3600)
 
 
 def run_cut_pipeline(cfg: dict[str, Any] | None = None, db_path: Any = None) -> list[str]:

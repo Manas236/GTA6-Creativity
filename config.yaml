@@ -92,8 +92,7 @@ cut:
     next_word_margin_s: 0.07 # ...or to the next one
     end_after_word_s: 0.35 # in a long gap, keep this much room on both sides of the end
     tail_s: 2.0 # transcribe this far past the window's max end, to see the gap after it
-    max_windows: 8 # scored windows to try before failing with no_clean_ending
-    retry_spacing_s: 2.0 # skip windows starting this close to one that had no sentence end (near-copies)
+    max_windows: 8 # candidate windows to cut and dedupe-check before giving up
     # whisper's word timestamps are not precise enough for short gaps (0.00 s reported over a
     # real pause; a 0.15 s gap reported where the speaker ran on). After . ? ! the AUDIO decides:
     # the end goes in the middle of the earliest measured pause after the word.
@@ -102,6 +101,21 @@ cut:
     audio_gap_search_s: 0.4 # ...within this far after whisper's word end
     pause_drop_db: 8.0 # with audio, the >= pause_gap_s case is a measured stretch this far under the speech
     no_speech_gap_s: null # disabled: whisper silently dropping words once made a "nobody speaks" gap over live speech
+  # Sentence-aligned windows (pipeline/sentence_windows.py): the source is transcribed once and
+  # every clean sentence end gives a candidate window, scored with the audio/scene formula.
+  sentence_windows:
+    full_transcribe_max_s: 660 # transcribe the whole source up to this long (discovery caps at 600 s)
+    region_count: 6 # longer sources: only the top-scoring regions...
+    region_margin_s: 10 # ...widened by this much
+    start_bonus: 0.05 # soft bonus when the window starts right before a sentence (scores are 0..1)
+    start_step_s: 0.5 # start grid inside [end - max_duration, end - min_duration]
+    start_lead_s: 0.15 # a sentence-start window begins this long before the sentence's first word
+    length_margin_s: 0.1 # windows stop this short of max_duration (an encoded 22.00 s cut came out 22.005 s)
+  # One line is added to every failure alert once this share of cut attempts in the last 24 h
+  # failed with no_clean_ending (and a cut that fails that way then alerts on its own).
+  no_clean_ending_alert:
+    rate: 0.40
+    min_attempts: 5
 
 # Every faster-whisper transcription (cut stage, hooks, render captions, VO, scripts) uses this
 # model and passes this glossary, so GTA names come out right on the burned-in captions.
@@ -111,8 +125,7 @@ transcribe:
   model: "small.en" # chosen by scripts/benchmark_captions.py on the laptop: PLAN.md calls #155-#159
   glossary_as: "hotwords" # hotwords | initial_prompt | both | none. NOT initial_prompt: with small.en it dropped 42 of 79 words on a real clip
   glossary:
-    - "GTA 6"
-    - "GTA VI"
+    - "GTA 6" # "GTA VI" removed: as a hotword it turned a spoken "GTA 6" into "GTA VI"
     - "Grand Theft Auto"
     - "Rockstar"
     - "Rockstar Games"

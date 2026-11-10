@@ -626,6 +626,22 @@ class ApprovalBot:
             return False
 
 
+def no_clean_ending_line(cfg: dict[str, Any] | None = None, db_path: Any = None) -> str | None:
+    """One line for failure alerts once the last-24 h no_clean_ending rate passes
+    cut.no_clean_ending_alert.rate (default 40 %, and only after min_attempts cut attempts)."""
+    try:
+        conf = ((cfg or config.get_config()).get("cut") or {}).get("no_clean_ending_alert") or {}
+        threshold = float(conf.get("rate", 0.40))
+        min_attempts = int(conf.get("min_attempts", 5))
+        st = db.cut_outcome_stats(db_path, hours=24)
+        if st["attempts"] < min_attempts or st["rate"] < threshold:
+            return None
+        return (f"Cut: {st['no_clean_ending']} of {st['attempts']} cut attempts in the last 24 h failed with "
+                f"no_clean_ending ({st['rate']:.0%}; alert threshold {threshold:.0%}).")
+    except Exception:  # noqa: BLE001 - a statistic must never stop an alert
+        return None
+
+
 def send_alert(
     text: str,
     key: str | None = None,
@@ -637,6 +653,9 @@ def send_alert(
     """Failure alert from any stage. Never raises: with Telegram off or no credentials it logs."""
     try:
         cfg = cfg or config.get_config()
+        rate_line = no_clean_ending_line(cfg, db_path)
+        if rate_line and rate_line not in text:
+            text = f"{text}\n{rate_line}"
         if bot is None:
             if not (cfg.get("telegram") or {}).get("enabled", True) or not (
                 config.secret("TELEGRAM_BOT_TOKEN") and config.secret("TELEGRAM_CHAT_ID")

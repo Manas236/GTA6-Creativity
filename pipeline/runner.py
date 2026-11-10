@@ -148,6 +148,11 @@ def print_status(db_path: Any = None) -> None:
         for r in counts:
             print(f"  {r['stage']:<20}: {r['cnt']}")
 
+    print("\n=== Cut: no_clean_ending ===")
+    for label, hours in (("last 24 h", 24), ("all time", None)):
+        st = db.cut_outcome_stats(db_path, hours=hours)
+        print(f"  {label:<10}: {st['no_clean_ending']} of {st['attempts']} cut attempts ({st['rate']:.0%})")
+
     print("\n=== Top Discovered Items (by score) ===")
     print(f"  {'Stage':<10} | {'Score':>7} | {'Views':>9} | {'Velocity':>8} | {'P-Rank':>6} | {'Author':<18} | Title")
     print("  " + "-" * 95)

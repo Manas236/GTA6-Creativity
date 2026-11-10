@@ -64,6 +64,8 @@ class ItemResult:
     no_clean_ending: bool = False      # the cut stage found no speech-safe end: swap the item
     transcript: list[str] = field(default_factory=list)   # last cut-stage words, when not rendered
     transcript_note: str = ""
+    selection: dict[str, Any] = field(default_factory=dict)   # how the cut stage chose the window
+    ending_words: str = ""
     replaces: str = ""                 # the item this one was swapped in for
 
 
@@ -246,6 +248,12 @@ def render_item(
             pass
         return result
 
+    try:
+        payload = json.loads(item.get("transcript_words") or "{}")
+        result.selection = dict(payload.get("selection") or {})
+        result.ending_words = " ".join(str(w.get("word", "")) for w in (payload.get("words") or [])[-8:])
+    except Exception:  # noqa: BLE001
+        pass
     hook = item.get("hook_text") or "IS THIS REALLY GTA 6?"
     channel = item.get("author_name") or "Creator"
     result.hook, result.channel = hook, channel
@@ -413,6 +421,17 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
         lines.append(f"{r.item_id}" + (f"  (swapped in for {r.replaces}: no_clean_ending)" if r.replaces else ""))
         lines.append(f"  channel  : {r.channel}")
         lines.append(f"  hook     : {r.hook}")
+        sel = r.selection
+        if sel.get("start") is not None:
+            lines.append(
+                f"  cut      : {sel['start']:.2f}-{sel['end']:.2f} s ({sel['end'] - sel['start']:.2f} s) of a "
+                f"{sel.get('source_s', 0):.0f} s source; {sel.get('clean_ends', 0)} clean sentence ends, "
+                f"{sel.get('candidates', 0)} candidate windows, chose #{sel.get('rank')} "
+                f"(score {sel.get('score', 0):.3f}, {'starts at a sentence' if sel.get('at_sentence_start') else 'mid-speech start'}, "
+                f"end rule {sel.get('end_rule', sel.get('mode'))})")
+            lines.append(f"  transcribe: {sel.get('transcribe_s', 0):.1f} s for {sel.get('transcribed')}"
+                         f"{' (cached)' if sel.get('transcript_cached') else ''}")
+            lines.append(f"  ends with: ...{r.ending_words}")
         lines.append(f"  keywords : {', '.join(r.keywords) or '-'}  (source: {r.keyword_source or '-'})")
         if not r.ok:
             lines.append(f"  STATUS   : FAILED - {r.message}")

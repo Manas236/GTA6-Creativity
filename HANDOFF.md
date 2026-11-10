@@ -44,10 +44,12 @@ Everything below is still yours to do, in this order. Nothing posts publicly unt
 
 > **Superseded by the captions pass (later on 2026-11-10):** captions now use small.en + the GTA glossary,
 > and the ending rule got stricter (a full stop needs a ≥ 0.2 s pause; every end in measured quiet).
-> Current state: item_00983 and item_1032 render and pass 16/16; **item_5a67 (Hazard) now fails
-> `no_clean_ending`** - its old end "…your wanted level" + 0.15 s was most likely mid-sentence - and its
-> previews were removed. `media/previews/README.txt` lists every burned-in caption word. To get a third
-> preview item: `python -m pipeline.runner discover`, `download`, `hooks`, then `render_previews.py`.
+> **Then sentence-aligned windows (PLAN calls #162-#168):** the cut stage now transcribes each source once
+> and builds windows from its clean sentence ends. All three items render again, **Hazard included**
+> (2 clean sentence ends in its 599 s source; it had failed 8 fixed windows), and pass 24/24.
+> `media/previews/README.txt` lists every burned-in caption word and, per item, the chosen window, the
+> number of clean sentence ends / candidate windows and the transcription time.
+> `python -m pipeline.runner status` shows the no_clean_ending rate (24 h and all time).
 
 ### Task 3: real-clip check of every preview (`python scripts/verify_previews.py`): 24/24 pass (first fix pass)
 Items: item_00983f85d1fd (GamingBolt), item_1032dd2c31da (Tridzo GTA), item_5a67cc8642ed (Hazard),

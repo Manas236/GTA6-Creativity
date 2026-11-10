@@ -4,7 +4,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Iterator
 
@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS items (
     keywords TEXT,                             -- C1: JSON array of 3-6 caption keywords
     style_preset TEXT,                          -- style preset the renders were made with
     transcript_words TEXT,                      -- JSON {cut_start, cut_end, model, words}: cut transcript cached by the hooks stage
+    source_transcript TEXT,                     -- JSON {key, words, regions, wall_s}: the whole-source transcript (cut stage)
     preview_only INTEGER DEFAULT 0,             -- 1 = style-preview data only: triggers block approval/posting
     voiceover_script TEXT,
     voiceover_audio_path TEXT,
@@ -264,6 +265,8 @@ def init_db(db_path: Path | str | None = None) -> None:
         # Cut-window transcript cached by the hooks stage and reused by render
         if "transcript_words" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN transcript_words TEXT")
+        if "source_transcript" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN source_transcript TEXT")
         if "preview_only" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN preview_only INTEGER DEFAULT 0")
         # Created after the migration: the trigger bodies reference items.preview_only.
@@ -525,6 +528,23 @@ def save_fingerprints(
             """,
             records,
         )
+
+
+def cut_outcome_stats(db_path: Path | str | None = None, hours: float | None = None) -> dict[str, Any]:
+    """Cut attempts (one stage_log row each: success / failure / rejected) and how many failed
+    with no_clean_ending, over the last `hours` (None = all time)."""
+    where = "stage = 'cut' AND status IN ('success', 'failure', 'rejected')"
+    params: list[Any] = []
+    if hours is not None:
+        where += " AND created_at >= ?"
+        params.append(clock.iso(clock.utcnow() - timedelta(hours=float(hours))))
+    with db(db_path) as conn:
+        attempts = conn.execute(f"SELECT COUNT(*) FROM stage_log WHERE {where}", params).fetchone()[0]
+        failed = conn.execute(
+            f"SELECT COUNT(*) FROM stage_log WHERE {where} AND status = 'failure' "
+            "AND message LIKE 'no_clean_ending%'", params).fetchone()[0]
+    return {"attempts": int(attempts), "no_clean_ending": int(failed),
+            "rate": (failed / attempts) if attempts else 0.0}
 
 
 def delete_fingerprints(item_id: str, scope: str, db_path: Path | str | None = None) -> int:

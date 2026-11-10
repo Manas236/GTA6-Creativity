@@ -51,7 +51,6 @@ DEFAULTS: dict[str, Any] = {
     "end_after_word_s": 0.35,     # in a long gap, keep at least this much room on both sides
     "tail_s": 2.0,                # cut stage: transcribe this far past the window's max end
     "max_windows": 8,             # cut stage: scored windows to try before no_clean_ending
-    "retry_spacing_s": 2.0,       # ...skipping windows this close to one that had no sentence end
     "audio_gap_drop_db": 12.0,    # a measured pause is this far under the speech level...
     "audio_gap_min_s": 0.2,       # ...for at least this long (shorter pauses are comma-length)
     "audio_gap_search_s": 0.4,    # looked for up to this far after whisper's word end
@@ -236,9 +235,9 @@ def audio_sentence_gaps(
         if best is None:
             continue
         s, e = env.time(best[1]), env.time(best[2])
-        mid = (s + e) / 2.0
-        half = max(0.0, min((e - s) / 2.0 - 0.01, 0.05))
-        out.append(SafeSpan(mid - half, mid + half, w_end, e, "punct_audio"))
+        # The whole measured pause is a safe end (A4 may pick any frame in it); point_for()
+        # still places a chosen end in its middle.
+        out.append(SafeSpan(s + 0.01, max(s + 0.01, e - 0.01), w_end, e, "punct_audio"))
     return out
 
 
@@ -463,6 +462,8 @@ def content_end(
     es = es or DEFAULTS
     duration = float(duration)
     hi = min(float(max_dur), duration)
+    if trusted_end is not None and hi < trusted_end <= float(max_dur) + 0.15:
+        hi = float(trusted_end)          # an encoded cut can run a few ms past max_duration
     lo = min(float(min_dur), hi)
     spans = safe_spans(words, lo, hi, duration, es, trusted_end=trusted_end, env=env)
     end = choose_end(spans, duration, es)

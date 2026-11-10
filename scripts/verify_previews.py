@@ -8,7 +8,7 @@ For every media/previews/<item>/P{n}_{A,B}.mp4 it
   1. transcribes the LAST 3 s of the render with faster-whisper and checks that the final
      word ends a sentence (. ? !) or that nobody speaks there;
   2. checks the same end against the SOURCE: the source audio from up to 20 s before the end
-     (from the cut start) to 2 s after it is transcribed and measured, and the end must sit in a sentence break by
+     (from the cut start) to 6 s after it is transcribed and measured, and the end must sit in a sentence break by
      the pipeline's own rule (pipeline/endings.py, audio-confirmed); the audio level at the
      cut point relative to the speaker is printed - this is the ground truth for "was the
      speaker cut off", since whisper can mishear or punctuate a truncated 3 s snippet;
@@ -95,7 +95,9 @@ def source_check(plan: dict[str, Any], es: dict[str, Any], cfg: dict[str, Any],
     # 20 s of context before the end: whisper's punctuation (and spelling) on a 5 s snippet is
     # unreliable - it wrote "level," + "they're" where 24 s of context gives "level." - and the
     # check must not be weaker than the decision it checks.
-    a, b = max(float(plan.get("cut_start") or 0.0), end_abs - 20.0), end_abs + 2.0
+    # ...and 6 s after it: with only 2 s, whisper's alignment at the window edge pulled the next
+    # word ("And", really +0.40 s) back into the silence before the cut.
+    a, b = max(float(plan.get("cut_start") or 0.0), end_abs - 20.0), end_abs + 6.0
     words = cutmod.transcribe_source_span(src, a, b, cfg=cfg)
     env = cutmod.audio_envelope(src, a - 5.0, b)          # 10 s of context for the speech level
     speech = env.speech_level() if env else None
@@ -103,7 +105,23 @@ def source_check(plan: dict[str, Any], es: dict[str, Any], cfg: dict[str, Any],
            if env and speech is not None and 0 <= env.index(end_abs) < len(env.db) else None)
     level = f" | end {rel:+.0f} dB" if rel is not None else ""
     loud = rel is not None and rel > -float(es["pause_drop_db"])     # sound at the cut point
-    if not [w for w in words if float(w["start"]) < end_abs + 2.0]:
+    phantoms: list[str] = []
+    if env and speech is not None:
+        # whisper sometimes places a short word inside measured silence (Hazard: "I" put before
+        # the cut although the audio is -16..-30 dB there and the whole-source transcript has
+        # "And I" 0.2 s after it). A word that is entirely quiet was not spoken there.
+        quiet = speech - float(es["audio_gap_drop_db"])
+        kept = []
+        for w in words:
+            a_i, b_i = env.index(float(w["start"])), env.index(float(w["end"]))
+            vals = [env.at(k) for k in range(max(0, a_i), min(len(env.db), b_i + 1))]
+            if vals and max(vals) <= quiet:
+                phantoms.append(str(w["word"]))
+            else:
+                kept.append(w)
+        words = kept
+    note_ph = f" (ignored '{' '.join(phantoms)}' placed in silence)" if phantoms else ""
+    if not [w for w in words if float(w["start"]) < end_abs + 6.0]:
         res = (True, "no speech around the end" + level)
     else:
         spans = endings.safe_spans(words, a, b, b, es, env=env)
@@ -122,7 +140,7 @@ def source_check(plan: dict[str, Any], es: dict[str, Any], cfg: dict[str, Any],
         else:
             # whisper sometimes starts the next word inside a measured pause; the audio is the truth
             note = f" (whisper starts '{inside[0]['word']}' early)" if inside else ""
-            res = (True, f"{span.reason}: '{last}' | next {nxt}{level}{note}")
+            res = (True, f"{span.reason}: '{last}' | next {nxt}{level}{note}{note_ph}")
     cache[key] = res
     return res
 
@@ -169,7 +187,7 @@ def table(rows: Sequence[Row], ss: dict[str, Any]) -> list[str]:
         "and the end re-checked against the source audio after it (pipeline/endings.py rule).",
         f"SFX: cue start times on that variant's output timeline; every gap must be >= {gap} s, at most {cap} cues.",
         "",
-        f"{'item':<18} {'file':<9} {'dur':>6}  {'last words (render tail)':<34} {'source check':<58} "
+        f"{'item':<18} {'file':<9} {'dur':>6}  {'last words (render tail)':<34} {'source check':<70} "
         f"{'SFX cues (s)':<16} {'gaps (s)':<9} result",
     ]
     for r in rows:
@@ -178,7 +196,7 @@ def table(rows: Sequence[Row], ss: dict[str, Any]) -> list[str]:
         verdict = "OK" if r.ok else ("ERROR " + r.error if r.error else
                                      "FAIL" + ("" if r.ending_ok else " ending") + ("" if r.sfx_ok else " sfx"))
         lines.append(f"{r.item:<18} {r.file:<9} {r.duration:6.2f}  {r.last_words[-34:]:<34} "
-                     f"{r.source_note[:58]:<58} {sfx:<16} {gaps:<9} {verdict}")
+                     f"{r.source_note[:70]:<70} {sfx:<16} {gaps:<9} {verdict}")
     passed = sum(1 for r in rows if r.ok)
     lines += ["", f"{passed}/{len(rows)} renders pass."]
     return lines
