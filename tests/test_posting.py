@@ -1,0 +1,832 @@
+"""Unit tests for CP3 Meta posting: the two-phase state machine, crash recovery, retries and the
+dry run. Zero network: the transport is a fake and no real request is ever built."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+import requests
+
+from pipeline import db, posting, rate_limit
+from pipeline.errors import RateLimitError
+
+IG_USER = "17841400000000000"
+FB_PAGE = "100000000000000"
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+class FakeResponse:
+    def __init__(self, payload: Any = None, status_code: int = 200, text: str = ""):
+        self._payload = {} if payload is None else payload
+        self.status_code = status_code
+        self.text = text or json.dumps(self._payload)
+
+    def json(self) -> Any:
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+
+class FakeTransport:
+    """Answers each (method, url-fragment) from a routing table and records every request."""
+
+    def __init__(self, routes: dict[str, Any] | None = None):
+        self.routes: dict[str, Any] = routes or {}
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.crash_on: str | None = None   # the first request whose url contains this raises CrashError
+
+    def __call__(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append((method, url, kwargs))
+        if self.crash_on and self.crash_on in url:
+            raise CrashError(f"process died during {url}")
+        for fragment, answer in self.routes.items():
+            if fragment in url:
+                if isinstance(answer, list):
+                    return answer.pop(0) if len(answer) > 1 else answer[0]
+                if callable(answer):
+                    return answer(method, url, kwargs)
+                return answer
+        return FakeResponse({"error": {"message": f"no fake route for {url}", "code": 100}}, 400)
+
+    def urls(self) -> list[str]:
+        return [u for _, u, _ in self.calls]
+
+    def sent(self, fragment: str) -> list[tuple[str, str, dict[str, Any]]]:
+        return [c for c in self.calls if fragment in c[1]]
+
+
+class CrashError(RuntimeError):
+    """Stands in for the process being killed: it is not one of the errors posting catches."""
+
+
+@pytest.fixture
+def cfg() -> dict[str, Any]:
+    return {
+        "app": {"dry_run": False},
+        "posting": {
+            "platforms": {"instagram": True, "facebook": True},
+            "meta_min_gap_seconds": 0,
+            "graph_base": "https://graph.test",
+            "rupload_base": "https://rupload.test",
+            "api_version": "v25.0",
+            "dry_run_mode": "plan_only",
+            "max_retries": 2,
+            "retry_backoff_s": 1.0,
+            "retry_backoff_cap_s": 8.0,
+            "max_post_attempts": 3,
+            "rate_limit_pause_hours": 3.0,
+            "container_poll_seconds": 0.0,
+            "container_poll_max_minutes": 1.0,
+            "recent_media_limit": 25,
+        },
+    }
+
+
+@pytest.fixture
+def secrets(monkeypatch) -> None:
+    values = {
+        "IG_USER_ID": IG_USER,
+        "IG_ACCESS_TOKEN": "ig-token-secret",
+        "FB_PAGE_ID": FB_PAGE,
+        "FB_PAGE_ACCESS_TOKEN": "fb-page-token-secret",
+        "TELEGRAM_BOT_TOKEN": "",
+        "TELEGRAM_CHAT_ID": "",
+    }
+    monkeypatch.setattr(posting.config, "secret", lambda key, default="": values.get(key, default))
+
+
+class Clock:
+    def __init__(self, now: float = 1_000_000.0):
+        self.now = now
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(round(seconds, 3))
+        self.now += seconds
+
+
+def make_publisher(tmp_db, cfg, transport, alerts=None, clock=None):
+    clock = clock or Clock()
+    client = posting.MetaClient(
+        transport=transport, cfg=cfg, db_path=tmp_db, clock=clock, sleep=clock.sleep
+    )
+    return posting.Publisher(
+        client=client,
+        cfg=cfg,
+        db_path=tmp_db,
+        alert=(lambda text, key=None: alerts.append((text, key))) if alerts is not None else (lambda t, k=None: None),
+        clock=clock,
+        sleep=clock.sleep,
+    ), clock
+
+
+def make_item(tmp_db: Path, tmp_path: Path, item_id: str = "item-1", variant: str | None = None) -> dict[str, Any]:
+    db.insert_discovered_item(
+        {
+            "id": item_id,
+            "source": "youtube",
+            "source_id": item_id,
+            "source_url": f"https://youtu.be/{item_id}",
+            "author_name": "GamingBolt",
+            "discovery_score": 0.6,
+            "raw_velocity": 5.0,
+            "percentile_rank": 0.8,
+        },
+        db_path=tmp_db,
+    )
+    a = tmp_path / f"{item_id}_A.mp4"
+    b = tmp_path / f"{item_id}_B.mp4"
+    a.write_bytes(b"A" * 1024)
+    b.write_bytes(b"B" * 4096)
+    db.transition_stage(
+        item_id,
+        "approved",
+        extra_fields={
+            "hook_text": "WHAT IS HIDDEN HERE?",
+            "hook_style": "question",
+            "authenticity": "unverified",
+            "render_a_path": str(a),
+            "render_b_path": str(b),
+            "chosen_variant": variant,
+            "approval_type": "approved",
+        },
+        db_path=tmp_db,
+    )
+    return db.get_item(item_id, db_path=tmp_db)
+
+
+def happy_routes() -> dict[str, Any]:
+    """Every call of both flows answering successfully."""
+    return {
+        f"/{IG_USER}/media_publish": FakeResponse({"id": "media-999"}),
+        f"/{IG_USER}/media": FakeResponse({"id": "container-abc"}),
+        "/ig-api-upload/": FakeResponse({"success": True}),
+        "/container-abc": FakeResponse({"status_code": "FINISHED"}),
+        "/media-999": FakeResponse({"permalink": "https://instagram.com/reel/xyz",
+                                    "timestamp": "2026-11-09T10:00:00+0000"}),
+        f"/{FB_PAGE}/video_reels": [FakeResponse({"video_id": "fbvid-777"}), FakeResponse({"success": True})],
+        "/video-upload/": FakeResponse({"success": True}),
+        "/fbvid-777": FakeResponse({"status": {"video_status": "ready"}, "permalink_url": "/reel/777"}),
+    }
+
+
+def ig_only(cfg: dict[str, Any]) -> dict[str, Any]:
+    cfg["posting"]["platforms"] = {"instagram": True, "facebook": False}
+    return cfg
+
+
+def post_row(tmp_db, item_id: str, platform: str) -> dict[str, Any]:
+    return next(p for p in posting.get_posts_for_item(item_id, db_path=tmp_db) if p["platform"] == platform)
+
+
+# ---------------------------------------------------------------------------
+# Caption template
+# ---------------------------------------------------------------------------
+
+def test_caption_template_carries_the_hook_the_creator_credit_and_the_tags():
+    caption = posting.build_caption("WHAT IS HIDDEN HERE?", "GamingBolt", "youtube")
+    assert caption == (
+        "WHAT IS HIDDEN HERE?\n\n"
+        "Credit: GamingBolt\n.\n"
+        "#gta6 #grandtheftauto #gta #gaming #rockstargames"
+    )
+
+
+def test_caption_template_adds_the_subreddit_line_for_reddit_items():
+    caption = posting.build_caption("WHAT IS HIDDEN HERE?", "u/someone", "reddit", subreddit="GTA6")
+    assert "Credit: u/someone\nFound via r/GTA6\n.\n" in caption
+
+
+def test_caption_falls_back_to_the_template_when_the_item_has_none():
+    built = posting.caption_for_item({"hook_text": "HOOK", "author_name": "Creator", "source": "youtube"})
+    assert built.startswith("HOOK\n\nCredit: Creator")
+    stored = posting.caption_for_item({"caption_text": "already written", "hook_text": "HOOK"})
+    assert stored == "already written"
+
+
+def test_a_caption_is_capped_at_the_instagram_limit():
+    caption = posting.build_caption("X" * 5000, "Creator")
+    assert len(caption) == posting.IG_CAPTION_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# The two-phase state machine
+# ---------------------------------------------------------------------------
+
+def test_instagram_walks_uploading_container_ready_publishing_live_in_order(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+
+    seen: list[str] = []
+    real = posting.set_status
+
+    def spy(post_id, status, db_path=None, **fields):
+        seen.append(status)
+        real(post_id, status, db_path=db_path, **fields)
+
+    posting.set_status = spy
+    try:
+        assert publisher.publish(row["id"], item) == posting.STATUS_LIVE
+    finally:
+        posting.set_status = real
+
+    assert seen == ["uploading", "container_ready", "publishing", "live"]
+    final = post_row(tmp_db, item["id"], "instagram")
+    assert final["remote_container_id"] == "container-abc"
+    assert final["remote_id"] == "media-999"
+    assert final["remote_url"] == "https://instagram.com/reel/xyz"
+    assert final["posted_at"] == "2026-11-09T10:00:00Z"
+
+
+def test_the_container_id_is_saved_before_the_bytes_are_ever_uploaded(tmp_db, tmp_path, cfg, secrets):
+    """Phase 1 must be durable first: a crash during the upload still leaves the id behind."""
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    transport.crash_on = "/ig-api-upload/"
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+
+    with pytest.raises(CrashError):
+        publisher.publish(row["id"], item)
+
+    crashed = post_row(tmp_db, item["id"], "instagram")
+    assert crashed["status"] == posting.STATUS_CONTAINER_READY
+    assert crashed["remote_container_id"] == "container-abc"
+
+
+def test_publishing_is_written_before_the_publish_call_is_issued(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    transport.crash_on = "media_publish"
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+
+    with pytest.raises(CrashError):
+        publisher.publish(row["id"], item)
+
+    crashed = post_row(tmp_db, item["id"], "instagram")
+    assert crashed["status"] == posting.STATUS_PUBLISHING
+    assert crashed["publish_started_at"]
+
+
+def test_facebook_walks_the_video_reels_start_upload_finish_flow(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    cfg["posting"]["platforms"] = {"instagram": False, "facebook": True}
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "facebook")
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_LIVE
+
+    start, finish = [c for c in transport.sent("/video_reels")]
+    assert start[2]["data"]["upload_phase"] == "start"
+    assert finish[2]["data"]["upload_phase"] == "finish"
+    assert finish[2]["data"]["video_state"] == "PUBLISHED"
+    assert "Credit: GamingBolt" in finish[2]["data"]["description"]
+    upload = transport.sent("/video-upload/")[0]
+    assert upload[2]["headers"]["file_size"] == "4096"      # variant B's bytes
+    assert upload[2]["headers"]["Authorization"] == "OAuth fb-page-token-secret"
+    final = post_row(tmp_db, item["id"], "facebook")
+    assert final["remote_id"] == "fbvid-777"
+    assert final["remote_url"] == "https://www.facebook.com/reel/777"
+
+
+def test_variant_a_only_items_upload_the_a_render(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path, variant="A")
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+
+    publisher.publish(post_row(tmp_db, item["id"], "instagram")["id"], item)
+
+    assert transport.sent("/ig-api-upload/")[0][2]["headers"]["file_size"] == "1024"   # variant A's bytes
+
+
+def test_the_item_becomes_posted_only_when_both_platform_rows_are_live(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+
+    results = posting.run_posting_for_item(item["id"], cfg=cfg, db_path=tmp_db, publisher=publisher)
+
+    assert results == {"instagram": "live", "facebook": "live"}
+    assert db.get_item(item["id"], db_path=tmp_db)["stage"] == "posted"
+
+
+def test_an_item_is_not_posted_while_one_platform_failed(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes[f"/{FB_PAGE}/video_reels"] = FakeResponse({"error": {"message": "Page is restricted", "code": 200}}, 403)
+    publisher, _ = make_publisher(tmp_db, cfg, FakeTransport(routes))
+
+    results = posting.run_posting_for_item(item["id"], cfg=cfg, db_path=tmp_db, publisher=publisher)
+
+    assert results["instagram"] == "live"
+    assert results["facebook"] == "failed"
+    assert db.get_item(item["id"], db_path=tmp_db)["stage"] == "approved"   # not 'posted'
+
+
+# ---------------------------------------------------------------------------
+# Crash at every status, and resume without a duplicate publish
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "crash_at, expect_status, expect_container",
+    [
+        (f"/{IG_USER}/media", posting.STATUS_UPLOADING, None),       # died creating the container
+        ("/ig-api-upload/", posting.STATUS_CONTAINER_READY, "container-abc"),  # died uploading the bytes
+        ("/container-abc", posting.STATUS_CONTAINER_READY, "container-abc"),   # died polling the container
+        ("media_publish", posting.STATUS_PUBLISHING, "container-abc"),         # died publishing
+    ],
+)
+def test_a_crash_at_each_status_leaves_a_resumable_row(tmp_db, tmp_path, cfg, secrets, crash_at, expect_status, expect_container):
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    transport.crash_on = crash_at
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+
+    with pytest.raises(CrashError):
+        publisher.publish(row["id"], item)
+
+    crashed = post_row(tmp_db, item["id"], "instagram")
+    assert crashed["status"] == expect_status
+    assert crashed["remote_container_id"] == expect_container
+
+
+def test_a_crash_before_publishing_resumes_and_publishes_exactly_once(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    transport.crash_on = "/ig-api-upload/"
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row_id = post_row(tmp_db, item["id"], "instagram")["id"]
+    with pytest.raises(CrashError):
+        publisher.publish(row_id, item)
+
+    transport.crash_on = None                                 # the process comes back
+    assert publisher.publish(row_id, item) == posting.STATUS_LIVE
+
+    assert len(transport.sent("media_publish")) == 1           # published once, and only once
+    assert len(transport.sent(f"/{IG_USER}/media,")) == 0
+    # the container was created once; the second run reused the saved id
+    creates = [c for c in transport.sent(f"/{IG_USER}/media") if "media_publish" not in c[1]]
+    assert len(creates) == 1
+
+
+def test_resuming_in_publishing_marks_live_when_the_remote_shows_it_published(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes["/container-abc"] = FakeResponse({"status_code": "PUBLISHED"})
+    routes[f"/{IG_USER}/media"] = FakeResponse({
+        "data": [{"id": "media-555", "caption": "WHAT IS HIDDEN HERE?\n\nCredit: GamingBolt\n.\n#gta6",
+                  "permalink": "https://instagram.com/reel/555", "timestamp": "2026-11-09T12:00:00+0000"}]
+    })
+    transport = FakeTransport(routes)
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+    posting.set_status(row["id"], posting.STATUS_PUBLISHING, db_path=tmp_db,
+                       remote_container_id="container-abc", publish_started_at="2026-11-09T11:00:00Z")
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_LIVE
+
+    assert transport.sent("media_publish") == []               # NOT published again
+    final = post_row(tmp_db, item["id"], "instagram")
+    assert final["remote_id"] == "media-555"
+    assert final["remote_url"] == "https://instagram.com/reel/555"
+    assert final["posted_at"] == "2026-11-09T12:00:00Z"
+
+
+def test_resuming_in_publishing_with_a_dead_container_restarts_and_publishes_once(tmp_db, tmp_path, cfg, secrets):
+    """ERROR / EXPIRED is positive proof nothing published, so a fresh container is safe."""
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes["/container-abc"] = FakeResponse({"status_code": "EXPIRED", "status": "container expired"})
+    routes[f"/{IG_USER}/media"] = [FakeResponse({"id": "container-new"})]
+    routes["/container-new"] = FakeResponse({"status_code": "FINISHED"})
+    transport = FakeTransport(routes)
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+    posting.set_status(row["id"], posting.STATUS_PUBLISHING, db_path=tmp_db,
+                       remote_container_id="container-abc", publish_started_at=db.now())
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_LIVE
+
+    final = post_row(tmp_db, item["id"], "instagram")
+    assert final["remote_container_id"] == "container-new"
+    assert len(transport.sent("media_publish")) == 1
+
+
+def test_an_unknown_remote_state_is_marked_failed_and_alerted_and_never_published(tmp_db, tmp_path, cfg, secrets):
+    """A FINISHED container with no matching media cannot prove a publish did not land."""
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes["/container-abc"] = FakeResponse({"status_code": "FINISHED"})
+    routes[f"/{IG_USER}/media"] = FakeResponse({"data": []})     # nothing on the account
+    transport = FakeTransport(routes)
+    alerts: list[tuple[str, str | None]] = []
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport, alerts)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+    posting.set_status(row["id"], posting.STATUS_PUBLISHING, db_path=tmp_db,
+                       remote_container_id="container-abc", publish_started_at=db.now())
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_FAILED
+
+    assert transport.sent("media_publish") == []               # never re-published
+    final = post_row(tmp_db, item["id"], "instagram")
+    assert "unknown" in final["error_message"]
+    assert len(alerts) == 1 and "failed" in alerts[0][0]
+
+
+def test_an_unreadable_container_is_also_unknown_and_never_published(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes["/container-abc"] = FakeResponse({"error": {"message": "temporarily unavailable", "code": 2}}, 400)
+    transport = FakeTransport(routes)
+    alerts: list[tuple[str, str | None]] = []
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport, alerts)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+    posting.set_status(row["id"], posting.STATUS_PUBLISHING, db_path=tmp_db,
+                       remote_container_id="container-abc", publish_started_at=db.now())
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_FAILED
+    assert transport.sent("media_publish") == []
+    assert "could not be read" in post_row(tmp_db, item["id"], "instagram")["error_message"]
+
+
+def test_a_facebook_reel_that_is_already_published_is_recovered_not_re_finished(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    cfg["posting"]["platforms"] = {"instagram": False, "facebook": True}
+    routes = happy_routes()
+    routes["/fbvid-777"] = FakeResponse({
+        "status": {"video_status": "ready", "publishing_phase": {"publish_status": "published"}},
+        "permalink_url": "/reel/777",
+    })
+    transport = FakeTransport(routes)
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "facebook")
+    posting.set_status(row["id"], posting.STATUS_PUBLISHING, db_path=tmp_db,
+                       remote_container_id="fbvid-777", publish_started_at=db.now())
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_LIVE
+
+    finishes = [c for c in transport.sent("/video_reels") if c[2].get("data", {}).get("upload_phase") == "finish"]
+    assert finishes == []
+    assert post_row(tmp_db, item["id"], "facebook")["remote_url"] == "https://www.facebook.com/reel/777"
+
+
+def test_a_facebook_reel_in_an_in_between_state_is_unknown_and_never_re_finished(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    cfg["posting"]["platforms"] = {"instagram": False, "facebook": True}
+    routes = happy_routes()
+    routes["/fbvid-777"] = FakeResponse({"status": {"video_status": "processing"}})
+    transport = FakeTransport(routes)
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "facebook")
+    posting.set_status(row["id"], posting.STATUS_PUBLISHING, db_path=tmp_db,
+                       remote_container_id="fbvid-777", publish_started_at=db.now())
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_FAILED
+    finishes = [c for c in transport.sent("/video_reels") if c[2].get("data", {}).get("upload_phase") == "finish"]
+    assert finishes == []
+
+
+def test_settle_resolves_every_row_left_in_publishing_on_startup(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes["/container-abc"] = FakeResponse({"status_code": "PUBLISHED"})
+    routes[f"/{IG_USER}/media"] = FakeResponse({"data": [
+        {"id": "media-555", "caption": "WHAT IS HIDDEN HERE?\n\nCredit: GamingBolt\n.\n#gta6",
+         "permalink": "https://instagram.com/reel/555", "timestamp": "2026-11-09T12:00:00+0000"}]})
+    routes["/fbvid-777"] = FakeResponse({"status": {"video_status": "processing"}})
+    transport = FakeTransport(routes)
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    for platform, remote in (("instagram", "container-abc"), ("facebook", "fbvid-777")):
+        posting.set_status(post_row(tmp_db, item["id"], platform)["id"], posting.STATUS_PUBLISHING,
+                           db_path=tmp_db, remote_container_id=remote, publish_started_at="2026-11-09T11:00:00Z")
+
+    settled = dict((pid, status) for pid, status in posting.settle_publishing_rows(
+        cfg=cfg, db_path=tmp_db, publisher=publisher))
+
+    assert sorted(settled.values()) == ["failed", "live"]
+    assert transport.sent("media_publish") == []
+
+
+# ---------------------------------------------------------------------------
+# Partial platform retry
+# ---------------------------------------------------------------------------
+
+def test_a_failed_facebook_row_retries_facebook_only(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes[f"/{FB_PAGE}/video_reels"] = FakeResponse({"error": {"message": "transient", "code": 1}}, 400)
+    transport = FakeTransport(routes)
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+    first = posting.run_posting_for_item(item["id"], cfg=cfg, db_path=tmp_db, publisher=publisher)
+    assert first == {"instagram": "live", "facebook": "failed"}
+    ig_calls_before = len(transport.sent(f"/{IG_USER}/"))
+
+    # Facebook is fixed; the retry pass must leave the live Instagram row alone.
+    transport.routes[f"/{FB_PAGE}/video_reels"] = [
+        FakeResponse({"video_id": "fbvid-777"}), FakeResponse({"success": True})
+    ]
+    second = posting.run_posting_for_item(item["id"], cfg=cfg, db_path=tmp_db, publisher=publisher)
+
+    assert second == {"instagram": "live", "facebook": "live"}
+    assert len(transport.sent(f"/{IG_USER}/")) == ig_calls_before   # no Instagram request at all
+    assert db.get_item(item["id"], db_path=tmp_db)["stage"] == "posted"
+
+
+def test_a_row_is_given_up_on_after_the_attempt_cap(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes[f"/{FB_PAGE}/video_reels"] = FakeResponse({"error": {"message": "broken", "code": 1}}, 400)
+    cfg["posting"]["platforms"] = {"instagram": False, "facebook": True}
+    publisher, _ = make_publisher(tmp_db, cfg, FakeTransport(routes))
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row_id = post_row(tmp_db, item["id"], "facebook")["id"]
+
+    for _ in range(cfg["posting"]["max_post_attempts"] + 1):
+        publisher.publish(row_id, item)
+
+    final = post_row(tmp_db, item["id"], "facebook")
+    assert final["status"] == posting.STATUS_FAILED
+    assert "gave up after 3 attempts" in final["error_message"]
+
+
+# ---------------------------------------------------------------------------
+# Rate limits, backoff and retries
+# ---------------------------------------------------------------------------
+
+def test_a_429_pauses_meta_for_hours_and_leaves_the_row_alone(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes[f"/{IG_USER}/media"] = FakeResponse(
+        {"error": {"message": "Application request limit reached", "code": 4}}, 429
+    )
+    alerts: list[tuple[str, str | None]] = []
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), FakeTransport(routes), alerts)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row_id = post_row(tmp_db, item["id"], "instagram")["id"]
+
+    with pytest.raises(RateLimitError):
+        publisher.publish(row_id, item)
+
+    paused, why = posting.meta_paused(tmp_db)
+    assert paused is True
+    assert "429" in why
+    with db.db(tmp_db) as conn:
+        remaining = conn.execute(
+            "SELECT paused_until FROM rate_limits WHERE source = 'meta_graph'"
+        ).fetchone()["paused_until"]
+    assert remaining > db.now()           # the pause reaches into the future, measured in hours
+    assert post_row(tmp_db, item["id"], "instagram")["status"] != posting.STATUS_FAILED
+    assert alerts and "Meta paused" in alerts[0][0]
+
+
+def test_a_block_code_without_a_429_also_pauses_meta(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes[f"/{IG_USER}/media"] = FakeResponse({"error": {"message": "User request limit", "code": 17}}, 400)
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), FakeTransport(routes))
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+
+    with pytest.raises(RateLimitError):
+        publisher.publish(post_row(tmp_db, item["id"], "instagram")["id"], item)
+
+    assert posting.meta_paused(tmp_db)[0] is True
+
+
+def test_nothing_is_posted_while_meta_is_paused(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    rate_limit.record_error(posting.META_SOURCE, "429 earlier", pause_hours=3.0, db_path=tmp_db)
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+
+    assert posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher) == {}
+    assert transport.calls == []
+    assert db.get_item(item["id"], db_path=tmp_db)["stage"] == "approved"
+
+
+def test_a_5xx_is_retried_with_capped_exponential_backoff(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    routes = happy_routes()
+    routes[f"/{IG_USER}/media"] = [
+        FakeResponse({}, 503), FakeResponse({}, 503), FakeResponse({"id": "container-abc"})
+    ]
+    transport = FakeTransport(routes)
+    publisher, clock = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+
+    assert publisher.publish(post_row(tmp_db, item["id"], "instagram")["id"], item) == posting.STATUS_LIVE
+    assert clock.slept[:2] == [1.0, 2.0]          # retry_backoff_s doubling
+
+
+def test_a_network_error_is_retried_and_then_fails_the_row_with_a_redacted_message(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+
+    def always_broken(method, url, kwargs):
+        raise requests.ConnectionError(f"could not reach {url}")
+
+    routes = happy_routes()
+    routes[f"/{IG_USER}/media"] = always_broken
+    publisher, clock = make_publisher(tmp_db, ig_only(cfg), FakeTransport(routes))
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+
+    assert publisher.publish(post_row(tmp_db, item["id"], "instagram")["id"], item) == posting.STATUS_FAILED
+    assert clock.slept == [1.0, 2.0]              # max_retries = 2, then it gives up
+    assert "ig-token-secret" not in post_row(tmp_db, item["id"], "instagram")["error_message"]
+
+
+def test_the_request_pacing_keeps_meta_calls_a_gap_apart(tmp_db, tmp_path, cfg, secrets):
+    cfg["posting"]["meta_min_gap_seconds"] = 3
+    clock = Clock()
+    client = posting.MetaClient(
+        transport=FakeTransport({"": FakeResponse({"ok": True})}), cfg=cfg, db_path=tmp_db,
+        clock=clock, sleep=clock.sleep,
+    )
+    client.get("https://graph.test/a")      # nothing before it
+    client.post("https://graph.test/b")     # right behind it: a full gap
+    clock.now += 1
+    client.get("https://graph.test/c")      # only the missing two seconds
+    assert clock.slept == [3.0, 2.0]
+
+
+def test_a_token_is_never_written_into_an_error_message(tmp_db, tmp_path, cfg, secrets):
+    assert posting.redact("https://graph.test/x?access_token=ig-token-secret&y=1") == (
+        "https://graph.test/x?access_token=***&y=1"
+    )
+    assert "ig-token-secret" not in posting.redact("OAuth ig-token-secret failed")
+
+
+# ---------------------------------------------------------------------------
+# Dry run
+# ---------------------------------------------------------------------------
+
+def test_a_dry_run_never_calls_a_publish_endpoint_and_logs_what_it_would_send(tmp_db, tmp_path, cfg, secrets):
+    cfg["app"]["dry_run"] = True
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+
+    results = posting.run_posting_for_item(item["id"], cfg=cfg, db_path=tmp_db, publisher=publisher)
+
+    assert results == {"instagram": "dry_run", "facebook": "dry_run"}
+    assert transport.calls == []            # plan_only: not one request, of any kind
+    # a dry run must not advance the item: it still has to post for real once dry_run is off
+    assert db.get_item(item["id"], db_path=tmp_db)["stage"] == "approved"
+    for platform in ("instagram", "facebook"):
+        row = post_row(tmp_db, item["id"], platform)
+        assert row["status"] == posting.STATUS_DRY_RUN
+        plan_path = row["error_message"].split("plan: ")[-1]
+        plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+        assert plan["dry_run"] is True
+        urls = [s["url"] for s in plan["steps"]]
+        assert any("rupload.test" in u for u in urls)                  # the upload it would do
+        assert json.dumps(plan)  # serialisable
+        assert "ig-token-secret" not in json.dumps(plan)               # and token-free
+        assert "fb-page-token-secret" not in json.dumps(plan)
+    ig_plan = json.loads(Path(
+        post_row(tmp_db, item["id"], "instagram")["error_message"].split("plan: ")[-1]
+    ).read_text(encoding="utf-8"))
+    assert any("media_publish" in s["url"] for s in ig_plan["steps"])  # planned, never sent
+
+
+def test_a_dry_run_still_walks_the_whole_state_machine(tmp_db, tmp_path, cfg, secrets):
+    cfg["app"]["dry_run"] = True
+    item = make_item(tmp_db, tmp_path)
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), FakeTransport(happy_routes()))
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+
+    seen: list[str] = []
+    real = posting.set_status
+
+    def spy(post_id, status, db_path=None, **fields):
+        seen.append(status)
+        real(post_id, status, db_path=db_path, **fields)
+
+    posting.set_status = spy
+    try:
+        publisher.publish(row["id"], item)
+    finally:
+        posting.set_status = real
+
+    assert seen == ["uploading", "container_ready", "publishing", "dry_run"]
+
+
+def test_up_to_publish_mode_uploads_but_still_never_publishes(tmp_db, tmp_path, cfg, secrets):
+    cfg["app"]["dry_run"] = True
+    cfg["posting"]["dry_run_mode"] = "up_to_publish"
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+
+    assert publisher.publish(post_row(tmp_db, item["id"], "instagram")["id"], item) == posting.STATUS_DRY_RUN
+
+    assert len(transport.sent("/ig-api-upload/")) == 1      # the bytes really went up
+    assert transport.sent("media_publish") == []            # the publish call did not
+
+
+def test_a_dry_run_row_left_in_publishing_is_settled_without_any_remote_call(tmp_db, tmp_path, cfg, secrets):
+    cfg["app"]["dry_run"] = True
+    item = make_item(tmp_db, tmp_path)
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    row = post_row(tmp_db, item["id"], "instagram")
+    posting.set_status(row["id"], posting.STATUS_PUBLISHING, db_path=tmp_db,
+                       remote_container_id="<dry-run-container:1>")
+
+    assert publisher.settle(post_row(tmp_db, item["id"], "instagram")) == posting.STATUS_DRY_RUN
+    assert transport.calls == []
+
+
+# ---------------------------------------------------------------------------
+# posts rows
+# ---------------------------------------------------------------------------
+
+def test_post_rows_are_created_once_per_platform_and_carry_the_learning_fields(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    posting.ensure_post_rows(item, slot_datetime="2026-11-10T13:00:00Z", cfg=cfg, db_path=tmp_db)
+    posting.ensure_post_rows(item, slot_datetime="2026-11-10T18:00:00Z", cfg=cfg, db_path=tmp_db)
+
+    rows = posting.get_posts_for_item(item["id"], db_path=tmp_db)
+    assert [r["platform"] for r in rows] == ["facebook", "instagram"]
+    assert all(r["slot_datetime"] == "2026-11-10T13:00:00Z" for r in rows)   # not recreated
+    assert all(r["hook_style"] == "question" and r["source"] == "youtube" for r in rows)
+    assert all(r["variant"] == "B" for r in rows)                            # default when unassigned
+    assert all("Credit: GamingBolt" in r["caption_text"] for r in rows)
+
+
+def test_only_enabled_platforms_get_a_row(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    posting.ensure_post_rows(item, cfg=ig_only(cfg), db_path=tmp_db)
+    assert [r["platform"] for r in posting.get_posts_for_item(item["id"], db_path=tmp_db)] == ["instagram"]
+
+
+def test_a_missing_render_file_fails_the_row_rather_than_uploading_nothing(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    Path(item["render_b_path"]).unlink()
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), FakeTransport(happy_routes()))
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+
+    assert publisher.publish(post_row(tmp_db, item["id"], "instagram")["id"], item) == posting.STATUS_FAILED
+    assert "missing on disk" in post_row(tmp_db, item["id"], "instagram")["error_message"]
+
+
+# ---------------------------------------------------------------------------
+# The laptop dry-run script's guard
+# ---------------------------------------------------------------------------
+
+def _load_cp3_script():
+    import importlib.util
+    path = Path(__file__).resolve().parent.parent / "scripts" / "cp3_dry_run.py"
+    spec = importlib.util.spec_from_file_location("cp3_dry_run", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_dry_run_script_guard_refuses_every_write_and_publish_endpoint(secrets):
+    script = _load_cp3_script()
+    guard = script.GuardedTransport()
+    guard.inner = lambda method, url, **kw: FakeResponse({"ok": True})
+
+    # read-only GETs pass
+    assert guard("GET", "https://graph.test/v25.0/debug_token", params={"input_token": "x"}).json() == {"ok": True}
+
+    forbidden = [
+        ("POST", f"https://graph.test/v25.0/{IG_USER}/media_publish", {"data": {"creation_id": "c"}}),
+        ("POST", "https://rupload.facebook.com/ig-api-upload/v25.0/c", {}),
+        ("POST", f"https://graph.test/v25.0/{FB_PAGE}/video_reels", {"data": {"upload_phase": "finish"}}),
+        ("POST", f"https://graph.test/v25.0/{IG_USER}/media", {"data": {"upload_type": "resumable"}}),
+        ("GET", f"https://graph.test/v25.0/{IG_USER}/media", {"params": {"upload_type": "resumable"}}),
+    ]
+    for method, url, kwargs in forbidden:
+        with pytest.raises(script.PublishAttempted):
+            guard(method, url, **kwargs)
+    assert len(guard.gets) == 1   # only the debug_token GET was ever let through

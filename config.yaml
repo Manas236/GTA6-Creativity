@@ -289,12 +289,15 @@ style:
     audio_fade_s: 0.15 # no video fade; audio fade capped at 0.15 s
 
 approval:
-  mode: "telegram" # 'telegram' or 'auto'
+  mode: "telegram" # 'telegram' or 'auto' ('auto' skips Telegram and applies the gate below)
   auto_quality_gate:
     require_both_renders: true
     require_ffprobe_pass: true
     require_grounded_hook: true
-    max_duration_seconds: 22.0
+    max_duration_seconds: 22.0 # applies to Variant A (the cut-length render)
+    # Variant B is a freeze-frame plus the cut, so it is longer by design (PLAN.md section 7).
+    # It is checked against this much headroom over A instead of max_duration_seconds.
+    max_b_extra_seconds: 8.0
 
 posting:
   profile: "local" # 'local' or 'server'
@@ -306,11 +309,28 @@ posting:
       timezone: "America/New_York"
       slots: ["18:00", "21:00"]
   min_gap_hours: 3.0
-  meta_min_gap_seconds: 3.0
+  meta_min_gap_seconds: 3.0 # minimum gap between any two Meta requests, shared across processes
   daily_post_target: 2
   platforms:
     instagram: true
     facebook: true
+  # Meta Graph API (CP3)
+  graph_base: "https://graph.facebook.com"
+  rupload_base: "https://rupload.facebook.com"
+  api_version: "v25.0"
+  # 'plan_only' (default): a dry run sends NO write request; the whole state machine runs and every
+  # request that would go out is logged and written to media/dry_run/. 'up_to_publish': the real
+  # container is created and the real bytes are uploaded, only the publish call is skipped - that
+  # touches the live account, so it is opt-in.
+  dry_run_mode: "plan_only"
+  max_retries: 3 # per-request retries on 5xx / network errors
+  retry_backoff_s: 2.0 # exponential: 2s, 4s, 8s ...
+  retry_backoff_cap_s: 30.0
+  max_post_attempts: 3 # a posts row is given up on after this many attempts
+  rate_limit_pause_hours: 3.0 # a 429 or block pauses every Meta call for this long
+  container_poll_seconds: 10.0
+  container_poll_max_minutes: 5.0
+  recent_media_limit: 25 # recent media checked when resolving a crash in 'publishing'
 
 telegram:
   enabled: true

@@ -23,7 +23,7 @@ is set (and the rule fallback otherwise), and renders into
 ---
 
 ## 1. Project State
-- **Checkpoints 0 - 2**: Completed and committed.
+- **Checkpoints 0 - 3**: Completed and committed.
   - CP0: Architecture plan, database schema, configuration, environment setup.
   - CP1: Discovery (YouTube/official channels), pull-based download, perceptual deduplication (pHash/Hamming), crash recovery.
   - CP2: Cut detection (loudness + scene changes), Gemini grounded hooks, Kokoro TTS voiceover, ASS subtitle generation, vertical 9:16 rendering (Variants A & B).
@@ -31,8 +31,13 @@ is set (and the rule fallback otherwise), and renders into
   flags grouped into presets **P0-P3**, all numbers under `style:` in `config.yaml`,
   verified on a synthetic clip (`samples/synthetic/presets_sheet.png`). See **PLAN.md
   §7B** and *Calls I made* #33-59. **The default preset stays P0.**
-- **Checkpoint 3**: Telegram review bot + Meta (Instagram & Facebook Reels) posting has **not** been started (another session is building it on a branch).
-- **Safety Defaults**: `dry_run: true` remains active by default in `config.yaml`.
+  - CP3: Telegram approval card (one self-editing card, strictly one item at a time) and Meta
+    posting (Instagram Reels resumable upload + Facebook Page Reels `video_reels`), two-phase and
+    crash-safe. Merged into `main` (PLAN.md *Calls I made* #60-74, renumbered from 33-47).
+- **Checkpoint 3**: built and tested with mocks. **Not yet run against the real APIs** - that is the
+  laptop dry run in section 5 below, and no live post happens until you say go.
+- **Safety Defaults**: `dry_run: true` remains active by default in `config.yaml`, and
+  `posting.dry_run_mode: plan_only` means a dry run sends no write request to Meta at all.
 
 ---
 
@@ -143,6 +148,64 @@ python scripts/fetch_assets.py --check   # verify assets and licences, download 
 ---
 
 ## 5. Test Commands
+## 5. CP3 Laptop Steps: run the dry run
+> **Run `git pull` on `main` first.** Nothing below posts
+> anything publicly; the dry run cannot reach a publish endpoint.
+
+### 5.1 Fill in `.env`
+Copy the new keys from `.env.example` (each has a one-line comment):
+
+| Key | Where to get it |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | @BotFather -> `/newbot` (or `/token` for an existing bot) |
+| `TELEGRAM_CHAT_ID` | message your bot once, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and take `message.chat.id` |
+| `IG_USER_ID` | Graph API Explorer -> `me/accounts?fields=instagram_business_account` |
+| `IG_ACCESS_TOKEN` | a long-lived **Page** token with `instagram_basic`, `instagram_content_publish`, `instagram_manage_insights`, `pages_read_engagement` |
+| `FB_PAGE_ID` | the Page's About tab, or `me/accounts` |
+| `FB_PAGE_ACCESS_TOKEN` | optional; only if `IG_ACCESS_TOKEN` is not already a Page token for `FB_PAGE_ID`. Needs `pages_show_list`, `pages_read_engagement`, `pages_manage_posts` |
+
+### 5.2 Run it (one command, no prompts)
+```bash
+git pull
+pip install -r requirements.txt     # if the venv is new
+python scripts/cp3_dry_run.py
+```
+
+What it does, in order:
+1. **Telegram** - `getMe`, then sends **one real approval card** to your chat: Variant B as the
+   video with the three buttons, Variant A as a second message, and the hook, authenticity tag,
+   source + creator and discovery score in the caption. It uses the highest-scoring render in
+   `pipeline.db`; if there is none it builds a synthetic 1080x1920 pair with ffmpeg first, so you
+   can still see the card exactly as it will look.
+   *The buttons are live:* tapping Approve / Reject / Approve A only really updates that item in
+   your local database. Tapping an older card answers "This card is out of date" and does nothing.
+2. **Meta** - read-only GETs: `/debug_token` (type, validity, expiry, permissions, and which
+   permissions are missing), the IG user, the IG `content_publishing_limit`, and the Page.
+3. **Posting flow in dry run** - the full two-phase state machine, logging and writing every request
+   it would send to `media/dry_run/post_<id>_<platform>.json`, with every token redacted.
+
+Exit code 0 means every check passed; 1 lists what needs attention. Nothing is published, and
+nothing can be: `app.dry_run` and `plan_only` are forced for that process, and a guard raises on any
+non-GET request and on any URL or body naming a write endpoint.
+
+### 5.3 Then stop
+Report what the card looked like and what the summary said. The first live post needs your explicit
+go; until then leave `app.dry_run: true`.
+
+### 5.4 Running the pipeline with approvals on
+```bash
+python -m pipeline.runner approve     # one approval pass: send a card if none is open, poll once
+python -m pipeline.runner post        # settle any crashed publish, then post approved items
+python -m pipeline.runner cycle       # a full cycle, including the approval poll and posting
+python -m pipeline.runner loop        # cycles continuously; the Telegram long poll runs inside it
+```
+To skip Telegram entirely, set `approval.mode: auto` in `config.yaml`: items are then approved or
+rejected by `approval.auto_quality_gate` (both renders present, hook grounded, ffprobe within the
+duration caps) with no network calls.
+
+---
+
+## 5B. Test Commands
 
 ### Zero-Network Tests (Local / Offline)
 Runs all unit and mock tests:
@@ -163,6 +226,17 @@ Near-tie hook wraps can therefore differ from Linux, e.g. `IS THIS REALLY / GTA 
 `IS THIS / REALLY GTA 6?` (792 vs 793 px). `test_build_ass_subtitles_no_speech` accepts
 either split when they are within 2 px.
 
+CP3 adds 60 of those tests and they make no network calls of any kind - both modules put every
+request behind an injectable transport, and the tests pass a fake:
+```bash
+pytest tests/test_telegram_bot.py tests/test_posting.py -q
+```
+They cover the card lifecycle (send, edit, approve, reject, A-only, stale click, foreign chat),
+one-at-a-time ordering, auto mode and the quality gate, edit throttling and 429 handling, the
+two-phase posting state machine, a crash at **every** status and resume without a duplicate publish,
+unknown remote state -> failed with no publish, FB-only retry, the 429 source pause, the dry run
+never calling publish, and the caption template.
+
 ### Live Network Integration Tests
 Runs live crash-recovery and network tests:
 ```bash
@@ -182,8 +256,12 @@ python -m pipeline.runner hooks
 python -m pipeline.runner voiceover
 python -m pipeline.runner render
 
-# Run a complete cycle
+python -m pipeline.runner approve
+python -m pipeline.runner post
+
+# Run a complete cycle, or loop forever
 python -m pipeline.runner cycle
+python -m pipeline.runner loop
 ```
 
 ### Style layer
