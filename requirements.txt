@@ -1,6 +1,7 @@
 # Core pipeline dependencies (Python 3.11+)
 yt-dlp>=2026.10.26
 requests>=2.32.0
+tzdata>=2024.1 # IANA timezones for zoneinfo on Windows (posting slot profiles)
 pyyaml>=6.0.0
 pillow>=10.0.0
 numpy>=1.26.0 # imported directly by the tests and the verification scripts

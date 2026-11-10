@@ -41,13 +41,15 @@ from typing import Any, Callable, Protocol
 
 import requests
 
-from . import config, db
+from . import clock, config, db
 
 log = logging.getLogger(__name__)
 
 K_CARD = "telegram:card"          # JSON {"mid":, "item_id":, "extra_mids": [...]}
 K_OFFSET = "telegram:offset"      # getUpdates offset, persisted so a restart never re-delivers taps
 K_ALERT = "telegram:last_alert"   # JSON {"key":, "at": epoch} so one failure is not re-sent forever
+K_AUTO_SINCE = "approval:auto_since"          # ISO time the approval mode switched to auto
+K_AUTO_NOTICE = "approval:auto_notice_sent"   # set once the single switch notice went out
 
 STALE = "This card is out of date - it was already decided. The current card is further down."
 ALERT_REPEAT_GAP_S = 3600.0       # the same failure is not re-alerted more often than this
@@ -334,7 +336,7 @@ def decide(item_id: str, action: str, db_path: Any = None) -> tuple[str, str]:
         return "", "That item is gone."
     if item.get("stage") not in ("awaiting_approval", "rendered"):
         return "", f"Already decided ({item.get('stage')})."
-    if action in ("ok", "aonly") and not db.is_releasable(item):
+    if action in ("ok", "aonly") and int(item.get("preview_only") or 0):
         refuse_item(item_id, "approval", RuntimeError("preview_only item cannot be approved"), db_path)
         return "", "This item is preview-only and cannot be approved."
     try:
@@ -451,7 +453,7 @@ class ApprovalBot:
 
     def send_card(self, item: dict[str, Any]) -> str | None:
         item_id = item["id"]
-        if not db.is_releasable(item):
+        if int(item.get("preview_only") or 0):
             log.warning("telegram: %s is preview_only; no card is sent for it", item_id)
             return None
         # The stage moves BEFORE anything is sent: if the database refuses the item, no card for it
@@ -499,6 +501,34 @@ class ApprovalBot:
             now=True,
         )
         set_card_state(None, self.db_path)
+
+    def release_stuck_card(self, poll_timeout: int | None = None) -> bool:
+        """Free the one-card slot when the open card can no longer be decided.
+
+        That is a card whose item is gone, already decided elsewhere, or is a synthetic dry-run
+        item (scripts/cp3_dry_run.py leaves its test card open). Without this, an untapped test
+        card would block every real card forever under the one-at-a-time rule. A tap that is
+        already waiting is collected first, so a real decision is never thrown away.
+        """
+        state = card_state(self.db_path)
+        if not state:
+            return False
+        item = db.get_item(state.get("item_id") or "", db_path=self.db_path)
+        stuck = (not item) or item.get("stage") not in ("awaiting_approval", "rendered") or db.is_synthetic(item)
+        if not stuck:
+            return False
+        if item and db.is_synthetic(item):
+            self.poll_once(0)                       # honour a tap on the test card if there is one
+            state = card_state(self.db_path)
+            if not state:
+                return True
+            item = db.get_item(state.get("item_id") or "", db_path=self.db_path) or item
+            if item.get("stage") in ("awaiting_approval", "rendered"):
+                db.mark_rejected(item["id"], "synthetic_dry_run_card_closed", db_path=self.db_path)
+        self.close_card(state, item or {"id": state.get("item_id")},
+                        "⌛ Closed: this card can no longer be decided.")
+        log.info("telegram: released the open card for %s", state.get("item_id"))
+        return True
 
     # ----------------------------------------------------------- updates
     def handle_update(self, update: dict[str, Any]) -> None:
@@ -567,24 +597,57 @@ class ApprovalBot:
         return handled
 
     # ----------------------------------------------------------- alerts
-    def alert(self, text: str, key: str | None = None) -> bool:
-        """A failure-only alert to the same chat. The same `key` is not re-sent within the hour."""
-        now_t = time.time()
+    def alert(self, text: str, key: str | None = None, repeat_gap_s: float | None = ALERT_REPEAT_GAP_S) -> bool:
+        """A failure-only alert to the same chat. The same `key` is not re-sent within the hour
+        (`repeat_gap_s=None`: that key is sent once, ever). Times are kept per key, so two
+        different failures alternating every cycle are each still limited."""
+        now_t = clock.epoch()
         if key:
             try:
-                last = json.loads(db.kv_get(K_ALERT, db_path=self.db_path) or "null") or {}
+                seen = json.loads(db.kv_get(K_ALERT, db_path=self.db_path) or "null") or {}
             except ValueError:
-                last = {}
-            if last.get("key") == key and (now_t - float(last.get("at", 0.0))) < ALERT_REPEAT_GAP_S:
-                log.info("telegram: alert %r already sent recently; not repeating", key)
+                seen = {}
+            if "keys" not in seen:   # the pre-CP4 shape held a single {"key", "at"}
+                seen = {"keys": {seen["key"]: seen.get("at", 0.0)} if seen.get("key") else {}}
+            keys: dict[str, float] = seen["keys"]
+            last = keys.get(key)
+            if last is not None and (repeat_gap_s is None or (now_t - float(last)) < repeat_gap_s):
+                log.info("telegram: alert %r already sent; not repeating", key)
                 return False
-            db.kv_set(K_ALERT, json.dumps({"key": key, "at": now_t}), db_path=self.db_path)
+            keys[key] = now_t
+            for old in [k for k, at in keys.items() if now_t - float(at) > 30 * 86400]:
+                keys.pop(old, None)
+            db.kv_set(K_ALERT, json.dumps({"keys": keys}), db_path=self.db_path)
         try:
             self.send_message(f"🚨 {redact(text)}")
             return True
         except (TelegramError, requests.RequestException) as e:
             log.warning("telegram: alert not delivered: %s", redact(e))
             return False
+
+
+def send_alert(
+    text: str,
+    key: str | None = None,
+    cfg: dict[str, Any] | None = None,
+    db_path: Any = None,
+    bot: ApprovalBot | None = None,
+    repeat_gap_s: float | None = ALERT_REPEAT_GAP_S,
+) -> bool:
+    """Failure alert from any stage. Never raises: with Telegram off or no credentials it logs."""
+    try:
+        cfg = cfg or config.get_config()
+        if bot is None:
+            if not (cfg.get("telegram") or {}).get("enabled", True) or not (
+                config.secret("TELEGRAM_BOT_TOKEN") and config.secret("TELEGRAM_CHAT_ID")
+            ):
+                log.warning("ALERT (not delivered, telegram off or no credentials): %s", redact(text))
+                return False
+            bot = ApprovalBot(cfg=cfg, db_path=db_path)
+        return bot.alert(text, key=key, repeat_gap_s=repeat_gap_s)
+    except Exception as e:  # noqa: BLE001 - alerting must never break the stage that alerts
+        log.warning("alert not delivered (%s): %s", e, text)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +750,68 @@ def run_auto_approval(
 # The runner's entry point
 # ---------------------------------------------------------------------------
 
+def effective_mode(cfg: dict[str, Any] | None = None, db_path: Any = None) -> str:
+    """'telegram' or 'auto' for this pass.
+
+    `approval.mode: auto` is always auto. `approval.mode: telegram` is Telegram for the first
+    `approval.switch_to_auto_after_days` days counted from the FIRST LIVE POST and auto after that;
+    the moment of the switch is pinned in `kv`. Set switch_to_auto_after_days to null (or 0) to
+    keep approving by hand - that also undoes a switch that already happened.
+    """
+    approval = ((cfg or {}).get("approval") or {})
+    mode = str(approval.get("mode") or "telegram").lower()
+    if mode == "auto":
+        return "auto"
+    after_days = approval.get("switch_to_auto_after_days")
+    if not after_days:
+        return "telegram"
+    if db.kv_get(K_AUTO_SINCE, db_path=db_path):
+        return "auto"
+    days = db.days_since_first_live(db_path)
+    if days is not None and days >= float(after_days):
+        db.kv_set(K_AUTO_SINCE, db.now(), db_path=db_path)
+        log.info("approval: %.1f days since the first live post; switching to auto approval", days)
+        return "auto"
+    return "telegram"
+
+
+def announce_auto_switch(
+    cfg: dict[str, Any], db_path: Any = None, bot: ApprovalBot | None = None
+) -> bool:
+    """Send the ONE Telegram notice that approvals are now automatic, and retire any open card.
+
+    Returns True when the notice went out on this call. The flag is only set once the message was
+    really delivered (or can never be: Telegram off / no credentials), so a network blip retries on
+    the next pass and never produces a second notice.
+    """
+    if db.kv_get(K_AUTO_NOTICE, db_path=db_path) or not db.kv_get(K_AUTO_SINCE, db_path=db_path):
+        return False
+    tg = cfg.get("telegram") or {}
+    have_creds = bool(config.secret("TELEGRAM_BOT_TOKEN") and config.secret("TELEGRAM_CHAT_ID"))
+    if bot is None and (not tg.get("enabled", True) or not have_creds):
+        log.warning("approval switched to auto; no Telegram notice (telegram off or credentials missing)")
+        db.kv_set(K_AUTO_NOTICE, "skipped:" + db.now(), db_path=db_path)
+        return False
+    bot = bot or ApprovalBot(cfg=cfg, db_path=db_path)
+    days = (cfg.get("approval") or {}).get("switch_to_auto_after_days")
+    try:
+        state = card_state(db_path)
+        if state:   # the item on the open card is decided by the gate from now on
+            item = db.get_item(state.get("item_id") or "", db_path=db_path) or {"id": state.get("item_id")}
+            bot.close_card(state, item, "🤖 Auto approval took over; the quality gate decides this item.")
+        bot.send_message(
+            f"🤖 Approvals are now automatic. It has been {days} days since the first live post, so "
+            "items are approved by the quality gate (both renders, grounded hook, duration) without "
+            "a card. You will still get failure alerts here. To go back to cards, set "
+            "approval.switch_to_auto_after_days to null in config.yaml."
+        )
+    except (TelegramError, requests.RequestException) as e:
+        log.warning("approval: switch notice not delivered yet (%s); will retry", redact(e))
+        return False
+    db.kv_set(K_AUTO_NOTICE, db.now(), db_path=db_path)
+    return True
+
+
 def run_approval_stage(
     cfg: dict[str, Any] | None = None,
     db_path: Any = None,
@@ -696,15 +821,21 @@ def run_approval_stage(
 ) -> dict[str, Any]:
     """One approval pass inside the runner's loop.
 
-    `approval.mode: auto` -> the quality gate, no network.
-    `approval.mode: telegram` -> ensure one card is open, then one long-poll round.
+    auto     -> the quality gate, no approval card (see `effective_mode` for when that is).
+    telegram -> ensure one card is open, then one long-poll round.
     """
     cfg = cfg or config.get_config()
-    mode = str(((cfg.get("approval") or {}).get("mode") or "telegram")).lower()
+    mode = effective_mode(cfg, db_path)
 
     if mode == "auto":
+        switched = db.kv_get(K_AUTO_SINCE, db_path=db_path)
+        notice = announce_auto_switch(cfg, db_path, bot) if switched else False
         result = run_auto_approval(cfg=cfg, db_path=db_path, probe=probe)
-        return {"mode": "auto", **result}
+        out: dict[str, Any] = {"mode": "auto", **result}
+        if switched:
+            out["auto_since"] = switched
+            out["switch_notice_sent"] = notice
+        return out
 
     tg = cfg.get("telegram") or {}
     if not tg.get("enabled", True):
@@ -715,6 +846,7 @@ def run_approval_stage(
         return {"mode": "telegram", "skipped": "credentials missing"}
 
     bot = bot or ApprovalBot(cfg=cfg, db_path=db_path)
+    bot.release_stuck_card(poll_timeout)
     sent = bot.ensure_card()
     handled = bot.poll_once(poll_timeout)
     bot.editor.flush()

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator, Iterator
 
+from . import clock
 from .config import project_root
 
 DEFAULT_DB_PATH = project_root() / "pipeline.db"
@@ -118,6 +119,8 @@ CREATE TABLE IF NOT EXISTS posts (
     attempt_count INTEGER DEFAULT 0,
     publish_started_at TEXT,
     caption_text TEXT,
+    no_retry INTEGER DEFAULT 0,                 -- 1 = failed for good: never retried (e.g. unknown remote state)
+    style_preset TEXT,                          -- captured for learning (items.style_preset at scheduling)
     error_message TEXT,
     posted_at TEXT,
     created_at TEXT NOT NULL,
@@ -210,8 +213,8 @@ END;
 
 
 def now() -> str:
-    """Return ISO-8601 UTC timestamp."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Return ISO-8601 UTC timestamp (from pipeline.clock, so tests can fake time)."""
+    return clock.now_iso()
 
 
 def parse_ts(ts: str) -> datetime:
@@ -275,6 +278,9 @@ def init_db(db_path: Path | str | None = None) -> None:
             ("attempt_count", "ALTER TABLE posts ADD COLUMN attempt_count INTEGER DEFAULT 0"),
             ("publish_started_at", "ALTER TABLE posts ADD COLUMN publish_started_at TEXT"),
             ("caption_text", "ALTER TABLE posts ADD COLUMN caption_text TEXT"),
+            # CP4
+            ("no_retry", "ALTER TABLE posts ADD COLUMN no_retry INTEGER DEFAULT 0"),
+            ("style_preset", "ALTER TABLE posts ADD COLUMN style_preset TEXT"),
         ):
             if col not in post_cols:
                 conn.execute(ddl)
@@ -345,12 +351,18 @@ def get_item(item_id: str, db_path: Path | str | None = None) -> dict[str, Any] 
 
 #: SQL that keeps only items that may be approved / scheduled / posted. Used explicitly by the
 #: approval and posting queries - they do not rely on the preview_only triggers firing.
-RELEASABLE_SQL = "COALESCE(preview_only, 0) = 0"
+SYNTHETIC_PREFIX = "synthetic-"   # ids of the items scripts/cp3_dry_run.py builds for its test card
+RELEASABLE_SQL = f"COALESCE(preview_only, 0) = 0 AND id NOT LIKE '{SYNTHETIC_PREFIX}%'"
+
+
+def is_synthetic(item: dict[str, Any] | None) -> bool:
+    return bool(item) and str(item.get("id") or "").startswith(SYNTHETIC_PREFIX)
 
 
 def is_releasable(item: dict[str, Any] | None) -> bool:
-    """False for an item that must never reach approval or posting (preview_only)."""
-    return bool(item) and not int(item.get("preview_only") or 0)
+    """False for an item that must never reach approval or posting: preview_only items and the
+    synthetic test items the dry-run scripts create."""
+    return bool(item) and not int(item.get("preview_only") or 0) and not is_synthetic(item)
 
 
 def is_trigger_refusal(exc: BaseException) -> bool:
@@ -382,6 +394,7 @@ def get_ready_buffer_count(db_path: Path | str | None = None) -> int:
             """
             SELECT COUNT(*) FROM items 
             WHERE stage IN ('rendered', 'awaiting_approval', 'approved', 'queued')
+              AND id NOT LIKE 'synthetic-%'
             """
         ).fetchone()
         return int(row[0]) if row else 0
@@ -562,3 +575,37 @@ def get_recent_source_velocities(
             (source, limit),
         ).fetchall()
         return [float(r["raw_velocity"]) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Launch clock: "week 1" and the approval switch both count from the first live post
+# ---------------------------------------------------------------------------
+
+K_FIRST_LIVE = "launch:first_live_at"
+
+
+def first_live_at(db_path: Path | str | None = None) -> str | None:
+    """ISO time of the channel's first live post, or None before launch.
+
+    Read from `posts` the first time and then pinned in `kv`, so later cleanup or a failed row can
+    never move the start of week 1.
+    """
+    pinned = kv_get(K_FIRST_LIVE, db_path=db_path)
+    if pinned:
+        return pinned
+    with db(db_path) as conn:
+        row = conn.execute(
+            "SELECT MIN(posted_at) AS first FROM posts WHERE status = 'live' AND posted_at IS NOT NULL"
+        ).fetchone()
+    first = row["first"] if row else None
+    if first:
+        kv_set(K_FIRST_LIVE, first, db_path=db_path)
+    return first
+
+
+def days_since_first_live(db_path: Path | str | None = None) -> float | None:
+    """Days elapsed since the first live post (None before launch)."""
+    first = first_live_at(db_path)
+    if not first:
+        return None
+    return (clock.utcnow() - clock.parse(first)).total_seconds() / 86400.0

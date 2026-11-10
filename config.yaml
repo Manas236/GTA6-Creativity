@@ -298,6 +298,9 @@ style:
 
 approval:
   mode: "telegram" # 'telegram' or 'auto' ('auto' skips Telegram and applies the gate below)
+  # Telegram approval for the first N days counted from the FIRST LIVE POST, then auto (the
+  # quality gate below), with one Telegram notice at the switch. null = approve by hand forever.
+  switch_to_auto_after_days: 7
   auto_quality_gate:
     require_both_renders: true
     require_ffprobe_pass: true
@@ -316,7 +319,11 @@ posting:
     server:
       timezone: "America/New_York"
       slots: ["18:00", "21:00"]
-  min_gap_hours: 3.0
+  min_gap_hours: 3.0 # between any two posts (scheduled slots and real live times)
+  # A queued post that has not started within this long after its slot (laptop asleep, Meta
+  # paused) is NOT sent late: the scheduler moves it to the next free slot, one per slot.
+  missed_slot_grace_minutes: 90
+  max_slot_search_days: 60
   meta_min_gap_seconds: 3.0 # minimum gap between any two Meta requests, shared across processes
   daily_post_target: 2
   platforms:
@@ -354,7 +361,11 @@ telegram:
 
 autopilot:
   alert_every_hours: 12
+  # A/B variant: 50/50 random for week_one_days from the first live post, then epsilon-greedy over
+  # ab_learning - the leading variant gets 1 - floor, the other keeps the floor.
+  week_one_days: 7
   bandit_min_exploration_floor: 0.20
+  bandit_min_samples_per_variant: 3 # until both variants have this many measured posts: 50/50
 
 retention:
   purge_downloads_immediately: true

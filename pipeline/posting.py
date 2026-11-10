@@ -65,7 +65,7 @@ from typing import Any, Callable, Protocol
 
 import requests
 
-from . import config, db, rate_limit
+from . import clock, config, db, rate_limit
 from .errors import PublishError, RateLimitError
 
 log = logging.getLogger(__name__)
@@ -92,6 +92,11 @@ STATUS_PUBLISHING = "publishing"
 STATUS_LIVE = "live"
 STATUS_FAILED = "failed"
 STATUS_DRY_RUN = "dry_run"
+
+# Rows that still have work to do: cleanup must not delete their media, and their slot is taken.
+OPEN_STATUSES = (STATUS_PENDING, STATUS_UPLOADING, STATUS_CONTAINER_READY, STATUS_PUBLISHING)
+# Rows whose publish has (or may have) reached the remote: such an item is never re-slotted.
+STARTED_STATUSES = (STATUS_PUBLISHING, STATUS_LIVE)
 
 HASHTAGS = "#gta6 #grandtheftauto #gta #gaming #rockstargames"
 
@@ -398,8 +403,9 @@ def ensure_post_rows(
 ) -> list[dict[str, Any]]:
     """One `pending` row per enabled platform, created once (UNIQUE(item_id, platform))."""
     cfg = cfg or config.get_config()
-    if not db.is_releasable(item):
-        raise PublishError(f"item {item['id']} is preview_only and is never posted")
+    refusal = refusal_reason(item, cfg)
+    if refusal:
+        raise PublishError(refusal)
     variant = item.get("chosen_variant") or "B"
     slot = slot_datetime or db.now()
     caption = caption_for_item(item, cfg)
@@ -409,10 +415,10 @@ def ensure_post_rows(
             conn.execute(
                 """
                 INSERT INTO posts (
-                    item_id, platform, variant, hook_style, source, authenticity,
+                    item_id, platform, variant, hook_style, source, authenticity, style_preset,
                     slot_datetime, status, ab_excluded, caption_text, created_at, updated_at
                 ) VALUES (
-                    :item_id, :platform, :variant, :hook_style, :source, :authenticity,
+                    :item_id, :platform, :variant, :hook_style, :source, :authenticity, :style_preset,
                     :slot_datetime, :status, :ab_excluded, :caption_text, :created_at, :updated_at
                 )
                 ON CONFLICT(item_id, platform) DO NOTHING
@@ -424,6 +430,7 @@ def ensure_post_rows(
                     "hook_style": item.get("hook_style") or "unknown",
                     "source": item.get("source") or "unknown",
                     "authenticity": item.get("authenticity") or "unverified",
+                    "style_preset": item.get("style_preset") or "P0",
                     "slot_datetime": slot,
                     "status": STATUS_PENDING,
                     "ab_excluded": int(item.get("ab_excluded") or 0),
@@ -433,6 +440,85 @@ def ensure_post_rows(
                 },
             )
     return get_posts_for_item(item["id"], db_path=db_path)
+
+
+def is_dry_run(cfg: dict[str, Any] | None) -> bool:
+    return bool(((cfg or {}).get("app") or {}).get("dry_run", True))
+
+
+def refusal_reason(item: dict[str, Any], cfg: dict[str, Any] | None = None) -> str | None:
+    """Why this item may not get `posts` rows, or None. Checked explicitly, before any write."""
+    if int(item.get("preview_only") or 0):
+        return f"item {item['id']} is preview_only and is never posted"
+    if db.is_synthetic(item) and not is_dry_run(cfg):
+        return f"item {item['id']} is a synthetic dry-run item and is never posted for real"
+    return None
+
+
+def max_post_attempts(cfg: dict[str, Any] | None) -> int:
+    return int((((cfg or {}).get("posting") or {}).get("max_post_attempts", 3)))
+
+
+def is_terminal_failure(post: dict[str, Any], cfg: dict[str, Any] | None = None) -> bool:
+    """A failed row that will never be tried again: flagged no_retry, or out of attempts."""
+    if post.get("status") != STATUS_FAILED:
+        return False
+    return bool(post.get("no_retry")) or int(post.get("attempt_count") or 0) >= max_post_attempts(cfg)
+
+
+def item_has_open_posts(item_id: str, cfg: dict[str, Any] | None = None, db_path: Any = None) -> bool:
+    """True while any row of the item is pending / mid-publish or still has retries left.
+    Cleanup uses this: the media such a row needs is never deleted."""
+    for post in get_posts_for_item(item_id, db_path=db_path):
+        if post["status"] in OPEN_STATUSES:
+            return True
+        if post["status"] == STATUS_FAILED and not is_terminal_failure(post, cfg):
+            return True
+    return False
+
+
+def missed_slot_grace(cfg: dict[str, Any] | None) -> float:
+    """Seconds after its slot that a not-yet-started post may still go out."""
+    return float((((cfg or {}).get("posting") or {}).get("missed_slot_grace_minutes", 90))) * 60.0
+
+
+def item_slot(rows: list[dict[str, Any]]) -> str | None:
+    slots = [r["slot_datetime"] for r in rows if r.get("slot_datetime")]
+    return min(slots) if slots else None
+
+
+def slot_is_missed(rows: list[dict[str, Any]], now: datetime, cfg: dict[str, Any] | None = None) -> bool:
+    """The slot passed more than the grace ago and nothing has (or may have) been published.
+
+    Such an item is not posted late: the scheduler moves it to the next free slot. Once any row
+    is `publishing` or `live` the post is underway and finishes where it is.
+    """
+    slot = item_slot(rows)
+    if not slot or any(r["status"] in STARTED_STATUSES for r in rows):
+        return False
+    return (now - clock.parse(slot)).total_seconds() > missed_slot_grace(cfg)
+
+
+def reset_dry_run_rows(cfg: dict[str, Any] | None = None, db_path: Any = None) -> int:
+    """Going live: rows a dry run finished as `dry_run` become `pending` again.
+
+    Without this, flipping app.dry_run to false would find every queued item already "done" and it
+    would never be posted. Their slots are in the past by then, so the scheduler re-slots them one
+    per slot - they do not all go out at once. Does nothing while app.dry_run is true.
+    """
+    if is_dry_run(cfg):
+        return 0
+    with db.db(db_path) as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE posts SET status = 'pending', remote_container_id = NULL, publish_started_at = NULL,
+                             attempt_count = 0, error_message = 'reset after dry run', updated_at = ?
+            WHERE status = 'dry_run'
+              AND item_id IN (SELECT id FROM items WHERE stage IN ('approved', 'queued') AND {db.RELEASABLE_SQL})
+            """,
+            (db.now(),),
+        )
+        return cur.rowcount
 
 
 def video_for_post(item: dict[str, Any], post: dict[str, Any]) -> Path:
@@ -545,9 +631,11 @@ class Publisher:
         except Exception as e:  # noqa: BLE001
             log.warning("alert not delivered (%s): %s", e, text)
 
-    def fail(self, post: dict[str, Any], message: str, alert: bool = True) -> str:
+    def fail(self, post: dict[str, Any], message: str, alert: bool = True, terminal: bool = False) -> str:
+        """`terminal=True` flags the row no_retry: no later pass may touch it again."""
         msg = redact(message)[:900]
-        set_status(post["id"], STATUS_FAILED, db_path=self.db_path, error_message=msg)
+        extra = {"no_retry": 1} if terminal else {}
+        set_status(post["id"], STATUS_FAILED, db_path=self.db_path, error_message=msg, **extra)
         db.log_stage(post["item_id"], "posting", "failure", message=f"{post['platform']}: {msg}", db_path=self.db_path)
         if alert:
             self.alert(
@@ -564,6 +652,8 @@ class Publisher:
             raise PublishError(f"no post row {post_id}")
         if post["status"] in (STATUS_LIVE, STATUS_DRY_RUN):
             return post["status"]
+        if post["status"] == STATUS_FAILED and post.get("no_retry"):
+            return STATUS_FAILED   # failed for good (e.g. unknown remote state): never sent again
 
         paused, why = meta_paused(self.db_path)
         if paused:
@@ -577,7 +667,8 @@ class Publisher:
         attempts = int(post.get("attempt_count") or 0) + 1
         if attempts > self.max_attempts:
             return self.fail(
-                post, f"gave up after {self.max_attempts} attempts (last status {post['status']})"
+                post, f"gave up after {self.max_attempts} attempts (last status {post['status']})",
+                terminal=True,
             )
         update_post(post_id, db_path=self.db_path, attempt_count=attempts)
         post["attempt_count"] = attempts
@@ -967,10 +1058,11 @@ class Publisher:
                 return self.publish(post_id, item)
             return STATUS_PENDING
 
-        # Unknown: never publish again.
+        # Unknown: never publish again - not now, and not on any later pass either (no_retry).
         return self.fail(
             post,
             f"remote state unknown after a crash in 'publishing'; not re-published. {json.dumps(detail)[:400]}",
+            terminal=True,
         )
 
 
@@ -1021,9 +1113,10 @@ def run_posting_for_item(
     item = db.get_item(item_id, db_path=db_path)
     if not item:
         raise PublishError(f"no item {item_id}")
-    if not db.is_releasable(item):
+    refusal = refusal_reason(item, cfg)
+    if refusal:
         # Explicit, before any row is written: posting never relies on the trigger to say no.
-        raise PublishError(f"item {item_id} is preview_only and is never posted")
+        raise PublishError(refusal)
 
     ensure_post_rows(item, slot_datetime=slot_datetime, cfg=cfg, db_path=db_path)
     publisher = publisher or Publisher(cfg=cfg, db_path=db_path)
@@ -1033,7 +1126,7 @@ def run_posting_for_item(
     for post in get_posts_for_item(item_id, db_path=db_path):
         if post["platform"] not in wanted:
             continue
-        if post["status"] in (STATUS_LIVE, STATUS_DRY_RUN):
+        if post["status"] in (STATUS_LIVE, STATUS_DRY_RUN) or is_terminal_failure(post, cfg):
             results[post["platform"]] = post["status"]
             continue
         try:
@@ -1043,38 +1136,106 @@ def run_posting_for_item(
             break
 
     final = {p: results.get(p) for p in wanted}
+    rows = [r for r in get_posts_for_item(item_id, db_path=db_path) if r["platform"] in wanted]
+    done_for_good = bool(rows) and len(rows) == len(wanted) and all(
+        r["status"] == STATUS_LIVE or is_terminal_failure(r, cfg) for r in rows
+    )
     if final and all(s == STATUS_LIVE for s in final.values()):
         db.transition_stage(item_id, "posted", db_path=db_path)
         db.log_stage(item_id, "posting", "success", message=f"posted: {final}", db_path=db_path)
     elif final and all(s == STATUS_DRY_RUN for s in final.values()):
         # A dry run must not advance the item: it still has to post for real once dry_run is off.
         log.info("item %s completed the flow in dry run; its stage is unchanged: %s", item_id, final)
+    elif done_for_good and any(r["status"] == STATUS_LIVE for r in rows):
+        # Live on one platform, given up on the other: the item is out, and it is measured.
+        db.transition_stage(item_id, "posted", db_path=db_path)
+        db.log_stage(item_id, "posting", "success",
+                     message=f"posted on some platforms only; the rest failed for good: {final}", db_path=db_path)
+    elif done_for_good:
+        # Every platform failed for good: take the item out of the queue so it frees its slot
+        # and is not retried every cycle forever.
+        db.mark_failed(item_id, "posting", f"every platform failed for good: {final}", db_path=db_path)
+        db.log_stage(item_id, "posting", "failure", message=f"gave up: {final}", db_path=db_path)
     else:
         log.info("item %s not fully posted yet: %s", item_id, final)
     return results
+
+
+def due_items(now: datetime, db_path: Any = None) -> list[dict[str, Any]]:
+    """Queued, releasable items whose slot has come, earliest slot first.
+
+    Items whose rows are all `dry_run` already walked the flow in a dry run and are left alone.
+    """
+    with db.db(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT i.*, MIN(p.slot_datetime) AS slot
+            FROM items i JOIN posts p ON p.item_id = i.id
+            WHERE i.stage = 'queued' AND {db.RELEASABLE_SQL.replace("id NOT LIKE", "i.id NOT LIKE")}
+            GROUP BY i.id
+            HAVING slot <= ? AND SUM(CASE WHEN p.status != 'dry_run' THEN 1 ELSE 0 END) > 0
+            ORDER BY slot ASC, i.discovery_score DESC
+            """,
+            (clock.iso(now),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def last_live_at(exclude_item_id: str | None = None, db_path: Any = None) -> str | None:
+    """When the most recent post of any OTHER item went live."""
+    with db.db(db_path) as conn:
+        row = conn.execute(
+            "SELECT MAX(posted_at) AS last FROM posts WHERE status = 'live' AND item_id != ?",
+            (exclude_item_id or "",),
+        ).fetchone()
+        return row["last"] if row else None
 
 
 def run_posting_stage(
     cfg: dict[str, Any] | None = None,
     db_path: Any = None,
     publisher: Publisher | None = None,
-    limit: int | None = None,
+    limit: int | None = 1,
+    now: datetime | None = None,
 ) -> dict[str, dict[str, str]]:
-    """One posting pass: settle crashed rows, then post approved / queued items."""
+    """One posting pass: settle crashed rows, then post the queued item(s) whose slot has come.
+
+    Only `queued` items are posted, and only at their slot (the scheduler turns `approved` into
+    `queued`). Three rules keep a sleeping laptop from double- or burst-posting:
+      * a post that is already underway (a row `publishing` or `live`) is finished, never restarted;
+      * a post that has not started and whose slot is more than `posting.missed_slot_grace_minutes`
+        old is NOT sent late - it is left for the scheduler to move to the next free slot;
+      * at most `limit` not-yet-started items are begun per pass, and none within
+        `posting.min_gap_hours` of another item's live post.
+    """
     cfg = cfg or config.get_config()
+    now = now or clock.utcnow()
     paused, why = meta_paused(db_path)
     if paused:
         log.warning("meta is paused; no posting this pass: %s", why)
         return {}
 
     publisher = publisher or Publisher(cfg=cfg, db_path=db_path)
+    reset_dry_run_rows(cfg=cfg, db_path=db_path)
     settle_publishing_rows(cfg=cfg, db_path=db_path, publisher=publisher)
 
+    min_gap_s = float((cfg.get("posting") or {}).get("min_gap_hours", 3.0)) * 3600.0
     out: dict[str, dict[str, str]] = {}
-    todo: list[dict[str, Any]] = []
-    for stage in ("approved", "queued"):
-        todo.extend(db.get_items_by_stage(stage, db_path=db_path, releasable_only=True))
-    for item in todo[: limit or len(todo)]:
+    begun = 0
+    for item in due_items(now, db_path=db_path):
+        rows = get_posts_for_item(item["id"], db_path=db_path)
+        underway = any(r["status"] in STARTED_STATUSES for r in rows)
+        if not underway:
+            if slot_is_missed(rows, now, cfg):
+                log.info("item %s missed its slot %s; the scheduler will re-slot it", item["id"], item["slot"])
+                continue
+            if limit is not None and begun >= limit:
+                continue
+            last = last_live_at(exclude_item_id=item["id"], db_path=db_path)
+            if last and (now - clock.parse(last)).total_seconds() < min_gap_s:
+                log.info("item %s held back: another post went live at %s (min gap)", item["id"], last)
+                continue
+            begun += 1
         try:
             out[item["id"]] = run_posting_for_item(item["id"], cfg=cfg, db_path=db_path, publisher=publisher)
         except RateLimitError:

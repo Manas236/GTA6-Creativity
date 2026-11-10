@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import requests
 
-from pipeline import db, posting, rate_limit
+from pipeline import clock, db, posting, rate_limit
 from pipeline.errors import RateLimitError
 
 IG_USER = "17841400000000000"
@@ -161,6 +161,12 @@ def make_item(tmp_db: Path, tmp_path: Path, item_id: str = "item-1", variant: st
         db_path=tmp_db,
     )
     return db.get_item(item_id, db_path=tmp_db)
+
+
+def queue_item(tmp_db, cfg, item: dict[str, Any], slot: str) -> None:
+    """What the scheduler does: post rows at `slot`, item moved to `queued`."""
+    posting.ensure_post_rows(item, slot_datetime=slot, cfg=cfg, db_path=tmp_db)
+    db.transition_stage(item["id"], "queued", db_path=tmp_db)
 
 
 def happy_routes() -> dict[str, Any]:
@@ -877,22 +883,26 @@ def test_posting_filters_preview_only_items_without_relying_on_the_trigger(tmp_d
 def test_a_trigger_refusal_fails_that_one_item_and_the_next_item_still_posts(tmp_db, tmp_path, cfg, secrets, monkeypatch):
     bad = make_item(tmp_db, tmp_path, "item-bad")
     good = make_item(tmp_db, tmp_path, "item-good")
+    ig_only(cfg)
+    for it, slot in ((bad, "2026-11-10T07:30:00Z"), (good, "2026-11-10T07:31:00Z")):
+        queue_item(tmp_db, cfg, it, slot)
     with db.db(tmp_db) as conn:   # any posts write for item-bad is refused, as the real trigger would
         conn.execute(
-            "CREATE TRIGGER refuse_bad BEFORE INSERT ON posts WHEN NEW.item_id = 'item-bad' "
+            "CREATE TRIGGER refuse_bad BEFORE UPDATE ON posts WHEN NEW.item_id = 'item-bad' "
             "BEGIN SELECT RAISE(ABORT, 'preview_only item cannot be posted'); END"
         )
     transport = FakeTransport(happy_routes())
-    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+    now = clock.parse("2026-11-10T07:35:00Z")
 
-    out = posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher)   # must not raise
+    out = posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher, now=now, limit=None)
 
     failed = db.get_item(bad["id"], db_path=tmp_db)
     assert failed["stage"] == "failed" and failed["error_stage"] == "posting"
     assert "refused by the database" in failed["error_message"]
     assert out == {good["id"]: {"instagram": "live"}}
     # the refused item left the queue: a second pass has nothing to trip over
-    assert posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher) == {}
+    assert posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher, now=now) == {}
 
 
 def test_the_real_trigger_raises_an_error_posting_recognises(tmp_db, tmp_path):

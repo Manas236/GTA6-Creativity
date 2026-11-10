@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import db
+from . import clock, db
 
 log = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ def is_source_paused(source: str, db_path: Any = None) -> tuple[bool, str]:
             return False, ""
         
         paused_until = db.parse_ts(row["paused_until"])
-        now_dt = datetime.now(timezone.utc)
+        now_dt = clock.utcnow()
         if now_dt < paused_until:
             rem_s = (paused_until - now_dt).total_seconds()
             return True, f"Paused for {rem_s / 3600:.1f}h more due to: {row['last_error']}"
@@ -29,7 +29,7 @@ def record_error(
     source: str, error_msg: str, pause_hours: float = 1.0, db_path: Any = None
 ) -> None:
     """Record an error and pause the source."""
-    now_dt = datetime.now(timezone.utc)
+    now_dt = clock.utcnow()
     paused_until_dt = now_dt + timedelta(hours=pause_hours)
     paused_until_ts = paused_until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     ts = db.now()

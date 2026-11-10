@@ -547,3 +547,115 @@ def test_the_card_sends_the_renders_of_the_items_own_style_preset(tmp_db, tmp_pa
     videos = transport.of("sendVideo")
     assert "Style preset: P2" in videos[0]["caption"]
     assert "P2" in videos[1]["caption"]
+
+
+# ---------------------------------------------------------------------------
+# CP4: Telegram approval for week 1, then auto, with one notice
+# ---------------------------------------------------------------------------
+
+def test_approval_stays_on_telegram_until_seven_days_after_the_first_live_post(tmp_db, tmp_path, cfg, fake_clock):
+    cfg["approval"]["switch_to_auto_after_days"] = 7
+    assert telegram_bot.effective_mode(cfg, tmp_db) == "telegram"            # nothing live yet
+
+    fake_clock.set("2027-01-01T00:00:00Z")                                   # months pass with no live post
+    assert telegram_bot.effective_mode(cfg, tmp_db) == "telegram"
+
+    db.kv_set(db.K_FIRST_LIVE, "2027-01-01T00:00:00Z", db_path=tmp_db)       # first live post
+    fake_clock.set("2027-01-07T23:59:00Z")
+    assert telegram_bot.effective_mode(cfg, tmp_db) == "telegram"
+    fake_clock.set("2027-01-08T00:00:00Z")
+    assert telegram_bot.effective_mode(cfg, tmp_db) == "auto"
+    assert db.kv_get(telegram_bot.K_AUTO_SINCE, db_path=tmp_db) == "2027-01-08T00:00:00Z"
+
+
+def test_the_switch_sends_exactly_one_notice_closes_the_open_card_and_uses_the_quality_gate(tmp_db, tmp_path, cfg, fake_clock):
+    cfg["approval"]["switch_to_auto_after_days"] = 7
+    make_item(tmp_db, tmp_path, "item-good", score=0.9)
+    make_item(tmp_db, tmp_path, "item-ungrounded", score=0.5, grounded=0)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot, poll_timeout=1, probe=lambda p: 20.0)
+    assert telegram_bot.card_state(tmp_db)["item_id"] == "item-good"         # week 1: a card is open
+
+    db.kv_set(db.K_FIRST_LIVE, "2026-11-01T00:00:00Z", db_path=tmp_db)
+    fake_clock.set("2026-11-08T00:00:01Z")
+    results = [
+        telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot, poll_timeout=1, probe=lambda p: 20.0)
+        for _ in range(3)
+    ]
+
+    assert [r["mode"] for r in results] == ["auto"] * 3
+    assert [r["switch_notice_sent"] for r in results] == [True, False, False]
+    notices = [p["text"] for p in transport.of("sendMessage") if "Approvals are now automatic" in p["text"]]
+    assert len(notices) == 1 and "7 days" in notices[0]
+    assert telegram_bot.card_state(tmp_db) is None                           # the open card was retired
+    assert any("Auto approval took over" in p.get("caption", "") for p in transport.of("editMessageCaption"))
+    # auto mode is the existing quality gate
+    assert db.get_item("item-good", db_path=tmp_db)["approval_type"] == "auto_approved"
+    bad = db.get_item("item-ungrounded", db_path=tmp_db)
+    assert bad["stage"] == "rejected" and "auto_quality_gate" in bad["rejection_reason"]
+    assert transport.methods().count("getUpdates") == 1                      # no more polling once auto
+
+
+def test_a_notice_that_could_not_be_delivered_is_retried_and_still_sent_only_once(tmp_db, tmp_path, cfg, fake_clock):
+    cfg["approval"]["switch_to_auto_after_days"] = 7
+    db.kv_set(db.K_FIRST_LIVE, "2026-11-01T00:00:00Z", db_path=tmp_db)
+    fake_clock.set("2026-11-09T00:00:00Z")
+    transport = FakeTransport()
+    transport.raise_on["sendMessage"] = telegram_bot.TelegramError("sendMessage", 502, "bad gateway")
+    bot = make_bot(tmp_db, cfg, transport)
+
+    first = telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot)
+    assert first["mode"] == "auto" and first["switch_notice_sent"] is False  # auto regardless of the notice
+    transport.raise_on.clear()
+    assert telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot)["switch_notice_sent"] is True
+    assert telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot)["switch_notice_sent"] is False
+
+
+def test_switch_to_auto_can_be_turned_off_and_that_undoes_a_switch(tmp_db, tmp_path, cfg, fake_clock):
+    db.kv_set(db.K_FIRST_LIVE, "2026-10-01T00:00:00Z", db_path=tmp_db)
+    cfg["approval"]["switch_to_auto_after_days"] = 7
+    assert telegram_bot.effective_mode(cfg, tmp_db) == "auto"
+    cfg["approval"]["switch_to_auto_after_days"] = None
+    assert telegram_bot.effective_mode(cfg, tmp_db) == "telegram"
+    cfg["approval"]["mode"] = "auto"
+    assert telegram_bot.effective_mode(cfg, tmp_db) == "auto"
+
+
+def test_an_untapped_synthetic_dry_run_card_does_not_block_real_cards(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "synthetic-cp3-1", score=0.1)
+    make_item(tmp_db, tmp_path, "item-real", score=0.9)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.send_card(db.get_item("synthetic-cp3-1", db_path=tmp_db))            # what scripts/cp3_dry_run.py does
+    assert telegram_bot.card_state(tmp_db)["item_id"] == "synthetic-cp3-1"
+
+    result = telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot, poll_timeout=1)
+
+    assert result["card_sent"] == "item-real"
+    assert db.get_item("synthetic-cp3-1", db_path=tmp_db)["stage"] == "rejected"
+
+
+def test_a_tap_on_the_synthetic_card_is_still_honoured_before_it_is_released(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "synthetic-cp3-1")
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.send_card(db.get_item("synthetic-cp3-1", db_path=tmp_db))
+    transport.updates.append([tap("synthetic-cp3-1", "ok", telegram_bot.card_state(tmp_db)["mid"])])
+
+    telegram_bot.run_approval_stage(cfg=cfg, db_path=tmp_db, bot=bot, poll_timeout=1)
+
+    assert db.get_item("synthetic-cp3-1", db_path=tmp_db)["stage"] == "approved"   # the tap counted
+    assert telegram_bot.card_state(tmp_db) is None
+
+
+def test_two_different_alerts_alternating_are_each_still_rate_limited(tmp_db, cfg, fake_clock):
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    sent = [bot.alert(f"stage {k} failed", key=k) for k in ("a", "b", "a", "b")]
+    assert sent == [True, True, False, False]
+    fake_clock.advance(hours=1, seconds=1)
+    assert bot.alert("stage a failed", key="a") is True
+    assert bot.alert("once only", key="once", repeat_gap_s=None) is True
+    fake_clock.advance(days=3)
+    assert bot.alert("once only", key="once", repeat_gap_s=None) is False

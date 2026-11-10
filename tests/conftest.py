@@ -7,7 +7,7 @@ from typing import Any, Generator
 
 import pytest
 
-from pipeline import config, db
+from pipeline import clock, config, db
 
 
 REAL_MEDIA_ROOT = config.ROOT_DIR / "media"
@@ -41,6 +41,23 @@ def isolated_media(tmp_path: Path) -> Generator[Path, None, None]:
         yield root
     finally:
         config.set_media_root(None)
+
+
+@pytest.fixture
+def fake_clock() -> Generator[clock.FakeClock, None, None]:
+    """A settable pipeline clock, starting Tuesday 10 Nov 2026 06:00 UTC (11:30 in Kolkata)."""
+    fc = clock.FakeClock("2026-11-10T06:00:00Z")
+    clock.set_clock(fc)
+    try:
+        yield fc
+    finally:
+        clock.set_clock(None)
+
+
+@pytest.fixture(autouse=True)
+def _real_clock_after_each_test() -> Generator[None, None, None]:
+    yield
+    clock.set_clock(None)
 
 
 @pytest.fixture
