@@ -397,10 +397,12 @@ analytics:
       comments: "post_video_social_actions.COMMENT" # one key of a breakdown
       shares: "post_video_social_actions.SHARE"
 
+# Disk retention (pipeline/cleanup.py). Nothing a pending / publishing post still needs is ever
+# deleted, and only files inside media/ are touched.
 retention:
-  purge_downloads_immediately: true
-  purge_renders_after_days: 7
-  purge_rejected_failed_after_days: 3
+  purge_downloads_immediately: true # the source download goes once the item is rendered
+  purge_renders_after_days: 7 # renders, cut, voiceover and subtitles, counted from the live post
+  purge_rejected_failed_after_days: 3 # all media of a rejected / failed item
 
 orchestrator:
   loop_interval_seconds: 60

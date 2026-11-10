@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any
 
-from . import analytics, config, cut, db, discover, download, hooks, posting, render, scheduler, telegram_bot, voiceover
+from . import analytics, cleanup, config, cut, db, discover, download, hooks, posting, render, scheduler, telegram_bot, voiceover
 
 logging.basicConfig(
     level=logging.INFO,
@@ -219,6 +219,10 @@ def _stage_analytics(cfg: dict[str, Any], db_path: Any) -> Any:
     return analytics.run_analytics_stage(cfg=cfg, db_path=db_path)
 
 
+def _stage_cleanup(cfg: dict[str, Any], db_path: Any) -> Any:
+    return cleanup.run_cleanup_stage(cfg=cfg, db_path=db_path)
+
+
 #: The cycle, in order. Each entry runs in its own try/except (see run_stages).
 STAGES: list[tuple[str, Any]] = [
     ("settle", _stage_settle),
@@ -230,11 +234,12 @@ STAGES: list[tuple[str, Any]] = [
     ("schedule", _stage_schedule),
     ("post", _stage_post),
     ("analytics", _stage_analytics),
+    ("cleanup", _stage_cleanup),
 ]
 
 
 #: Single-stage CLI commands that just run one stage function under the lock.
-EXTRA_COMMANDS: dict[str, Any] = {"analytics": _stage_analytics}
+EXTRA_COMMANDS: dict[str, Any] = {"analytics": _stage_analytics, "cleanup": _stage_cleanup}
 
 
 def run_stages(
@@ -353,6 +358,7 @@ def main() -> None:
     subparsers.add_parser("schedule", help="Give approved items a variant and the next free posting slot")
     subparsers.add_parser("post", help="Settle crashed publishes, schedule, then post items whose slot has come")
     subparsers.add_parser("analytics", help="Take due 24h/72h snapshots and rebuild ab_learning")
+    subparsers.add_parser("cleanup", help="Apply disk retention (source, renders, rejected/failed media)")
     subparsers.add_parser("cycle", help="Run complete pipeline cycle")
     loop_parser = subparsers.add_parser("loop", help="The long-running process: every stage in order, forever")
     loop_parser.add_argument("--interval", type=float, default=None, help="Seconds between cycles")

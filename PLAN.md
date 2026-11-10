@@ -1005,6 +1005,14 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 110. **`ab_learning.weight`**: for `variant` it is the allocation probability the scheduler will really use (0.5/0.5, or 0.8/0.2), written from the same `scheduler.variant_probabilities()`; for the other dimensions it is that value's share of the dimension's total score. Only `variant` drives a decision today; the other four dimensions are measured for the weekly read-out and for later use in discovery weights.
 111. **Analytics requests are GETs through the posting client**, so they share its pacing, retries and the source-wide 429 pause, and they are allowed in a dry run — where there are no live posts, so nothing is requested.
 
+### CP4: cleanup
+
+112. **"Renders" means everything made for the post**: 7 days after the live post the two renders go together with the cut, the voiceover wav and the item's subtitle files — none of them has a use once the renders are gone. The 7 days count from the **last** platform's `posted_at`.
+113. **What "still needed by a post" means**: an item with any row `pending`, `uploading`, `container_ready`, `publishing`, or `failed` with retries left keeps every file, under both the 7-day and the 3-day rule (e.g. Instagram live a month ago but Facebook still open, or an item marked `failed` while a row is mid-publish). A row that failed for good (#89/#90) no longer protects anything.
+114. **Cleanup only deletes what it can prove is ours**: only paths recorded on the item row (plus `media/subtitles/<item_id>_*`), only if the resolved path lies inside the media folder (a `..` or an absolute path elsewhere is logged and left, pointer intact), and never a file another item row still points at (the CP3 dry-run items all share one synthetic render pair). The column is set to NULL only once the file is really gone.
+115. **`cleaned` is only reached from `measured`**: a `posted` item past retention loses its files but keeps its stage until analytics has finished with it (only matters if `purge_renders_after_days` is set below the 72 h + 12 h measurement window), then becomes `cleaned` on a later pass.
+116. **Cleanup runs in dry run too, and skips `preview_only`**: it only touches local files and `app.dry_run` is about public posting. In a dry run nothing is ever `posted`, so only the source-after-render and rejected/failed rules can fire. `preview_only` items belong to the style previews and are never cleaned by the pipeline.
+
 ---
 
 ## 14. Checkpoint 1 Re-Proof Verification Data
