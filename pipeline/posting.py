@@ -269,8 +269,11 @@ class MetaClient:
         return max(wait, 0.0)
 
     # ------------------------------------------------------------- sending
-    def request(self, method: str, url: str, **kwargs: Any) -> Any:
-        """One paced request, retried on 5xx and network errors with capped exponential backoff."""
+    def request(self, method: str, url: str, *, retry: bool = True, **kwargs: Any) -> Any:
+        """One paced request, retried on 5xx and network errors with capped exponential backoff.
+
+        retry=False is for the publish calls: they are not idempotent, and a lost response may
+        mean the post went out, so they are sent once and the caller settles from the remote."""
         attempt = 0
         while True:
             self.wait_turn()
@@ -278,13 +281,13 @@ class MetaClient:
                 resp = self.transport(method, url, **kwargs)
             except requests.RequestException as e:
                 e.args = tuple(redact(a) for a in e.args) or (redact(e),)
-                if attempt >= self.max_retries:
+                if not retry or attempt >= self.max_retries:
                     raise
                 self._backoff(attempt, f"network error: {redact(e)}")
                 attempt += 1
                 continue
             status = int(getattr(resp, "status_code", 200))
-            if status >= 500 and attempt < self.max_retries:
+            if retry and status >= 500 and attempt < self.max_retries:
                 self._backoff(attempt, f"HTTP {status}")
                 attempt += 1
                 continue
@@ -766,6 +769,15 @@ class Publisher:
             self.alert(f"Meta paused for {self.client.pause_hours:.0f}h: {redact(e)[:300]}", key="meta_rate_limit")
             raise
         except (PublishError, requests.RequestException, OSError) as e:
+            current = get_post(post_id, db_path=self.db_path) or post
+            if current["status"] == STATUS_PUBLISHING:
+                # The publish call itself went wrong: Meta may have published anyway (a lost
+                # response). Never mark this retryable - leave it `publishing` so the next pass
+                # settles it from the remote state, which never publishes twice (call #60).
+                update_post(post_id, db_path=self.db_path, error_message=redact(f"{type(e).__name__}: {e}")[:900])
+                log.warning("%s publish call failed for %s (%s); left publishing, to be settled from the remote",
+                            post["platform"], post["item_id"], type(e).__name__)
+                return STATUS_PUBLISHING
             return self.fail(post, f"{type(e).__name__}: {e}")
 
     # ------------------------------------------------------------- instagram
@@ -841,7 +853,8 @@ class Publisher:
                          message=f"instagram dry run, {len(plan.steps)} planned requests", db_path=self.db_path)
             return STATUS_DRY_RUN
 
-        published = self.client.check(self.client.post(publish_url, data=publish_params, timeout=60), "media_publish")
+        published = self.client.check(
+            self.client.post(publish_url, data=publish_params, timeout=60, retry=False), "media_publish")
         media_id = published["id"]
         link, when = self._ig_media_details(media_id, token)
         set_status(
@@ -949,7 +962,8 @@ class Publisher:
                          message=f"facebook dry run, {len(plan.steps)} planned requests", db_path=self.db_path)
             return STATUS_DRY_RUN
 
-        finished = self.client.check(self.client.post(reels_url, data=finish_params, timeout=60), "FB reels finish")
+        finished = self.client.check(
+            self.client.post(reels_url, data=finish_params, timeout=60, retry=False), "FB reels finish")
         if not finished.get("success", True):
             return self.fail(post, f"FB reels finish refused: {finished}")
         published_at = db.now()

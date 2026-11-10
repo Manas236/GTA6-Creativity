@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any
 
-from . import analytics, cleanup, config, cut, db, discover, download, hooks, posting, render, scheduler, telegram_bot, voiceover
+from . import analytics, cleanup, config, cut, db, discover, download, healthcheck, hooks, posting, render, scheduler, telegram_bot, voiceover
 
 logging.basicConfig(
     level=logging.INFO,
@@ -223,6 +223,9 @@ def _stage_cleanup(cfg: dict[str, Any], db_path: Any) -> Any:
     return cleanup.run_cleanup_stage(cfg=cfg, db_path=db_path)
 
 
+#: Healthchecks.io transport; None = requests. Tests and scripts/cp4_dry_run.py replace it.
+healthcheck_transport: Any = None
+
 #: The cycle, in order. Each entry runs in its own try/except (see run_stages).
 STAGES: list[tuple[str, Any]] = [
     ("settle", _stage_settle),
@@ -292,6 +295,7 @@ def run_single_cycle(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
         log.info("Starting pipeline cycle...")
         result = run_stages(cfg, db_path)
         log.info("Cycle finished in %.2fs (%s)", result["duration_s"], result["status"])
+        result["healthcheck"] = healthcheck.ping(result, cfg=cfg, transport=healthcheck_transport)
         return result
     finally:
         release_lock(db_path=db_path)
@@ -328,6 +332,8 @@ def run_loop(
                 result = run_stages(cfg, db_path)
                 log.info("Cycle %d: %s%s", cycles + 1, result["status"],
                          f" (failed stages: {sorted(result['errors'])})" if result["errors"] else "")
+                # Dead-man switch: only after a fully successful cycle; never raises.
+                healthcheck.ping(result, cfg=cfg, transport=healthcheck_transport)
             except KeyboardInterrupt:
                 raise
             except Exception:  # noqa: BLE001 - run_stages already isolates; this is the last net

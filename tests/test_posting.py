@@ -915,3 +915,37 @@ def test_the_real_trigger_raises_an_error_posting_recognises(tmp_db, tmp_path):
     with pytest.raises(sqlite3.IntegrityError) as err:
         db.transition_stage(item["id"], "approved", db_path=tmp_db)
     assert db.is_trigger_refusal(err.value)
+
+
+def test_a_lost_publish_response_is_never_retried_and_settles_live_without_a_second_publish(tmp_db, tmp_path, cfg, secrets):
+    """Meta published, but the response to media_publish was lost (network error). The call is
+    not retried in flight, the row stays `publishing`, and the next pass settles it from the
+    remote: live, with exactly one media_publish ever sent."""
+    ig_only(cfg)
+    item = make_item(tmp_db, tmp_path)
+    posting.ensure_post_rows(item, cfg=cfg, db_path=tmp_db)
+    state = {"published": False}
+
+    def media_publish(method, url, kwargs):
+        state["published"] = True                       # Meta did publish...
+        raise requests.ConnectionError("connection reset")   # ...but the answer never arrived
+
+    routes = happy_routes()
+    routes[f"/{IG_USER}/media_publish"] = media_publish
+    routes["/container-abc"] = lambda m, u, k: FakeResponse(
+        {"status_code": "PUBLISHED" if state["published"] else "FINISHED"})
+    routes[f"/{IG_USER}/media"] = lambda m, u, k: FakeResponse(
+        {"id": "container-abc"} if m == "POST" else
+        {"data": [{"id": "media-999", "caption": post_row(tmp_db, item["id"], "instagram")["caption_text"],
+                   "timestamp": "2099-01-01T00:00:00+0000", "permalink": "https://instagram.com/reel/xyz"}]})
+    transport = FakeTransport(routes)
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+
+    row = post_row(tmp_db, item["id"], "instagram")
+    assert publisher.publish(row["id"], item) == posting.STATUS_PUBLISHING
+    assert len(transport.sent("media_publish")) == 1                 # not retried in flight
+    assert post_row(tmp_db, item["id"], "instagram")["status"] == posting.STATUS_PUBLISHING
+
+    assert publisher.publish(row["id"], item) == posting.STATUS_LIVE   # the next pass settles it
+    done = post_row(tmp_db, item["id"], "instagram")
+    assert done["remote_id"] == "media-999" and len(transport.sent("media_publish")) == 1

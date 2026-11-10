@@ -1,0 +1,37 @@
+# systemd unit for the GTA 6 clipping pipeline's one long-running process (`runner loop`).
+#
+# Install (as root), after the steps in README.md "Moving to a server":
+#   cp deploy/gta6-pipeline.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now gta6-pipeline
+#   journalctl -u gta6-pipeline -f            # follow the logs
+#
+# Edit User= and the two /opt/gta6-pipeline paths if you installed elsewhere.
+
+[Unit]
+Description=GTA 6 clipping pipeline (runner loop)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=gta6
+Group=gta6
+WorkingDirectory=/opt/gta6-pipeline
+# Secrets come from /opt/gta6-pipeline/.env, which pipeline/config.py reads itself.
+# Nothing secret belongs in this file.
+ExecStart=/opt/gta6-pipeline/.venv/bin/python -m pipeline.runner loop
+Environment=PYTHONUNBUFFERED=1
+# SIGINT, not SIGTERM: the loop turns it into KeyboardInterrupt and releases its database lock
+# on the way out. If it is killed anyway, the next start sees the dead PID and takes the lock.
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=always
+RestartSec=30
+# A render can hold a few hundred MB; keep the box responsive if something runs away.
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
