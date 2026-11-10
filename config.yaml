@@ -29,11 +29,16 @@ sources:
       - "UCWOA1ZGywLbqmigxE4Qlvvw" # Netflix
       - "UCKy1dAqELo0zrOtPkf0eTMw" # IGN
       - "UCbu2SsF-Or3Rsn3NxBNL00g" # GameSpot
-  twitch:
-    enabled: false # Active from launch (19 Nov 2026)
-    game_name: "Grand Theft Auto VI"
+  twitch: # Helix clips for the game category; downloaded by yt-dlp, scored and deduped like YouTube
+    enabled: false # true forces Twitch on now; false = follow enable_from
+    enable_from: "2026-11-19" # auto-enabled from this date (UTC), the GTA VI launch. null = never
+    game_name: "Grand Theft Auto VI" # resolved to a game id through Helix and cached
+    game_id: null # set to pin the id and skip the lookup
     weight: 1.10
-    limit: 20
+    limit: 20 # clips per run (Helix returns them by view count, max 100)
+    lookback_hours: 48 # only clips created in this window
+    languages: ["en"] # [] = any language
+    min_views: 0
   kick:
     enabled: false
     # Official API at api.kick.com/public has no clips endpoint.

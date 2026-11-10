@@ -188,12 +188,32 @@ def discover_youtube(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
 # Scoring & Insertion
 # ---------------------------------------------------------------------------
 
+def gather_candidates(cfg: dict[str, Any], db_path: Any = None) -> list[dict[str, Any]]:
+    """Unscored candidates from every source. One source failing never stops another."""
+    from . import twitch   # local import: twitch pulls in nothing discover needs at import time
+
+    candidates: list[dict[str, Any]] = []
+    for name, fn in (("youtube", discover_youtube), ("twitch", twitch.discover_twitch)):
+        try:
+            found = fn(cfg, db_path)
+        except Exception as e:  # noqa: BLE001 - isolate the source
+            log.error("%s discovery failed: %s", name, e)
+            found = []
+        candidates.extend(found)
+    return candidates
+
+
 def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> list[dict[str, Any]]:
-    """Execute discovery, compute percentile discovery scores with real decay, and write to DB."""
+    """Execute discovery, compute percentile discovery scores with real decay, and write to DB.
+
+    Every source goes through the same scoring: its raw velocity is percentile-ranked within
+    that SOURCE's own rolling pool (so Twitch clip views are never ranked against YouTube video
+    views), then decayed and weighted by the one config formula.
+    """
     cfg = cfg or config.get_config()
     db.init_db(db_path)
 
-    all_candidates = discover_youtube(cfg, db_path)
+    all_candidates = gather_candidates(cfg, db_path)
     if not all_candidates:
         log.info("No candidates discovered.")
         return []
@@ -205,14 +225,18 @@ def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> lis
     )
     half_life = float(disc_cfg.get("half_life_hours", 36.0))
     velocity_power = float(disc_cfg.get("velocity_power", 1.2))
+    pool_size = int(disc_cfg.get("rolling_pool_size", 100))
 
-    # Rolling pool for percentile rank calculation
-    db_velocities = db.get_recent_source_velocities("youtube", limit=100, db_path=db_path)
-    combined_pool = db_velocities + [i["raw_velocity"] for i in all_candidates]
+    # Rolling pool for percentile rank calculation, one per source
+    pools: dict[str, list[float]] = {}
+    for source in {i["source"] for i in all_candidates}:
+        pools[source] = db.get_recent_source_velocities(source, limit=pool_size, db_path=db_path) + [
+            i["raw_velocity"] for i in all_candidates if i["source"] == source
+        ]
 
     scored_items: list[dict[str, Any]] = []
     for item in all_candidates:
-        p_rank = _compute_percentile(item["raw_velocity"], combined_pool)
+        p_rank = _compute_percentile(item["raw_velocity"], pools[item["source"]])
         age_h = item["age_hours"]
         eff_weight = item["effective_weight"]
         decay = 0.5 ** (age_h / half_life)

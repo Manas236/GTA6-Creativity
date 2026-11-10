@@ -1013,6 +1013,15 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 115. **`cleaned` is only reached from `measured`**: a `posted` item past retention loses its files but keeps its stage until analytics has finished with it (only matters if `purge_renders_after_days` is set below the 72 h + 12 h measurement window), then becomes `cleaned` on a later pass.
 116. **Cleanup runs in dry run too, and skips `preview_only`**: it only touches local files and `app.dry_run` is about public posting. In a dry run nothing is ever `posted`, so only the source-after-render and rejected/failed rules can fire. `preview_only` items belong to the style previews and are never cleaned by the pipeline.
 
+### CP4: Twitch discovery
+
+117. **Twitch switches itself on by date**: `sources.twitch.enable_from: "2026-11-19"` is compared with the current **UTC** date (so it begins 05:30 on launch day in India); `enabled: true` forces it on earlier, `enable_from: null` with `enabled: false` keeps it off. No config edit is needed on launch day.
+118. **Missing Twitch credentials = skip + one alert, ever**: `discover_twitch` never raises. Without `TWITCH_CLIENT_ID` / `TWITCH_CLIENT_SECRET` it returns no candidates and sends a single Telegram alert (key remembered permanently, `repeat_gap_s=None`); YouTube discovery carries on. A category that does not exist under the configured name is alerted once the same way; a 429 pauses the `twitch` source for 1 h; any other error is logged and returns nothing.
+119. **The app access token is kept in memory only**, never in `pipeline.db`: it is a credential, and the long-running loop needs a new one only every ~60 days (it is also refreshed once on a 401). The resolved game id *is* cached in `kv`.
+120. **Percentile pools are per source**: `run_discovery` used one pool seeded with YouTube velocities for every candidate. Twitch clip view-velocities are a different scale from YouTube's, so each source is now ranked within its own rolling pool before the shared formula applies `weight` (Twitch 1.10) and decay.
+121. **Twitch candidates**: top clips by views for the game id over `lookback_hours` (48), `limit` 20, `languages: ["en"]`; credit goes to the **broadcaster**. They are downloaded by yt-dlp from the clip URL with the same capped format selector (step 5 of #81 exists for them) and go through the same download- and cut-level dedupe.
+122. **A global test guard forbids real HTTP**: an autouse fixture makes `requests.Session.request` raise in every non-`live` test, so a test that forgets to inject a transport fails loudly instead of talking to Telegram, Meta, Twitch or Gemini (relevant once `.env` on the laptop holds real keys).
+
 ---
 
 ## 14. Checkpoint 1 Re-Proof Verification Data

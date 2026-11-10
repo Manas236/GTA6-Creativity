@@ -43,6 +43,22 @@ def isolated_media(tmp_path: Path) -> Generator[Path, None, None]:
         config.set_media_root(None)
 
 
+@pytest.fixture(autouse=True)
+def no_real_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hard stop: no test may send a real HTTP request (the `live` suite is exempt).
+    Every external API sits behind an injectable transport; a test that forgets to inject one
+    fails here instead of quietly talking to Telegram, Meta, Twitch or Gemini."""
+    if request.node.get_closest_marker("live"):
+        return
+
+    def refuse(self, method, url, *args, **kwargs):
+        raise AssertionError(f"real network call attempted in a test: {method} {str(url)[:80]}")
+
+    import requests
+
+    monkeypatch.setattr(requests.sessions.Session, "request", refuse)
+
+
 @pytest.fixture
 def fake_clock() -> Generator[clock.FakeClock, None, None]:
     """A settable pipeline clock, starting Tuesday 10 Nov 2026 06:00 UTC (11:30 in Kolkata)."""
