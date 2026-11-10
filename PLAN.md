@@ -589,10 +589,15 @@ the mp4s are not committed.
    - If FB fails while IG succeeds, the subsequent retry processes FB only.
 
 ### Creator Credit Formatting
-- **Reddit items**:
-  `{hook_text}\n\nCredit: {author_name}\nFound via r/{subreddit}\n.\n#gta6 #grandtheftauto #gta #gaming #rockstargames`
+Templates live in `config.yaml` → `posting.caption_templates` (code defaults in
+`posting.CAPTION_TEMPLATES`); an unknown source uses the YouTube one. Reddit was dropped as a
+source (Decision A), so its template was removed.
 - **YouTube items**:
   `{hook_text}\n\nCredit: {author_name}\n.\n#gta6 #grandtheftauto #gta #gaming #rockstargames`
+- **Twitch items**:
+  `{hook_text}\n\nClipped from {author_name} on Twitch\ntwitch.tv/{channel}\n.\n#gta6 #grandtheftauto #gta #gaming #rockstargames #twitchclips`
+  (`{channel}` is the broadcaster name lower-cased with non-login characters removed; the link line
+  is dropped when nothing is left, e.g. a non-Latin display name).
 
 Implemented as `posting.build_caption()`; `posting.caption_for_item()` prefers the caption the
 render stage already stored and falls back to the template. The caption is frozen onto each
@@ -950,6 +955,15 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 72. **Rate-Limit Pause Is Source-Wide**: a 429 or block pauses the whole `meta_graph` source for `posting.rate_limit_pause_hours` (3 h), not just the failing row, and the row is left at its current status rather than failed, so it resumes cleanly when the pause lifts.
 73. **Facebook Can Use Its Own Page Token**: `FB_PAGE_ACCESS_TOKEN` is read first and falls back to `IG_ACCESS_TOKEN`, since Page Reels need a PAGE token with `pages_manage_posts` while Instagram publishing needs `instagram_content_publish`; one token often covers both, but not always.
 74. **Graph API v25.0 Pinned in Config**: `posting.api_version`, `posting.graph_base` and `posting.rupload_base` are config keys, so a version bump is an edit rather than a code change.
+
+### Merge of CP3 into main, and CP3 made to respect `preview_only`
+
+75. **CP3's calls renumbered 33-47 → 60-74**: both branches had continued from 32. Main's 33-59 (style layer) keep their numbers because HANDOFF.md and the style commits already cite them; CP3's moved (+27) and its one cross-reference (#64 → call #25) still points at main's #25.
+76. **`preview_only` is filtered in the queries, not left to the trigger**: `db.get_items_by_stage(..., releasable_only=True)` is used by the Telegram card, the auto gate and the posting stage, and `send_card`, `decide`, `ensure_post_rows`, `run_posting_for_item` and `render.run_render_item` each check `db.is_releasable()` themselves. The tests drop the triggers and assert the filters still hold. The triggers stay as the last line of defence.
+77. **A trigger refusal fails that one item**: every write that a trigger could refuse (`rendered`, `awaiting_approval`, `approved`, any `posts` write) catches `sqlite3.IntegrityError`, marks that item `failed` (not a release stage, so the trigger allows it) with `error_stage` `render` / `approval` / `posting`, and carries on with the next item. A failed item is in no queue, so the next cycle cannot meet it again — no crash loop.
+78. **The card moves the item to `awaiting_approval` before it sends anything**: previously the videos went out first. If the database refuses the item, nothing has reached the chat; if the process dies after the move, `next_item_for_review` re-offers `awaiting_approval` items first, so the card is simply sent again.
+79. **The card shows the item's own `style_preset` renders**: `telegram_bot.card_renders()` returns the render paths recorded on the item (the files made with `items.style_preset`, and the files that will be posted) plus the preset name, which is printed on the card and on the Variant A message. It never picks a `media/previews/` render of another preset and never follows `style.preset` if that changed after the item was rendered. An item rendered before the style layer (NULL preset) is labelled P0, which is what those renders were.
+80. **Reddit caption template removed, Twitch template added, templates in config**: `posting.caption_templates` (`youtube`, `twitch`); the render stage now builds its caption through the same `posting.build_caption()` instead of a hard-coded string, so a Twitch item gets the Twitch credit. Twitch credits the *broadcaster* (the streamer whose content it is), not the viewer who pressed "clip".
 
 ---
 

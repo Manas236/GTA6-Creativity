@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -222,6 +223,17 @@ def authenticity_tag(value: str | None) -> str:
     return AUTHENTICITY_TAG.get((value or "unverified").lower(), f"❓ {(value or 'unverified').upper()}")
 
 
+def card_renders(item: dict[str, Any]) -> tuple[str | None, str | None, str]:
+    """(variant A path, variant B path, preset) the card shows.
+
+    Always the renders the pipeline made with the item's own `style_preset` - the ones recorded on
+    the item row and the ones that will be posted - never a preview render of another preset and
+    never whatever `style.preset` happens to say in config today.
+    """
+    preset = str(item.get("style_preset") or "").strip() or "P0"
+    return item.get("render_a_path"), item.get("render_b_path"), preset
+
+
 def card_text(item: dict[str, Any], decided: str = "") -> str:
     """The single status card's body. `decided` replaces the prompt line once a button was used."""
     lines = [
@@ -233,6 +245,7 @@ def card_text(item: dict[str, Any], decided: str = "") -> str:
         f"📺 Source: {item.get('source', '?')} · {item.get('source_url') or ''}",
         f"👤 Creator: {item.get('author_name') or 'Creator'}",
         f"📈 Discovery score: {float(item.get('discovery_score') or 0.0):.3f}",
+        f"🎨 Style preset: {card_renders(item)[2]}",
     ]
     if item.get("original_title"):
         lines.append(f"🎞 Original: {str(item['original_title'])[:120]}")
@@ -281,12 +294,30 @@ def next_item_for_review(db_path: Any = None) -> dict[str, Any] | None:
 
     `awaiting_approval` rows come first: an item whose card was sent but whose decision never
     landed (the bot died between the send and the tap) is shown again before a fresh one.
+    preview_only items are filtered out here explicitly; the card never depends on the SQLite
+    trigger firing to keep them away.
     """
-    pending = db.get_items_by_stage("awaiting_approval", limit=1, db_path=db_path)
+    pending = db.get_items_by_stage("awaiting_approval", limit=1, db_path=db_path, releasable_only=True)
     if pending:
         return pending[0]
-    ready = db.get_items_by_stage("rendered", limit=1, db_path=db_path)
+    ready = db.get_items_by_stage("rendered", limit=1, db_path=db_path, releasable_only=True)
     return ready[0] if ready else None
+
+
+def refuse_item(item_id: str, stage: str, exc: BaseException, db_path: Any = None) -> str:
+    """A preview_only trigger refused a write: fail that ONE item and carry on.
+
+    `failed` is not a release stage, so the trigger lets this through; the item then leaves every
+    approval / posting queue and the runner cannot loop on it.
+    """
+    msg = f"refused by the database: {exc}"
+    log.error("%s: item %s %s", stage, item_id, msg)
+    try:
+        db.mark_failed(item_id, stage, msg, db_path=db_path)
+        db.log_stage(item_id, stage, "failure", message=msg, db_path=db_path)
+    except sqlite3.Error as e:  # noqa: PERF203 - never let the clean-up itself crash the runner
+        log.error("%s: could not mark %s failed: %s", stage, item_id, e)
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +334,17 @@ def decide(item_id: str, action: str, db_path: Any = None) -> tuple[str, str]:
         return "", "That item is gone."
     if item.get("stage") not in ("awaiting_approval", "rendered"):
         return "", f"Already decided ({item.get('stage')})."
+    if action in ("ok", "aonly") and not db.is_releasable(item):
+        refuse_item(item_id, "approval", RuntimeError("preview_only item cannot be approved"), db_path)
+        return "", "This item is preview-only and cannot be approved."
+    try:
+        return _apply_decision(item_id, action, db_path)
+    except sqlite3.IntegrityError as e:
+        refuse_item(item_id, "approval", e, db_path)
+        return "", "The database refused that item; it was failed and skipped."
 
+
+def _apply_decision(item_id: str, action: str, db_path: Any = None) -> tuple[str, str]:
     if action == "no":
         db.mark_rejected(item_id, "user_rejected", db_path=db_path)
         db.log_stage(item_id, "approval", "success", message="rejected via telegram", db_path=db_path)
@@ -408,11 +449,22 @@ class ApprovalBot:
             return None
         return self.send_card(item)
 
-    def send_card(self, item: dict[str, Any]) -> str:
+    def send_card(self, item: dict[str, Any]) -> str | None:
         item_id = item["id"]
+        if not db.is_releasable(item):
+            log.warning("telegram: %s is preview_only; no card is sent for it", item_id)
+            return None
+        # The stage moves BEFORE anything is sent: if the database refuses the item, no card for it
+        # ever reaches the chat, and a crash after this line re-offers the item (awaiting_approval
+        # is picked up first by next_item_for_review).
+        if item.get("stage") != "awaiting_approval":
+            try:
+                db.transition_stage(item_id, "awaiting_approval", db_path=self.db_path)
+            except sqlite3.IntegrityError as e:
+                refuse_item(item_id, "approval", e, self.db_path)
+                return None
+        a_path, b_path, preset = card_renders(item)
         text = card_text(item)
-        b_path = item.get("render_b_path")
-        a_path = item.get("render_a_path")
 
         if b_path:
             main = self.send_video(b_path, text, card_markup(item_id))
@@ -424,14 +476,14 @@ class ApprovalBot:
         extra_mids: list[int] = []
         if a_path:
             try:
-                second = self.send_video(a_path, f"🅰 Variant A (captions only) · {item.get('hook_text') or ''}")
+                second = self.send_video(
+                    a_path, f"🅰 Variant A (captions only, {preset}) · {item.get('hook_text') or ''}"
+                )
                 extra_mids.append(int(second["message_id"]))
             except (TelegramError, requests.RequestException, OSError) as e:
                 log.warning("telegram: Variant A not sent for %s: %s", item_id, redact(e))
 
         set_card_state({"mid": mid, "item_id": item_id, "extra_mids": extra_mids}, self.db_path)
-        if item.get("stage") != "awaiting_approval":
-            db.transition_stage(item_id, "awaiting_approval", db_path=self.db_path)
         db.log_stage(item_id, "approval", "start", message=f"card sent as message {mid}", db_path=self.db_path)
         log.info("telegram: card for %s sent as message %s", item_id, mid)
         return item_id
@@ -607,15 +659,20 @@ def run_auto_approval(
     approved: list[str] = []
     rejected: list[str] = []
     for stage in ("rendered", "awaiting_approval"):
-        for item in db.get_items_by_stage(stage, db_path=db_path):
+        for item in db.get_items_by_stage(stage, db_path=db_path, releasable_only=True):
             passed, reason = quality_gate(item, cfg=cfg, probe=probe)
             if passed:
-                db.transition_stage(
-                    item["id"],
-                    "approved",
-                    extra_fields={"approval_type": "auto_approved", "chosen_variant": None, "ab_excluded": 0},
-                    db_path=db_path,
-                )
+                try:
+                    db.transition_stage(
+                        item["id"],
+                        "approved",
+                        extra_fields={"approval_type": "auto_approved", "chosen_variant": None, "ab_excluded": 0},
+                        db_path=db_path,
+                    )
+                except sqlite3.IntegrityError as e:
+                    refuse_item(item["id"], "approval", e, db_path)
+                    rejected.append(item["id"])
+                    continue
                 db.log_stage(item["id"], "approval", "success", message=f"auto approved: {reason}", db_path=db_path)
                 approved.append(item["id"])
             else:

@@ -314,6 +314,12 @@ posting:
   platforms:
     instagram: true
     facebook: true
+  # Creator-credit caption per source ({hook_text}, {author_name}, {channel}, {hashtags}).
+  # Reddit was dropped as a source, so it has no template; unknown sources use youtube's.
+  hashtags: "#gta6 #grandtheftauto #gta #gaming #rockstargames"
+  caption_templates:
+    youtube: "{hook_text}\n\nCredit: {author_name}\n.\n{hashtags}"
+    twitch: "{hook_text}\n\nClipped from {author_name} on Twitch\ntwitch.tv/{channel}\n.\n{hashtags} #twitchclips"
   # Meta Graph API (CP3)
   graph_base: "https://graph.facebook.com"
   rupload_base: "https://rupload.facebook.com"

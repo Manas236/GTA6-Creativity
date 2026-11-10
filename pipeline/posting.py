@@ -95,32 +95,56 @@ STATUS_DRY_RUN = "dry_run"
 
 HASHTAGS = "#gta6 #grandtheftauto #gta #gaming #rockstargames"
 
+# Creator-credit templates per source (PLAN.md section 9). `posting.caption_templates` in
+# config.yaml overrides them. The lone "." keeps Instagram from folding the hashtags into the
+# visible first lines. Reddit was dropped as a source (Decision A), so it has no template.
+CAPTION_TEMPLATES = {
+    "youtube": "{hook_text}\n\nCredit: {author_name}\n.\n{hashtags}",
+    "twitch": "{hook_text}\n\nClipped from {author_name} on Twitch\ntwitch.tv/{channel}\n.\n{hashtags} #twitchclips",
+}
+DEFAULT_CAPTION_SOURCE = "youtube"
+
 
 # ---------------------------------------------------------------------------
 # Caption template
 # ---------------------------------------------------------------------------
 
+def twitch_channel(author_name: str) -> str:
+    """The channel part of a twitch.tv link: the login is the display name lower-cased, no spaces."""
+    return re.sub(r"[^a-z0-9_]", "", (author_name or "").lower())
+
+
 def build_caption(
     hook_text: str,
     author_name: str,
-    source: str = "youtube",
-    subreddit: str | None = None,
-    hashtags: str = HASHTAGS,
+    source: str = DEFAULT_CAPTION_SOURCE,
+    hashtags: str | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> str:
-    """The caption template with creator credit (PLAN.md section 9).
+    """The caption with creator credit (PLAN.md section 9), from the template for `source`.
 
-    YouTube / Twitch:  hook, blank line, "Credit: <creator>", ".", hashtags.
-    Reddit (legacy):   the same with a "Found via r/<sub>" line under the credit.
-    The lone "." keeps Instagram from folding the hashtags into the visible first lines.
+    YouTube: hook, blank line, "Credit: <creator>", ".", hashtags.
+    Twitch:  hook, blank line, "Clipped from <streamer> on Twitch", the channel link, ".", hashtags.
+    An unknown source uses the YouTube template.
     """
-    credit = [f"Credit: {author_name or 'Creator'}"]
-    if source == "reddit" and subreddit:
-        credit.append(f"Found via r/{subreddit}")
-    caption = "\n\n".join([hook_text.strip(), "\n".join(credit) + "\n.\n" + hashtags])
+    posting_cfg = (cfg or {}).get("posting") or {}
+    templates = {**CAPTION_TEMPLATES, **(posting_cfg.get("caption_templates") or {})}
+    template = templates.get(source) or templates[DEFAULT_CAPTION_SOURCE]
+    author = author_name or "Creator"
+    channel = twitch_channel(author)
+    if source == "twitch" and not channel:
+        # A display name with no ASCII login (e.g. non-Latin): credit without a broken link.
+        template = template.replace("twitch.tv/{channel}\n", "")
+    caption = template.format(
+        hook_text=(hook_text or "").strip(),
+        author_name=author,
+        channel=channel,
+        hashtags=hashtags or posting_cfg.get("hashtags") or HASHTAGS,
+    )
     return caption[:IG_CAPTION_LIMIT]
 
 
-def caption_for_item(item: dict[str, Any]) -> str:
+def caption_for_item(item: dict[str, Any], cfg: dict[str, Any] | None = None) -> str:
     """The caption to send for an item: the stored one, else built from the template."""
     stored = (item.get("caption_text") or "").strip()
     if stored:
@@ -128,7 +152,8 @@ def caption_for_item(item: dict[str, Any]) -> str:
     return build_caption(
         item.get("hook_text") or "",
         item.get("author_name") or "Creator",
-        item.get("source") or "youtube",
+        item.get("source") or DEFAULT_CAPTION_SOURCE,
+        cfg=cfg,
     )
 
 
@@ -373,9 +398,11 @@ def ensure_post_rows(
 ) -> list[dict[str, Any]]:
     """One `pending` row per enabled platform, created once (UNIQUE(item_id, platform))."""
     cfg = cfg or config.get_config()
+    if not db.is_releasable(item):
+        raise PublishError(f"item {item['id']} is preview_only and is never posted")
     variant = item.get("chosen_variant") or "B"
     slot = slot_datetime or db.now()
-    caption = caption_for_item(item)
+    caption = caption_for_item(item, cfg)
     ts = db.now()
     with db.db(db_path) as conn:
         for platform in enabled_platforms(cfg):
@@ -972,6 +999,9 @@ def settle_publishing_rows(
             break
         except (PublishError, requests.RequestException, OSError) as e:
             out.append((post["id"], publisher.fail(post, f"settle failed: {e}")))
+        except sqlite3.IntegrityError as e:
+            fail_refused_item(post["item_id"], e, db_path=db_path)
+            out.append((post["id"], STATUS_FAILED))
     return out
 
 
@@ -991,6 +1021,9 @@ def run_posting_for_item(
     item = db.get_item(item_id, db_path=db_path)
     if not item:
         raise PublishError(f"no item {item_id}")
+    if not db.is_releasable(item):
+        # Explicit, before any row is written: posting never relies on the trigger to say no.
+        raise PublishError(f"item {item_id} is preview_only and is never posted")
 
     ensure_post_rows(item, slot_datetime=slot_datetime, cfg=cfg, db_path=db_path)
     publisher = publisher or Publisher(cfg=cfg, db_path=db_path)
@@ -1040,7 +1073,7 @@ def run_posting_stage(
     out: dict[str, dict[str, str]] = {}
     todo: list[dict[str, Any]] = []
     for stage in ("approved", "queued"):
-        todo.extend(db.get_items_by_stage(stage, db_path=db_path))
+        todo.extend(db.get_items_by_stage(stage, db_path=db_path, releasable_only=True))
     for item in todo[: limit or len(todo)]:
         try:
             out[item["id"]] = run_posting_for_item(item["id"], cfg=cfg, db_path=db_path, publisher=publisher)
@@ -1048,4 +1081,21 @@ def run_posting_stage(
             break
         except PublishError as e:
             log.warning("posting failed for %s: %s", item["id"], redact(e))
+        except sqlite3.IntegrityError as e:
+            fail_refused_item(item["id"], e, db_path=db_path)
     return out
+
+
+def fail_refused_item(item_id: str, exc: BaseException, db_path: Any = None) -> None:
+    """A database trigger (preview_only) refused a posting write: fail that ONE item, cleanly.
+
+    `failed` is not a release stage, so the trigger allows it; the item leaves the posting queue
+    and the next pass does not meet it again - the runner cannot crash-loop on it.
+    """
+    msg = f"refused by the database: {exc}"
+    log.error("posting: item %s %s", item_id, msg)
+    try:
+        db.mark_failed(item_id, "posting", msg, db_path=db_path)
+        db.log_stage(item_id, "posting", "failure", message=msg, db_path=db_path)
+    except sqlite3.Error as e:
+        log.error("posting: could not mark %s failed: %s", item_id, e)

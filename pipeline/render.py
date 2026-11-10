@@ -19,12 +19,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import audio_mix, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, style, voiceover
+from . import audio_mix, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, voiceover
 from .cut import extract_audio_loudness_profile, snap_end_to_pause
 from .download import verify_video_file
 from .rendercore import (  # re-exported for callers and tests
@@ -853,6 +854,11 @@ def run_render_item(
     if not item:
         return False, f"Item {item_id} not found", {}
 
+    if not db.is_releasable(item):
+        # A preview_only item can never enter 'rendered' (SQLite trigger). Skip it up front
+        # instead of rendering for minutes and then being refused; its state is left untouched.
+        return False, "preview_only item: not rendered by the pipeline", {}
+
     cut_path_str = item.get("cut_path")
     if not cut_path_str or not Path(cut_path_str).exists():
         db.mark_failed(item_id, "render", "Cut file not found on disk", db_path=db_path)
@@ -935,7 +941,7 @@ def run_render_item(
 
     # Generate Creator Credit Social Caption
     author = item.get("author_name") or "Creator"
-    caption_text = f"{hook_text}\n\nCredit: {author}\n.\n#gta6 #grandtheftauto #gta #gaming #rockstargames"
+    caption_text = posting.build_caption(hook_text, author, item.get("source") or "youtube", cfg=cfg)
 
     # Purge raw source download immediately per project retention rule
     download_path_str = item.get("download_path")
@@ -944,17 +950,22 @@ def run_render_item(
         log.info("Purged raw source download: %s", download_path_str)
 
     # Transition item to 'rendered' stage
-    db.transition_stage(
-        item_id,
-        "rendered",
-        extra_fields={
-            "render_a_path": str(render_a_path),
-            "render_b_path": str(render_b_path),
-            "caption_text": caption_text,
-            "style_preset": result["preset"],
-        },
-        db_path=db_path,
-    )
+    try:
+        db.transition_stage(
+            item_id,
+            "rendered",
+            extra_fields={
+                "render_a_path": str(render_a_path),
+                "render_b_path": str(render_b_path),
+                "caption_text": caption_text,
+                "style_preset": result["preset"],
+            },
+            db_path=db_path,
+        )
+    except sqlite3.IntegrityError as e:
+        # The preview_only trigger refused: fail this one item, never crash the runner on it.
+        db.mark_failed(item_id, "render", f"refused by the database: {e}", db_path=db_path)
+        return False, f"refused by the database: {e}", {}
     db.log_stage(
         item_id,
         "render",

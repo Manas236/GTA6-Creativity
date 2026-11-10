@@ -343,14 +343,34 @@ def get_item(item_id: str, db_path: Path | str | None = None) -> dict[str, Any] 
         return dict(row) if row else None
 
 
+#: SQL that keeps only items that may be approved / scheduled / posted. Used explicitly by the
+#: approval and posting queries - they do not rely on the preview_only triggers firing.
+RELEASABLE_SQL = "COALESCE(preview_only, 0) = 0"
+
+
+def is_releasable(item: dict[str, Any] | None) -> bool:
+    """False for an item that must never reach approval or posting (preview_only)."""
+    return bool(item) and not int(item.get("preview_only") or 0)
+
+
+def is_trigger_refusal(exc: BaseException) -> bool:
+    """True when `exc` is one of the preview_only triggers refusing a write (RAISE(ABORT))."""
+    return isinstance(exc, sqlite3.IntegrityError) and "preview_only" in str(exc)
+
+
 def get_items_by_stage(
-    stage: str, limit: int | None = None, order_by_score: bool = True, db_path: Path | str | None = None
+    stage: str,
+    limit: int | None = None,
+    order_by_score: bool = True,
+    db_path: Path | str | None = None,
+    releasable_only: bool = False,
 ) -> list[dict[str, Any]]:
     order_clause = "ORDER BY discovery_score DESC" if order_by_score else "ORDER BY created_at ASC"
     limit_clause = f"LIMIT {limit}" if limit else ""
+    where = f"AND {RELEASABLE_SQL}" if releasable_only else ""
     with db(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM items WHERE stage = ? {order_clause} {limit_clause}", (stage,)
+            f"SELECT * FROM items WHERE stage = ? {where} {order_clause} {limit_clause}", (stage,)
         ).fetchall()
         return [dict(r) for r in rows]
 

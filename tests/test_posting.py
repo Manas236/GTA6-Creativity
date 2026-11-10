@@ -200,9 +200,23 @@ def test_caption_template_carries_the_hook_the_creator_credit_and_the_tags():
     )
 
 
-def test_caption_template_adds_the_subreddit_line_for_reddit_items():
-    caption = posting.build_caption("WHAT IS HIDDEN HERE?", "u/someone", "reddit", subreddit="GTA6")
-    assert "Credit: u/someone\nFound via r/GTA6\n.\n" in caption
+def test_twitch_items_get_the_twitch_credit_template():
+    caption = posting.build_caption("WHAT IS HIDDEN HERE?", "Shroud Live", "twitch")
+    assert caption == (
+        "WHAT IS HIDDEN HERE?\n\n"
+        "Clipped from Shroud Live on Twitch\ntwitch.tv/shroudlive\n.\n"
+        "#gta6 #grandtheftauto #gta #gaming #rockstargames #twitchclips"
+    )
+    # a display name with no ASCII login gets the credit without a broken link
+    assert "twitch.tv/" not in posting.build_caption("HOOK", "配信者", "twitch")
+
+
+def test_there_is_no_reddit_template_and_templates_can_be_overridden_in_config():
+    assert "reddit" not in posting.CAPTION_TEMPLATES
+    assert "Found via r/" not in posting.build_caption("HOOK", "u/someone", "reddit")
+    cfg = {"posting": {"caption_templates": {"twitch": "{hook_text} / {author_name} / {hashtags}"},
+                       "hashtags": "#x"}}
+    assert posting.build_caption("HOOK", "Streamer", "twitch", cfg=cfg) == "HOOK / Streamer / #x"
 
 
 def test_caption_falls_back_to_the_template_when_the_item_has_none():
@@ -830,3 +844,62 @@ def test_the_dry_run_script_guard_refuses_every_write_and_publish_endpoint(secre
         with pytest.raises(script.PublishAttempted):
             guard(method, url, **kwargs)
     assert len(guard.gets) == 1   # only the debug_token GET was ever let through
+
+
+# ---------------------------------------------------------------------------
+# preview_only: filtered explicitly, and a trigger refusal fails one item cleanly
+# ---------------------------------------------------------------------------
+
+def _drop_preview_triggers(tmp_db) -> None:
+    with db.db(tmp_db) as conn:
+        for name in ("items_preview_only_never_released", "posts_block_preview_only_insert",
+                     "posts_block_preview_only_update"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+
+def test_posting_filters_preview_only_items_without_relying_on_the_trigger(tmp_db, tmp_path, cfg, secrets):
+    item = make_item(tmp_db, tmp_path)
+    _drop_preview_triggers(tmp_db)                       # the filter must hold on its own
+    db.set_preview_only(item["id"], True, db_path=tmp_db)
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+
+    assert posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher) == {}
+    with pytest.raises(posting.PublishError, match="preview_only"):
+        posting.run_posting_for_item(item["id"], cfg=cfg, db_path=tmp_db, publisher=publisher)
+    with pytest.raises(posting.PublishError, match="preview_only"):
+        posting.ensure_post_rows(db.get_item(item["id"], db_path=tmp_db), cfg=cfg, db_path=tmp_db)
+
+    assert transport.calls == []
+    assert posting.get_posts_for_item(item["id"], db_path=tmp_db) == []
+
+
+def test_a_trigger_refusal_fails_that_one_item_and_the_next_item_still_posts(tmp_db, tmp_path, cfg, secrets, monkeypatch):
+    bad = make_item(tmp_db, tmp_path, "item-bad")
+    good = make_item(tmp_db, tmp_path, "item-good")
+    with db.db(tmp_db) as conn:   # any posts write for item-bad is refused, as the real trigger would
+        conn.execute(
+            "CREATE TRIGGER refuse_bad BEFORE INSERT ON posts WHEN NEW.item_id = 'item-bad' "
+            "BEGIN SELECT RAISE(ABORT, 'preview_only item cannot be posted'); END"
+        )
+    transport = FakeTransport(happy_routes())
+    publisher, _ = make_publisher(tmp_db, ig_only(cfg), transport)
+
+    out = posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher)   # must not raise
+
+    failed = db.get_item(bad["id"], db_path=tmp_db)
+    assert failed["stage"] == "failed" and failed["error_stage"] == "posting"
+    assert "refused by the database" in failed["error_message"]
+    assert out == {good["id"]: {"instagram": "live"}}
+    # the refused item left the queue: a second pass has nothing to trip over
+    assert posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher) == {}
+
+
+def test_the_real_trigger_raises_an_error_posting_recognises(tmp_db, tmp_path):
+    import sqlite3
+    item = make_item(tmp_db, tmp_path)
+    db.transition_stage(item["id"], "cut", db_path=tmp_db)
+    db.set_preview_only(item["id"], True, db_path=tmp_db)
+    with pytest.raises(sqlite3.IntegrityError) as err:
+        db.transition_stage(item["id"], "approved", db_path=tmp_db)
+    assert db.is_trigger_refusal(err.value)

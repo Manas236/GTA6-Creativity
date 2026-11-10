@@ -465,3 +465,85 @@ def test_one_runner_pass_sends_the_card_and_polls_once(tmp_db, tmp_path, cfg):
 
     assert result == {"mode": "telegram", "card_sent": "item-1", "updates_handled": 0}
     assert transport.methods().count("getUpdates") == 1
+
+
+# ---------------------------------------------------------------------------
+# preview_only and the style preset
+# ---------------------------------------------------------------------------
+
+def _drop_preview_triggers(tmp_db) -> None:
+    with db.db(tmp_db) as conn:
+        for name in ("items_preview_only_never_released", "posts_block_preview_only_insert",
+                     "posts_block_preview_only_update"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+
+def test_a_preview_only_item_never_gets_a_card_even_without_the_trigger(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "item-preview", score=0.9)
+    make_item(tmp_db, tmp_path, "item-real", score=0.1)
+    _drop_preview_triggers(tmp_db)                      # the filter must hold on its own
+    db.set_preview_only("item-preview", True, db_path=tmp_db)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+
+    assert bot.ensure_card() == "item-real"             # the higher-scoring preview item is skipped
+    assert db.get_item("item-preview", db_path=tmp_db)["stage"] == "rendered"
+    # sending it directly is refused too, and so is the auto gate
+    telegram_bot.set_card_state(None, tmp_db)
+    assert bot.send_card(db.get_item("item-preview", db_path=tmp_db)) is None
+    result = telegram_bot.run_auto_approval(cfg=cfg, db_path=tmp_db, probe=lambda p: 20.0)
+    assert "item-preview" not in result["approved"] + result["rejected"]
+
+
+def test_a_trigger_refusal_on_the_card_fails_that_item_and_the_next_one_is_offered(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "item-bad", score=0.9)
+    make_item(tmp_db, tmp_path, "item-good", score=0.1)
+    with db.db(tmp_db) as conn:   # the database refuses item-bad exactly as the real trigger would
+        conn.execute(
+            "CREATE TRIGGER refuse_bad BEFORE UPDATE OF stage ON items "
+            "WHEN NEW.id = 'item-bad' AND NEW.stage IN ('awaiting_approval', 'approved') "
+            "BEGIN SELECT RAISE(ABORT, 'preview_only item cannot enter an approval/posting stage'); END"
+        )
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+
+    assert bot.ensure_card() is None                    # refused, cleanly: nothing was sent
+    assert transport.of("sendVideo") == []
+    bad = db.get_item("item-bad", db_path=tmp_db)
+    assert bad["stage"] == "failed" and bad["error_stage"] == "approval"
+    assert telegram_bot.card_state(tmp_db) is None      # the slot is free
+    assert bot.ensure_card() == "item-good"             # the runner carries on with the next item
+
+
+def test_a_refused_decision_fails_the_item_instead_of_raising(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path, "item-1", stage="awaiting_approval")
+    with db.db(tmp_db) as conn:
+        conn.execute(
+            "CREATE TRIGGER refuse_approve BEFORE UPDATE OF stage ON items WHEN NEW.stage = 'approved' "
+            "BEGIN SELECT RAISE(ABORT, 'preview_only item cannot enter an approval/posting stage'); END"
+        )
+    outcome, answer = telegram_bot.decide("item-1", "ok", db_path=tmp_db)
+    assert outcome == "" and "refused" in answer
+    assert db.get_item("item-1", db_path=tmp_db)["stage"] == "failed"
+
+
+def test_the_card_sends_the_renders_of_the_items_own_style_preset(tmp_db, tmp_path, cfg):
+    item = make_item(tmp_db, tmp_path)
+    # a preview render of another preset sits right next to the real ones and must be ignored
+    (tmp_path / "P3_B.mp4").write_bytes(b"P" * 2048)
+    db.transition_stage("item-1", "rendered", extra_fields={"style_preset": "P2"}, db_path=tmp_db)
+    sent_files: list[str] = []
+
+    class FileTransport(FakeTransport):
+        def __call__(self, method, params, files=None, http_timeout=30.0):
+            if files:
+                sent_files.append(files["video"][0])
+            return super().__call__(method, params, files, http_timeout)
+
+    transport = FileTransport()
+    make_bot(tmp_db, cfg, transport).ensure_card()
+
+    assert sent_files == [Path(item["render_b_path"]).name, Path(item["render_a_path"]).name]
+    videos = transport.of("sendVideo")
+    assert "Style preset: P2" in videos[0]["caption"]
+    assert "P2" in videos[1]["caption"]
