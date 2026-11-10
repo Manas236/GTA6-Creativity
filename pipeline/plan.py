@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import audio_mix, config, edits, keywords as kwmod, overlay, style
-from .cut import extract_audio_loudness_profile, extract_scene_cuts, snap_end_to_pause
+from .cut import audio_envelope, extract_audio_loudness_profile, extract_scene_cuts, snap_end_to_pause
 from . import endings
 from .rendercore import ascent_px, cap_height_px, descent_px, layout_hook, media_duration, render_settings
 
@@ -38,6 +38,7 @@ class ClipAnalysis:
     motion: list[tuple[float, float]] = field(default_factory=list)
     speech_peak_db: float = -6.0
     loop_end: edits.LoopEnd | None = None
+    tail_quiet_s: float | None = None                 # measured quiet before the end (speech clips)
     words: list[dict[str, Any]] = field(default_factory=list)   # cut timeline, trimmed to end_s
     notes: list[str] = field(default_factory=list)
 
@@ -169,10 +170,12 @@ def analyze_clip(
     min_dur = float(cut_cfg.get("min_duration", 18.0))
     max_dur = min(float(cut_cfg.get("max_duration", 22.0)), dur)
     spans: list[endings.SafeSpan] | None = None
+    env = None
     if words:
+        env = audio_envelope(cut_path, 0.0, dur) if Path(str(cut_path)).exists() else None
         proposed, spans = endings.content_end(
             words, dur, min_dur, float(cut_cfg.get("max_duration", 22.0)), es,
-            trusted_end=dur if clean_cut_end else None,
+            trusted_end=dur if clean_cut_end else None, env=env,
         )
     else:
         proposed = snap_end_to_pause(
@@ -196,10 +199,14 @@ def analyze_clip(
     if spans:
         span = endings.span_at(end_s, spans)
         end_s = min(endings.snap_inside(end_s, span, 1.0 / fps) if span else _snap(end_s, fps), dur)
-        if span is None or endings.speaks_through(end_s, words):
+        # A measured pause (punct_audio) is where whisper's NEXT word claims to have started
+        # already; the audio says it has not, so that one check is the audio's.
+        if span is None or (span.reason != "punct_audio" and endings.speaks_through(end_s, words)):
             raise endings.NoCleanEnding(f"no_clean_ending: end {end_s:.3f}s is not after a completed sentence")
+        words = [w for w in words if float(w["end"]) <= end_s + 0.02]
     else:
         end_s = min(_snap(end_s, fps), dur)
+    tail_quiet = endings.quiet_tail_s(end_s, env, es) if spans else None
 
     # --- A3 dead air, measured on the content region only ---------------------------
     if flags["dead_air"]:
@@ -235,6 +242,7 @@ def analyze_clip(
         motion=motion,
         speech_peak_db=round(speech_peak, 2),
         loop_end=loop,
+        tail_quiet_s=tail_quiet,
         words=[w for w in words if float(w["start"]) < end_s],
         notes=notes,
     )
@@ -341,9 +349,13 @@ def build_style_plan(
 
     fade = float(ss["loop_end"]["audio_fade_s"]) if flags["loop_end"] else float(rs["end_fade_s"])
     if speech_out:
-        # The end sits in silence after the last word; never let the fade reach back into it.
+        # The end sits in silence after the last word; never let the fade reach back into it -
+        # by whisper's word end, and by the measured quiet before the end (whisper's word ends
+        # can be late or early by ~0.1 s).
         room = total_s - max(float(w["end"]) for w in speech_out)
-        fade = round(min(fade, max(0.05, room)), 3)
+        if analysis.tail_quiet_s is not None and analysis.tail_quiet_s > 0:
+            room = min(room, analysis.tail_quiet_s)
+        fade = round(min(fade, max(0.03, room)), 3)
 
     notes = list(analysis.notes)
     if flags["zoom_fill"]:

@@ -27,6 +27,7 @@ Options:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -288,6 +289,17 @@ def render_item(
             "elapsed_a_s": res["elapsed_a_s"], "elapsed_b_s": res["elapsed_b_s"],
             "style_a": res["style_a"],
         }
+        # What scripts/verify_previews.py checks: where the end sits in the source, and the
+        # SFX cues each variant was mixed with (both on that variant's output timeline).
+        (item_dir / f"{preset}.plan.json").write_text(json.dumps({
+            "item_id": item_id, "preset": preset,
+            "cut_start": item.get("cut_start"), "cut_end": item.get("cut_end"),
+            "download_path": item.get("download_path"),
+            "end_s": res.get("end_s"), "source_end_s": res.get("source_end_s"),
+            "freeze_s": res.get("freeze_s"),
+            "sfx": {"A": (res.get("style_a") or {}).get("sfx", []),
+                    "B": (res.get("style_b") or {}).get("sfx", [])},
+        }, indent=1, default=str), encoding="utf-8")
         print(f"    {preset}_A.mp4  {res['probe_a']['video_duration']:6.2f} s  "
               f"rendered in {res['elapsed_a_s']:6.1f} s")
         print(f"    {preset}_B.mp4  {res['probe_b']['video_duration']:6.2f} s  "

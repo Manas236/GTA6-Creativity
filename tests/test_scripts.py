@@ -220,7 +220,7 @@ def _verified_payload(cut_start=5.0, cut_end=25.0, words=None, ending="sentence"
     import json
     model = render_previews.render.render_settings()["whisper_model"]
     return json.dumps({"cut_start": cut_start, "cut_end": cut_end, "model": model,
-                       "words": words or [], "ending": ending, "source": "cut"})
+                       "words": words or [], "ending": ending, "ending_rule": render_previews.endings.RULE_VERSION, "source": "cut"})
 
 
 def test_render_previews_reuses_an_existing_download_and_a_current_cut(tmp_path):

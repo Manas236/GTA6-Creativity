@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import audio_mix, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, voiceover
-from .cut import extract_audio_loudness_profile, snap_end_to_pause
+from .cut import audio_envelope, extract_audio_loudness_profile, snap_end_to_pause
 from . import endings
 from .download import verify_video_file
 from .rendercore import (  # re-exported for callers and tests
@@ -205,7 +205,8 @@ def cut_end_verified(item: dict[str, Any] | None, model_name: str) -> bool:
     try:
         raw = item.get("transcript_words")
         data = json.loads(raw) if isinstance(raw, str) else raw
-        return data.get("ending") in ("sentence", "no_speech")
+        return (data.get("ending") in ("sentence", "no_speech")
+                and int(data.get("ending_rule") or 1) >= endings.RULE_VERSION)
     except Exception:
         return False
 
@@ -780,9 +781,10 @@ def snap_render_end(
     min_dur = float(cut_cfg.get("min_duration", 18.0))
     max_dur = float(cut_cfg.get("max_duration", 22.0))
     if speech_words:
+        env = audio_envelope(cut_path, 0.0, cut_duration) if Path(str(cut_path)).exists() else None
         end, _spans = endings.content_end(
             speech_words, cut_duration, min_dur, max_dur, endings.ending_settings(cfg),
-            trusted_end=cut_duration if clean_cut_end else None,
+            trusted_end=cut_duration if clean_cut_end else None, env=env,
         )
         return end
     if cut_duration <= min_dur:

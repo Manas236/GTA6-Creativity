@@ -22,12 +22,17 @@ def _ffmpeg(*args: str) -> None:
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args], check=True, capture_output=True)
 
 
-def _make_cut(path: Path, seconds: float = 3.0, color: str | None = None) -> Path:
-    """Source-like cut: 16:9, 59.94 fps, 96 kHz audio running to the last frame (the CP2 inputs)."""
+def _make_cut(path: Path, seconds: float = 3.0, color: str | None = None,
+              silences: list[tuple[float, float]] | None = None) -> Path:
+    """Source-like cut: 16:9, 59.94 fps, 96 kHz audio running to the last frame (the CP2 inputs).
+    `silences` mutes the tone over those spans (a speaker's pauses)."""
     video = f"color=c={color}:s=640x360:r=60000/1001:d={seconds}" if color else \
         f"testsrc=size=640x360:rate=60000/1001:duration={seconds}"
+    mute = "+".join(f"between(t,{a},{b})" for a, b in silences or [])
+    af = ["-af", f"volume='1-({mute})':eval=frame"] if mute else []
     _ffmpeg("-f", "lavfi", "-i", video,
             "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=96000:duration={seconds}",
+            *af,
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-ar", "96000", "-t", str(seconds), str(path))
     return path
@@ -364,7 +369,7 @@ def test_render_item_variants_snaps_end_to_pause(tmp_path: Path):
     """Full A+B pass on a 20 s cut: end snapped into the 19.1-19.5 s pause after the
     sentence-final "RIGHT." (a 0.4 s gap after a word WITHOUT . ? ! is not an end any
     more), B = freeze + A."""
-    cut = _make_cut(tmp_path / "cut20.mp4", 20.0, color="navy")
+    cut = _make_cut(tmp_path / "cut20.mp4", 20.0, color="navy", silences=[(19.15, 19.45)])  # a real pause
     vo = _make_vo(tmp_path / "vo.wav", 1.5)
     words = [{"word": "W", "start": float(t), "end": float(t) + 0.8} for t in range(0, 18)]
     words += [{"word": "RIGHT.", "start": 18.4, "end": 19.1}, {"word": "BOOM", "start": 19.5, "end": 20.4}]

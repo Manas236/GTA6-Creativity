@@ -308,3 +308,109 @@ def test_whisper_falls_back_to_the_default_cache_when_hf_home_is_on_a_missing_dr
         assert root and root.endswith(str(Path(".cache") / "huggingface" / "hub"))
     monkeypatch.delenv("HF_HOME")
     assert render.whisper_download_root() is None
+
+
+# ----------------------------------------------------------------------------- audio-measured pauses
+
+def _env(dur: float, dips: list[tuple[float, float]], speech_db: float = -20.0, dip_db: float = -42.0):
+    hop = 0.01
+    n = int(dur / hop) + 1
+    db_vals = [dip_db if any(a <= i * hop < b for a, b in dips) else speech_db for i in range(n)]
+    return endings.Envelope(0.0, hop, db_vals)
+
+
+def test_a_full_stop_with_no_whisper_gap_counts_when_the_audio_pauses():
+    # whisper: "so." ends 19.00 and "The" starts 19.00 (0.00 s); the audio dips 19.08-19.24
+    words = continuous(0.0, 18.8) + [W("so.", 18.8, 19.0), W("The", 19.0, 19.3)] + continuous(19.3, 25.0)
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES) == []                       # whisper alone: none
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.08, 19.24)]))
+    assert len(spans) == 1 and spans[0].reason == "punct_audio"
+    end = endings.choose_end(spans, 20.0, ES)
+    assert 19.10 <= end <= 19.22                                                       # inside the measured pause
+
+
+def test_a_measured_pause_after_a_word_without_a_full_stop_is_not_an_end():
+    words = continuous(0.0, 18.8) + [W("so", 18.8, 19.0), W("the", 19.0, 19.3)] + continuous(19.3, 25.0)
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.08, 19.24)])) == []
+
+
+def test_a_dip_shorter_than_audio_gap_min_s_is_a_consonant_not_a_pause():
+    words = continuous(0.0, 18.8) + [W("so.", 18.8, 19.0), W("Take", 19.0, 19.3)] + continuous(19.3, 25.0)
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.10, 19.15)])) == []
+
+
+def test_the_cut_stage_uses_the_measured_pause():
+    words = continuous(0.0, 18.8) + [W("so.", 18.8, 19.0), W("The", 19.0, 19.3)] + continuous(19.3, 25.0)
+    sc = scan([(0.0, 1.0)])
+    assert cut.clean_end_for_window(sc.windows[0], sc, words, 24.0, ES) is None
+    choice = cut.clean_end_for_window(sc.windows[0], sc, words, 24.0, ES, env=_env(25.0, [(19.08, 19.24)]))
+    assert choice is not None and 19.1 <= choice.end <= 19.22 and choice.words[-1]["word"] == "so."
+
+
+def test_windows_snapped_to_the_same_start_are_tried_once():
+    with patch.object(cut, "verify_video_file", return_value=(True, 120.0)), \
+         patch.object(cut, "extract_scene_cuts", return_value=[30.5, 60.0, 90.0]), \
+         patch.object(cut, "extract_audio_loudness_profile", return_value=[(t, -20.0) for t in range(120)]):
+        sc = cut.scan_cut_windows("unused.mp4", cfg={"cut": {}})
+    starts = [w.start for w in sc.windows]
+    assert len(starts) == len(set(starts)) and 30.5 in starts
+
+
+def test_a_whisper_gap_after_a_full_stop_without_an_audio_pause_is_not_an_end():
+    # The item_1032 case: whisper puts 0.2 s between "online." and "So", the audio runs straight on.
+    words = continuous(0.0, 18.6) + [W("online.", 18.6, 19.0), W("So", 19.2, 19.4)] + continuous(19.4, 25.0)
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES)                                  # whisper alone: yes
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [])) == []       # the audio: no
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.02, 19.12)]))
+    assert len(spans) == 1 and spans[0].reason == "punct_audio" and 19.02 < spans[0].start < spans[0].end < 19.12
+
+
+def test_a_cut_verified_under_an_older_rule_is_not_trusted():
+    payload = {"cut_start": 1.0, "cut_end": 21.0, "model": MODEL, "words": [], "ending": "sentence"}
+    item = {"cut_start": 1.0, "cut_end": 21.0, "transcript_words": json.dumps(payload)}
+    assert render.cut_end_verified(item, MODEL) is False                                     # rule 1
+    item["transcript_words"] = json.dumps({**payload, "ending_rule": endings.RULE_VERSION})
+    assert render.cut_end_verified(item, MODEL) is True
+
+
+def test_the_end_fade_fits_inside_the_measured_quiet_tail():
+    env = _env(21.0, [(20.9, 21.0)])
+    assert endings.quiet_tail_s(20.98, env, ES) == pytest.approx(0.08, abs=0.011)
+    assert endings.quiet_tail_s(20.5, env, ES) == 0.0
+    assert endings.quiet_tail_s(20.98, None, ES) is None
+
+
+def test_a_verified_cut_end_with_many_decimals_is_kept_and_found():
+    # Real cut durations are not on a millisecond grid (e.g. 18.98567 s); rounding the chosen end
+    # up must not push it out of the one-point verified span (P0 failed on two real items).
+    dur = 18.98567
+    words = continuous(0.0, 18.6) + [W("done", 18.6, 18.9)]
+    end, spans = endings.content_end(words, dur, 18.0, 22.0, ES, trusted_end=dur)
+    assert end <= dur and endings.span_at(end, spans) is not None
+    assert end == pytest.approx(dur, abs=1e-3)
+
+
+def test_a_long_whisper_pause_with_loud_audio_is_not_an_end():
+    # Whisper: 0.7 s between "download," and "one"; the audio is loud through it (the item_1032 case).
+    words = continuous(0.0, 18.3) + [W("download,", 18.3, 18.6), W("one", 19.3, 19.5)] + continuous(19.5, 25.0)
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES)                                  # whisper alone: yes
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [])) == []       # loud: no
+    # a 0.3 s real pause inside whisper's "0.7 s gap" is not a >= 0.6 s gap (the measured item_1032 case)
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(18.75, 19.05)], dip_db=-30.0)) == []
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(18.65, 19.3)], dip_db=-30.0))
+    assert len(spans) == 1 and spans[0].reason == "pause" and 18.65 < spans[0].start < spans[0].end < 19.3
+
+
+def test_with_audio_whisper_gaps_only_count_when_it_hears_nobody_for_a_long_time():
+    words = continuous(0.0, 10.0) + [W("over", 10.0, 10.3)]          # then 13.7 s of music, no speech
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, []))   # loud music
+    assert spans and spans[0].reason == "pause" and spans[0].start == 18.0
+
+
+def test_the_verified_cut_end_only_reaches_back_over_its_measured_quiet_tail():
+    words = continuous(0.0, 18.3) + [W("download,", 18.3, 18.6)]
+    loud = endings.safe_spans(words, 18.0, 19.0, 19.0, ES, trusted_end=19.0, env=_env(19.0, []))
+    assert [(s.reason, s.start, s.end) for s in loud] == [("verified", 19.0, 19.0)]       # just the point
+    quiet = endings.safe_spans(words, 18.0, 19.0, 19.0, ES, trusted_end=19.0, env=_env(19.0, [(18.8, 19.01)]))
+    v = [s for s in quiet if s.reason == "verified"][0]
+    assert 18.8 < v.start < 18.85 and v.end == 19.0

@@ -321,7 +321,7 @@ def test_a3_real_render_drops_dead_air_and_shifts_the_captions(tmp_path: Path):
     Image.fromarray(a).save(png)
     _ffmpeg("-loop", "1", "-t", "6", "-i", str(png),
             "-f", "lavfi", "-i", "sine=frequency=300:sample_rate=48000:duration=6",
-            "-filter_complex", "[1:a]volume='1-between(t,2.0,3.8)':eval=frame[a]",
+            "-filter_complex", "[1:a]volume='1-between(t,2.0,3.8)-between(t,5.3,6.0)':eval=frame[a]",
             "-map", "0:v", "-map", "[a]",
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "30",
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-t", "6", str(cut))

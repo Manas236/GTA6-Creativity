@@ -308,8 +308,12 @@ def scan_cut_windows(video_path: Path | str, cfg: dict[str, Any] | None = None) 
 
         windows.append(CutWindow(round(snapped_start, 2), round(t_end, 2), score))
 
-    # Best score first; a stable sort keeps the earlier window on a tie.
+    # Best score first; a stable sort keeps the earlier window on a tie. Snapping starts to
+    # scene cuts can give several windows the same start: keep only the best of each, so the
+    # next-best window really is a different one.
     windows.sort(key=lambda w: w.score, reverse=True)
+    seen_starts: set[float] = set()
+    windows = [w for w in windows if not (w.start in seen_starts or seen_starts.add(w.start))]
     if not windows:
         windows = [CutWindow(0.0, min(total_duration, target_dur), 0.5)]
     return CutScan(total_duration, loudness_profile, scene_cuts, windows, min_dur, max_dur, target_dur)
@@ -345,6 +349,33 @@ def select_best_cut_window(
 
 # (video_path, span_start_s, span_end_s) -> whisper words with ABSOLUTE source times.
 Transcriber = Callable[[Path, float, float], list[dict[str, Any]]]
+# (video_path, span_start_s, span_end_s) -> the audio level envelope on the SOURCE timeline.
+EnvelopeFn = Callable[[Path, float, float], "endings.Envelope | None"]
+
+
+def audio_envelope(video_path: Path | str, start_s: float, end_s: float,
+                   hop_s: float = 0.01, win_s: float = 0.03) -> endings.Envelope | None:
+    """dB level every `hop_s` (RMS over `win_s`) of [start_s, end_s] of the file's audio, with
+    times on the file's timeline. None if the audio cannot be read."""
+    import numpy as np
+
+    sr = 16000
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{max(0.0, start_s):.3f}",
+           "-t", f"{max(0.1, end_s - start_s):.3f}", "-i", str(video_path), "-vn", "-ac", "1",
+           "-ar", str(sr), "-f", "s16le", "-"]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=120).stdout
+    except Exception as e:  # noqa: BLE001
+        log.warning("audio envelope failed for %s: %s", video_path, e)
+        return None
+    if len(raw) < sr // 5:
+        return None
+    x = np.frombuffer(raw[: len(raw) // 2 * 2], dtype=np.int16).astype(np.float32) / 32768.0
+    win = max(1, int(sr * win_s))
+    power = np.convolve(x * x, np.ones(win, dtype=np.float32) / win, mode="same")
+    hop = max(1, int(sr * hop_s))
+    db_vals = 10.0 * np.log10(power[::hop] + 1e-12)
+    return endings.Envelope(max(0.0, start_s), hop / sr, [round(float(v), 2) for v in db_vals])
 
 
 def whisper_model_name(cfg: dict[str, Any] | None = None) -> str:
@@ -389,6 +420,7 @@ def clean_end_for_window(
     words_abs: Sequence[dict[str, Any]],
     audio_end: float,
     es: dict[str, Any],
+    env: endings.Envelope | None = None,
 ) -> EndChoice | None:
     """Pick this window's end, or None when speech runs through its whole end range.
 
@@ -409,7 +441,7 @@ def clean_end_for_window(
         )
         return EndChoice(win.start, round(end, 2), "no_speech", [])
 
-    spans = endings.safe_spans(in_window, lo, hi, audio_end, es)
+    spans = endings.safe_spans(in_window, lo, hi, audio_end, es, env=env)
     target = min(max(win.end, lo), hi)
     end = endings.choose_end(spans, target, es)
     if end is None:
@@ -420,7 +452,9 @@ def clean_end_for_window(
     cut_words = [
         {**w, "start": round(max(0.0, float(w["start"]) - win.start), 3),
          "end": round(float(w["end"]) - win.start, 3)}
-        for w in in_window if float(w["start"]) < end
+        # Words that FINISH before the end. After a measured pause (punct_audio) whisper often
+        # starts the next word inside the pause; that word is not in the cut.
+        for w in in_window if float(w["end"]) <= end + 1e-6
     ]
     return EndChoice(win.start, end, "sentence", cut_words)
 
@@ -434,6 +468,7 @@ def transcript_payload(choice: EndChoice, model_name: str) -> str:
         "model": model_name,
         "words": choice.words,
         "ending": choice.kind,          # the cut stage checked this end: render may trust it
+        "ending_rule": endings.RULE_VERSION,
         "source": "cut",
     })
 
@@ -466,6 +501,7 @@ def run_cut_item(
     cfg: dict[str, Any] | None = None,
     db_path: Any = None,
     transcriber: Transcriber | None = None,
+    envelope: EnvelopeFn | None = None,
 ) -> tuple[bool, str]:
     """Execute cut stage for a downloaded item: a speech-safe end, then cut-level dedupe.
 
@@ -491,6 +527,7 @@ def run_cut_item(
     if transcriber is None:
         def transcriber(path: Path, a: float, b: float) -> list[dict[str, Any]]:
             return transcribe_source_span(path, a, b, model_name=model_name)
+    envelope = envelope or audio_envelope
 
     scan = scan_cut_windows(download_path, cfg=cfg)
     if not scan:
@@ -519,7 +556,8 @@ def run_cut_item(
             db.mark_failed(item_id, "cut", reason, db_path=db_path)
             return False, reason
 
-        choice = clean_end_for_window(win, scan, words_abs, audio_end, es)
+        env = envelope(download_path, win.start, audio_end) if words_abs else None
+        choice = clean_end_for_window(win, scan, words_abs, audio_end, es, env=env)
         if choice is None:
             no_end.append(f"#{rank} {win.start:.1f}s")
             log.info("Cut window #%d [%.1fs +%.0f-%.0fs] has no sentence end; trying the next",
