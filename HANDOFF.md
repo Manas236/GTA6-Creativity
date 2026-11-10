@@ -2,41 +2,125 @@
 
 ## 0. Laptop: what to run next
 
-```bash
-git pull
-pip install -r requirements.txt
-python scripts/fetch_assets.py        # CC0 music bed for A2 + asset/license verification
-python scripts/render_previews.py     # P0-P3 x A/B for the 3 CP2 items, plus 2x2 grids
+Everything below is still yours to do, in this order. Nothing posts publicly until step 7.
+
+1. **Update and check** (Windows PowerShell, in the project folder):
+   ```powershell
+   git pull
+   .venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   python scripts/fetch_assets.py      # music bed now comes from OpenGameArt (FreePD closed)
+   pytest                              # expect all green
+   ```
+2. **Pick a style preset.** Watch `media/previews/<item>/grid_A.mp4` and `grid_B.mp4` for the three
+   items (2x2 tiles labelled P0-P3; the single files are `P{n}_A.mp4` / `P{n}_B.mp4`), then set
+   `style.preset` in `config.yaml`. It is still **P0**. `media/previews/README.txt` ends with the
+   endings/SFX check table (also in section 0b below). To re-render later:
+   `python scripts/render_previews.py` then `python scripts/verify_previews.py`.
+3. **Fill in `.env`** (copy names from `.env.example`). Missing on this laptop as of 2026-11-10:
+   `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IG_USER_ID`, `IG_ACCESS_TOKEN`, `FB_PAGE_ID`,
+   `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`; optional and also missing: `FB_PAGE_ACCESS_TOKEN`
+   (only if `IG_ACCESS_TOKEN` is not a Page token for the Page) and `HEALTHCHECK_URL`.
+   `GEMINI_API_KEY` is set. Section 5.1 says where to get each value.
+4. **CP3 real-token dry run** (sends one real Telegram card; Meta is read-only):
+   `python scripts/cp3_dry_run.py` - see section 5.2, and tell me what the card looked like and
+   what the summary said.
+5. **Check the insight metric names** in Graph API Explorer before the first 24 h snapshot
+   (`{ig-media-id}/insights?metric=views`, `{video-id}/video_insights`): PLAN.md calls #103-#104.
+   They are config (`analytics.instagram`, `analytics.facebook`), not code.
+6. **Twitch credentials before 19 Nov**: create an app at dev.twitch.tv, put `TWITCH_CLIENT_ID` /
+   `TWITCH_CLIENT_SECRET` in `.env`. Twitch discovery switches itself on 2026-11-19 (UTC); without
+   the keys it is skipped with one Telegram alert.
+7. **Go live on 19 Nov - only after you say go**: set `app.dry_run: false` in `config.yaml` and run
+   `python -m pipeline.runner loop` (or the server service, step 8). The first live post starts
+   week 1: 50/50 A/B and Telegram cards for 7 days, then the bandit and auto approval.
+8. *Optional*: move to an always-on server (README "Moving to a server": systemd unit in
+   `deploy/`, set `posting.profile: "server"`), and set `HEALTHCHECK_URL` for the dead-man switch.
+9. *Optional*: this machine has `HF_HOME=D:\huggingface_cache` set system-wide but no D: drive;
+   whisper now falls back to `~/.cache/huggingface` (PLAN call #136), but you may want to remove or
+   fix that variable.
+
+## 0b. Fix pass 2026-11-10: results
+
+### Task 3: real-clip check of every preview (`python scripts/verify_previews.py`): 24/24 pass
+Items: item_00983f85d1fd (GamingBolt), item_1032dd2c31da (Tridzo GTA), item_5a67cc8642ed (Hazard),
+the three in this laptop's `pipeline.db` (none was swapped out). All were re-downloaded as H.264
+1080p and re-cut under the final rule; item_1032 needed its 8th-best window (the first 7 had no
+sentence end in 18-22 s). The hooks/VO are the ones stored earlier; item_1032's window moved
+(111.1 s -> 114.4 s), item_00983 and item_5a67 kept their start.
+"Source check" = the end placed back in the source, re-transcribed with 2 s after it, and the audio
+level at the cut point relative to the speaker. Whisper hears Hazard's "wanted level." as "wanna
+love." / "-lup." in the source too; that is whisper, not the cut.
+
+```
+item               file         dur  last words (render tail)           source check                                               SFX cues (s)     gaps (s)  result
+item_00983f85d1fd  P0_A.mp4   21.07  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                -                -         OK
+item_00983f85d1fd  P0_B.mp4   27.27  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                -                -         OK
+item_00983f85d1fd  P1_A.mp4   21.07  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                -                -         OK
+item_00983f85d1fd  P1_B.mp4   27.27  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                -                -         OK
+item_00983f85d1fd  P2_A.mp4   21.07  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                0.00, 13.24      13.24     OK
+item_00983f85d1fd  P2_B.mp4   27.27  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                0.00, 19.44      19.44     OK
+item_00983f85d1fd  P3_A.mp4   21.07  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                0.00, 13.24      13.24     OK
+item_00983f85d1fd  P3_B.mp4   27.27  not to do so.                      pause: 'so.' | next The +0.89s | end -16 dB                0.00, 19.44      19.44     OK
+item_1032dd2c31da  P0_A.mp4   20.60  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        -                -         OK
+item_1032dd2c31da  P0_B.mp4   22.50  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        -                -         OK
+item_1032dd2c31da  P1_A.mp4   20.60  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        -                -         OK
+item_1032dd2c31da  P1_B.mp4   22.50  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        -                -         OK
+item_1032dd2c31da  P2_A.mp4   20.60  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        0.00, 17.14      17.14     OK
+item_1032dd2c31da  P2_B.mp4   22.50  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        0.00, 19.04      19.04     OK
+item_1032dd2c31da  P3_A.mp4   20.60  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        0.00, 17.14      17.14     OK
+item_1032dd2c31da  P3_B.mp4   22.50  download one megabyte pack.        punct_audio: 'pack.' | next Now +0.18s | end -24 dB        0.00, 19.04      19.04     OK
+item_5a67cc8642ed  P0_A.mp4   18.47  of your wanna -lup.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    -                -         OK
+item_5a67cc8642ed  P0_B.mp4   21.17  of your wanna -lup.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    -                -         OK
+item_5a67cc8642ed  P1_A.mp4   18.47  of your wanna love.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    -                -         OK
+item_5a67cc8642ed  P1_B.mp4   21.17  of your wanna -lup.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    -                -         OK
+item_5a67cc8642ed  P2_A.mp4   18.47  of your wanna love.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    0.00, 16.34      16.34     OK
+item_5a67cc8642ed  P2_B.mp4   21.17  of your wanna love.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    0.00, 19.04      19.04     OK
+item_5a67cc8642ed  P3_A.mp4   18.47  of your wanna love.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    0.00, 16.34      16.34     OK
+item_5a67cc8642ed  P3_B.mp4   21.17  of your wanna love.                punct_audio: 'love.' | next They're +0.08s | end -16 dB    0.00, 19.04      19.04     OK
 ```
 
-Then look at `media/previews/<item_id>/grid_A.mp4` and `grid_B.mp4` (2x2, tiles labelled
-P0-P3), pick a preset, and set `style.preset` in `config.yaml`. **The pipeline default is
-still `P0`** and nothing changes until that choice is made.
-`media/previews/README.txt` lists every file, its hook, its keywords and its render time.
 
-`scripts/render_previews.py` is one command with no prompts: it re-downloads and re-cuts
-`item_a35aead652d3`, `item_763c2e191a1f` and `item_4622278cd0fc`, reuses their stored
-hooks and voiceover scripts, generates the C1 keywords with Gemini when `GEMINI_API_KEY`
-is set (and the rule fallback otherwise), and renders into
-`media/previews/<id>/P{n}_{A,B}.mp4`.
+### CP4 dry run (`python scripts/cp4_dry_run.py`, seed 7)
+10 simulated days on a fake clock, real stage code, every network call faked, temporary database
+(the real `pipeline.db` and `media/` are checked to be untouched). Result: **PASS**.
+
+```
+window      : 2026-11-12T00:00:00Z -> 2026-11-22T00:00:00Z (10 days, 480 ticks of 30 min)
+cycles      : 412 run, 1 with a failed stage (the simulated crash); laptop asleep 16 Nov 06:00Z -> 17 Nov 16:00Z
+healthcheck : 411 pings (one per fully successful cycle; none for the failed one)
+approval    : 20 Telegram cards, taps ok 15 / A-only 2 / reject 3
+auto switch : first live 12 Nov 07:30Z; auto approval from 19 Nov 07:30Z (7 days); 1 switch notice
+posts       : 16 items published, 32 platform publishes, max 2 per local day, >= 3 h apart
+missed slots: 4 re-slotted after the sleep, one per slot (16 Nov 13:00 -> 18 Nov 13:00 IST, ...)
+crash       : sim-02 - runner died right after Instagram published -> settled live, 1 publish
+lost reply  : sim-04 - Instagram published, reply lost -> settled live, 1 publish call
+variant     : drawn at each slot; week 1: A 7 / B 2 (50/50 random); after week 1 (19 Nov 07:30Z):
+              4 draws still 50/50 (B had < 3 measured items), then 2 by the bandit
+              (B leads 0.91 vs 0.41 -> B 80% / A 20%), one A and one B
+metrics     : 24 x 24h and 16 x 72h snapshots
+cleanup     : 6 items' renders deleted 7 days after posting, 6 items 'cleaned'
+invariants  : no double post / no burst / nothing preview_only, rejected or unapproved posted /
+              cleanup kept every file an open post needs / uploaded variant == row variant /
+              real pipeline.db + media untouched  -> all PASS
+```
+
 
 ---
 
 ## 1. Project State
-- **Checkpoints 0 - 3**: Completed and committed.
-  - CP0: Architecture plan, database schema, configuration, environment setup.
-  - CP1: Discovery (YouTube/official channels), pull-based download, perceptual deduplication (pHash/Hamming), crash recovery.
-  - CP2: Cut detection (loudness + scene changes), Gemini grounded hooks, Kokoro TTS voiceover, ASS subtitle generation, vertical 9:16 rendering (Variants A & B).
-- **Style layer**: Completed and committed. Edit effects as independently toggleable
-  flags grouped into presets **P0-P3**, all numbers under `style:` in `config.yaml`,
-  verified on a synthetic clip (`samples/synthetic/presets_sheet.png`). See **PLAN.md
-  §7B** and *Calls I made* #33-59. **The default preset stays P0.**
-  - CP3: Telegram approval card (one self-editing card, strictly one item at a time) and Meta
-    posting (Instagram Reels resumable upload + Facebook Page Reels `video_reels`), two-phase and
-    crash-safe. Merged into `main` (PLAN.md *Calls I made* #60-74, renumbered from 33-47).
-- **Checkpoint 3**: built and tested with mocks. **Not yet run against the real APIs** - that is the
-  laptop dry run in section 5 below, and no live post happens until you say go.
-- **Safety Defaults**: `dry_run: true` remains active by default in `config.yaml`, and
+- **CP0-CP2 + style layer**: done (PLAN.md §1-§8, §7B; calls #1-#59). Default preset **P0**.
+- **Endings** (fix pass 2026-11-10): a clip only ends after a completed sentence, checked against
+  the audio; an item with no clean ending fails at `cut` with `no_clean_ending` (PLAN.md §7,
+  calls #124-#136, #146-#151).
+- **SFX** (fix pass 2026-11-10): the hook boom, then at most one whoosh at least 5 s from any other
+  cue; max 2 per clip (calls #137-#139).
+- **CP3** (Telegram approval + Meta posting): built and tested with mocks on `main`. **Not yet run
+  against the real APIs** (step 4 above).
+- **CP4** (scheduler, slot-time A/B draw, approval switch, analytics, cleanup, Twitch, healthcheck,
+  server unit): built and tested with mocks on `main`; `scripts/cp4_dry_run.py` passes every
+  invariant over 10 simulated days (section 0b). **Not yet run against the real APIs.**
+- **Safety defaults**: `app.dry_run: true` and `style.preset: "P0"` in `config.yaml`;
   `posting.dry_run_mode: plan_only` means a dry run sends no write request to Meta at all.
 
 ---
@@ -147,7 +231,6 @@ python scripts/fetch_assets.py --check   # verify assets and licences, download 
 
 ---
 
-## 5. Test Commands
 ## 5. CP3 Laptop Steps: run the dry run
 > **Run `git pull` on `main` first.** Nothing below posts
 > anything publicly; the dry run cannot reach a publish endpoint.
@@ -213,7 +296,7 @@ Runs all unit and mock tests:
 pytest
 ```
 *(Default `pytest.ini` runs `-m "not live"`, passing completely offline).*
-**140 passed, 1 deselected** as of the style-layer pass — 65 pre-existing plus:
+**140 passed, 1 deselected** as of the style-layer pass (see the final message of the latest pass for the current count) — 65 pre-existing plus:
 `tests/test_style.py` (presets, F1 segments and geometry, safe-area placement, C1-C4,
 M1-M4, A1-A4 maths, graph assembly), `tests/test_style_render.py` (the same through
 ffmpeg/libass: the F1 band really resizes, the bar really fills, the hook outlines really
@@ -302,12 +385,9 @@ and refuse any `posts` insert/update for it, whatever code tries. Clear the flag
 after a real hooks run.
 
 ## 7. Known issues: both FIXED (PLAN.md calls 81-83)
-1. **Dedupe/scene-detection timeouts on AV1 1440p sources.** yt-dlp's
-   `bestvideo[ext=mp4]` picks AV1 1440p60; the gyan.dev "essentials" ffmpeg only has the
-   libaom AV1 decoder (~13 s per 30 s of source here). Download dedupe (180 s timeout)
-   timed out on all three 9-10 min sources, so no fingerprints were stored and dedupe
-   was effectively skipped; scene detection took ~240-270 s of its 300 s limit (a timeout
-   would reject the clip as `static_source`). Planned fix: cap downloads at 1080p H.264.
-2. **The test suite writes into the real project folder** (e.g.
-   `media/downloads/dl_item_1.mp4` from `tests/test_download.py`). Tests should use
-   `tmp_path` for media as they do for the DB.
+1. **Dedupe/scene-detection timeouts on AV1 1440p sources** - FIXED: downloads are capped at
+   1080p H.264 and an AV1 / over-cap file is refused. Verified on the laptop 2026-11-10: the three
+   preview sources were re-downloaded as H.264 1080p and a full window scan took ~36 s instead of
+   ~4 min. (`media/downloads/dl_item_1.mp4` is a leftover of the old test behaviour; safe to delete.)
+2. **The test suite wrote into the real project folder** - FIXED: tests use `tmp_path` for media,
+   and `tests/test_zz_media_isolation.py` fails the run if anything under the real `media/` changes.
