@@ -55,6 +55,14 @@ dedupe:
   download_coverage_threshold: 0.65 # Fraction of shorter video duration that must match
   consecutive_frames: 3 # Frames sequence window for Hamming comparison
 
+download:
+  # Sources are capped at 1080p H.264 (avc1). yt-dlp's default picked AV1 1440p60, which the
+  # laptop's ffmpeg decodes far slower than real time, so dedupe (180 s) and scene detection
+  # (300 s) timed out. Fallback chain in pipeline/download.py:format_selector; AV1 is never picked.
+  max_height: 1080
+  reject_codecs: ["av1"] # a finished download in one of these codecs is failed, not processed
+  format: null # set a yt-dlp selector here to replace the built-in chain entirely
+
 buffer:
   target_ready_items: 6 # Pull-based cap: process only enough to maintain 6 ready items
 

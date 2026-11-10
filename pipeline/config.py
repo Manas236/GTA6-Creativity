@@ -68,9 +68,26 @@ def get_config(reload: bool = False) -> dict[str, Any]:
     return _CONFIG_CACHE
 
 
+_MEDIA_ROOT: Path | None = None
+
+
+def set_media_root(path: Path | str | None) -> None:
+    """Point every media path somewhere else (the tests use tmp_path). None restores the default."""
+    global _MEDIA_ROOT
+    _MEDIA_ROOT = Path(path) if path is not None else None
+
+
+def media_root() -> Path:
+    """The media folder: set_media_root() > $GTA6_MEDIA_DIR > <project>/media. Not created here."""
+    if _MEDIA_ROOT is not None:
+        return _MEDIA_ROOT
+    env_root = os.environ.get("GTA6_MEDIA_DIR")
+    return Path(env_root) if env_root else ROOT_DIR / "media"
+
+
 def media_dir(subdir: str = "") -> Path:
     """Get path to media directory, ensuring it exists."""
-    p = ROOT_DIR / "media"
+    p = media_root()
     if subdir:
         p = p / subdir
     p.mkdir(parents=True, exist_ok=True)

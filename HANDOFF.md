@@ -301,7 +301,7 @@ to move it into `rendered`/`awaiting_approval`/`approved`/`queued`/`posted`/`mea
 and refuse any `posts` insert/update for it, whatever code tries. Clear the flag only
 after a real hooks run.
 
-## 7. Known issues (logged, not fixed)
+## 7. Known issues: both FIXED (PLAN.md calls 81-83)
 1. **Dedupe/scene-detection timeouts on AV1 1440p sources.** yt-dlp's
    `bestvideo[ext=mp4]` picks AV1 1440p60; the gyan.dev "essentials" ffmpeg only has the
    libaom AV1 decoder (~13 s per 30 s of source here). Download dedupe (180 s timeout)

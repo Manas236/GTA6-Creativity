@@ -965,6 +965,12 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 79. **The card shows the item's own `style_preset` renders**: `telegram_bot.card_renders()` returns the render paths recorded on the item (the files made with `items.style_preset`, and the files that will be posted) plus the preset name, which is printed on the card and on the Variant A message. It never picks a `media/previews/` render of another preset and never follows `style.preset` if that changed after the item was rendered. An item rendered before the style layer (NULL preset) is labelled P0, which is what those renders were.
 80. **Reddit caption template removed, Twitch template added, templates in config**: `posting.caption_templates` (`youtube`, `twitch`); the render stage now builds its caption through the same `posting.build_caption()` instead of a hard-coded string, so a Twitch item gets the Twitch credit. Twitch credits the *broadcaster* (the streamer whose content it is), not the viewer who pressed "clip".
 
+### Known issues from HANDOFF §7
+
+81. **Downloads capped at 1080p H.264, with no "anything" fallback**: `download.format_selector()` builds the chain avc1 ≤1080p + m4a → avc1 ≤1080p + any audio → progressive avc1 → any non-AV1 ≤1080p (VP9) + audio → a single non-AV1 ≤1080p file with unknown codec allowed (Twitch clips report none). A source that exists only as AV1 or only above 1080p **fails the download** rather than being picked: a slow-decoding source is what made dedupe time out (so no fingerprints were stored and dedupe was silently skipped) and what pushed scene detection to its limit. The chain is tested against yt-dlp's real selector, offline.
+82. **A finished download is probed and failed closed if it is AV1 or above the cap** (`download.source_is_acceptable`, `download.reject_codecs`): step 5 of the chain accepts files whose codec the site does not report, so the file itself is the only proof. Height is compared on the short side, so a vertical 1080×1920 clip is not rejected as "1920p".
+83. **Tests write media under `tmp_path` through one switch**: `config.set_media_root()` (and `$GTA6_MEDIA_DIR`) redirect `config.media_dir()`; an autouse fixture points it at `tmp_path/media` for every test. `tests/test_zz_media_isolation.py` runs last and fails if any file under the real `media/` was added, removed or changed during the session (snapshot taken in `pytest_sessionstart`), so it also holds on the laptop where `media/` has real content.
+
 ---
 
 ## 14. Checkpoint 1 Re-Proof Verification Data

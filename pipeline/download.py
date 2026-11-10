@@ -47,6 +47,79 @@ def verify_video_file(path: Path | str) -> tuple[bool, float]:
     return False, 0.0
 
 
+def format_selector(cfg: dict[str, Any] | None = None) -> str:
+    """The yt-dlp format selector: H.264 (avc1) capped at `download.max_height`, never AV1.
+
+    yt-dlp's old `bestvideo[ext=mp4]` picked AV1 1440p60, which the laptop's ffmpeg decodes at
+    ~0.4x real time - dedupe and scene detection then ran into their timeouts. The chain, first
+    match wins:
+      1. H.264 video <= max_height + m4a (AAC) audio   - the normal YouTube case, no re-encode
+      2. H.264 video <= max_height + any audio
+      3. a single progressive H.264 file <= max_height
+      4. any NON-AV1 video <= max_height + audio       - e.g. VP9 when a video has no avc1 at all
+      5. a single file <= max_height whose codec is not AV1, unknown height/codec allowed
+                                                       - Twitch clips, which report no codec
+    There is deliberately no "anything at all" fallback: a source that only exists as AV1 or
+    above max_height fails the download instead of being picked.
+    `download.format` in config.yaml replaces the whole chain.
+    """
+    dl = ((cfg or {}).get("download") or {})
+    if dl.get("format"):
+        return str(dl["format"])
+    h = int(dl.get("max_height", 1080))
+    return "/".join(
+        [
+            f"bv[vcodec^=avc1][height<={h}]+ba[ext=m4a]",
+            f"bv[vcodec^=avc1][height<={h}]+ba",
+            f"b[vcodec^=avc1][height<={h}]",
+            f"bv[vcodec!^=av01][height<={h}]+ba",
+            f"b[vcodec!^=?av01][height<=?{h}]",
+        ]
+    )
+
+
+def probe_video_stream(path: Path | str) -> tuple[str, int]:
+    """(codec_name, height) of the first video stream, or ("", 0) when ffprobe cannot tell."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,height", "-of", "csv=p=0", str(path),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip()
+        codec, _, height = out.splitlines()[0].partition(",")
+        return codec.strip().lower(), int(float(height or 0))
+    except Exception as e:  # noqa: BLE001
+        log.warning("ffprobe stream check failed for %s: %s", path, e)
+        return "", 0
+
+
+def source_is_acceptable(path: Path | str, cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Fail closed if a download still came out as AV1 or above the height cap (the selector's
+    last step accepts files whose codec the site does not report)."""
+    dl = ((cfg or {}).get("download") or {})
+    max_height = int(dl.get("max_height", 1080))
+    rejected = {str(c).lower() for c in dl.get("reject_codecs", ["av1"])}
+    codec, height = probe_video_stream(path)
+    if codec in rejected:
+        return False, f"source is {codec} ({height}p); only H.264/VP9 sources are processed"
+    # A vertical 1080x1920 clip has height 1920; compare the short side to the cap.
+    if height > max_height and not _short_side_within(path, max_height):
+        return False, f"source is {height}p, above the {max_height}p cap"
+    return True, f"{codec or 'unknown'} {height}p"
+
+
+def _short_side_within(path: Path | str, max_height: int) -> bool:
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path),
+    ]
+    try:
+        w, _, h = subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip().partition(",")
+        return min(int(w), int(h)) <= max_height
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def download_single_item(
     item: dict[str, Any],
     cfg: dict[str, Any] | None = None,
@@ -78,7 +151,7 @@ def download_single_item(
             pass
 
     ydl_opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": format_selector(cfg or config.get_config()),
         "outtmpl": str(temp_pattern),
         "quiet": True,
         "no_warnings": True,
@@ -122,6 +195,12 @@ def download_single_item(
         actual_temp.unlink(missing_ok=True)
         db.mark_failed(item_id, "download", "ffprobe validation failed (corrupt or unreadable media)", db_path=db_path)
         return False, "ffprobe validation failed"
+
+    acceptable, why = source_is_acceptable(actual_temp, cfg or config.get_config())
+    if not acceptable:
+        actual_temp.unlink(missing_ok=True)
+        db.mark_failed(item_id, "download", f"Unsupported source format: {why}", db_path=db_path)
+        return False, f"Unsupported source format: {why}"
 
     # Atomically rename to final file
     try:
