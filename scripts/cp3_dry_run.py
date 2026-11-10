@@ -7,8 +7,11 @@ What it does:
      render. If the database holds none, it builds a synthetic 9:16 pair with ffmpeg first, under a
      `synthetic-cp3-*` item id, so the card can be seen exactly as it will look in production.
   2. Meta: validates the tokens and permissions with READ-ONLY GET calls - /debug_token, the IG
-     user, the IG publishing limit and the Facebook Page - and then runs the real posting flow in
-     dry-run mode, which writes a plan of every request it would send.
+     user, the IG publishing limit, the Facebook Page and the Page's linked IG account - and then
+     runs the real posting flow in dry-run mode, which writes a plan of every request it would send.
+     It FAILS (exit code 1, every missing permission listed) when a token lacks any of the nine
+     permissions in REQUIRED_SCOPES, is not a PAGE token (for FB_PAGE_ID, when Meta names the Page),
+     is not valid, or when IG_USER_ID is not the Instagram account linked to FB_PAGE_ID.
 
 It can NEVER publish. Three independent guards:
   * `app.dry_run` is forced to true and `posting.dry_run_mode` to "plan_only" for this process;
@@ -25,6 +28,7 @@ import logging
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +44,25 @@ FORBIDDEN_URL_PARTS = ("media_publish", "rupload.facebook.com", "/video_reels")
 FORBIDDEN_BODY_KEYS = ("upload_phase", "video_state", "creation_id", "upload_type")
 
 SYNTHETIC_PREFIX = "synthetic-cp3-"
+
+# Every Meta permission the pipeline uses, and what for (SETUP.md section 2). One Page token from
+# me/accounts normally carries all nine. With a separate FB_PAGE_ACCESS_TOKEN they are split:
+# the Instagram token needs IG_SCOPES and the Facebook token FB_SCOPES.
+REQUIRED_SCOPES: dict[str, str] = {
+    "instagram_basic": "IG account lookup and recent media (crash recovery)",
+    "instagram_content_publish": "IG Reels: container, upload, media_publish",
+    "instagram_manage_insights": "IG 24 h / 72 h metric snapshots",
+    "business_management": "added by the Instagram use case; needed if the Page is in a business portfolio",
+    "pages_show_list": "me/accounts; required by Page Reels publishing",
+    "pages_read_engagement": "required by IG publishing and by Page Reels publishing",
+    "pages_manage_posts": "Facebook Page Reels (video_reels start / finish)",
+    "read_insights": "Facebook Reel metric snapshots (video_insights)",
+    "pages_manage_engagement": "Facebook Reel metric snapshots (video_insights)",
+}
+IG_SCOPES = ("instagram_basic", "instagram_content_publish", "instagram_manage_insights",
+             "business_management", "pages_show_list", "pages_read_engagement")
+FB_SCOPES = ("pages_show_list", "pages_read_engagement", "pages_manage_posts",
+             "read_insights", "pages_manage_engagement")
 
 
 class PublishAttempted(RuntimeError):
@@ -177,56 +200,109 @@ def check_telegram(db_path: Any = None, cfg: dict[str, Any] | None = None) -> di
 # Meta
 # ---------------------------------------------------------------------------
 
+def _get_row(client: posting.MetaClient, step: str, url: str, params: dict[str, Any]) -> dict[str, Any]:
+    """One read-only GET as a result row: ok + the JSON body, or not ok + the redacted error."""
+    row: dict[str, Any] = {"step": step}
+    try:
+        row["data"] = client.check(client.get(url, params=params, timeout=30), step)
+        row["ok"] = True
+    except Exception as e:  # noqa: BLE001
+        row["ok"] = False
+        row["detail"] = posting.redact(e)[:400]
+    return row
+
+
+def _date(epoch: Any) -> str:
+    """A debug_token timestamp as a date; 0 means never."""
+    try:
+        value = int(epoch)
+    except (TypeError, ValueError):
+        return "?"
+    return "never" if value == 0 else datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def check_token(
+    client: posting.MetaClient, step: str, token: str, required: tuple[str, ...], page: str | None
+) -> dict[str, Any]:
+    """/debug_token for one token. It must be valid, a PAGE token (for `page`, when Meta names the
+    Page in profile_id) and carry every permission in `required`; anything less fails the row.
+    An answer with no scopes at all counts every required permission as missing."""
+    row = _get_row(client, step, f"{client.base()}/debug_token", {"input_token": token, "access_token": token})
+    if not row.get("ok"):
+        return row
+    info = (row.get("data") or {}).get("data") or {}
+    scopes = set(info.get("scopes") or [])
+    kind = info.get("type")
+    row["type"] = kind
+    row["missing"] = [s for s in required if s not in scopes]
+    row["detail"] = (
+        f"type={kind}, valid={info.get('is_valid')}, expires={_date(info.get('expires_at'))}"
+        + (f", data access until {_date(info['data_access_expires_at'])}"
+           if info.get("data_access_expires_at") is not None else "")
+        + f", {len(required) - len(row['missing'])}/{len(required)} required permissions"
+    )
+    problems: list[str] = []
+    if info.get("is_valid") is not True:
+        problems.append("the token is not valid - make a new one (SETUP.md 2d)")
+    if kind != "PAGE":
+        problems.append(f"it is a {kind or 'UNKNOWN'} token, not a PAGE token - use the Page's "
+                        "access_token from me/accounts (SETUP.md 2d)")
+    profile = info.get("profile_id")
+    if page and profile and str(profile) != str(page):
+        problems.append(f"it is a token for Page {profile}, not for FB_PAGE_ID {page}")
+    if row["missing"]:
+        problems.append(f"MISSING {len(row['missing'])} permission(s): {', '.join(row['missing'])}")
+    if problems:
+        row["ok"] = False
+        row["detail"] += "; " + "; ".join(problems)
+    return row
+
+
+def check_ig_link(client: posting.MetaClient, page: str, ig_user: str, token: str) -> dict[str, Any]:
+    """IG_USER_ID must be the Instagram account linked to FB_PAGE_ID: IG publishing goes through it."""
+    row = _get_row(client, "ig_linked_to_page", f"{client.base()}/{page}",
+                   {"fields": "instagram_business_account", "access_token": token})
+    if not row.get("ok"):
+        return row
+    linked = str(((row.get("data") or {}).get("instagram_business_account") or {}).get("id") or "")
+    if not linked:
+        row["ok"] = False
+        row["detail"] = (f"Page {page} has no Instagram account linked: Page settings -> Linked accounts -> "
+                         "Instagram (SETUP.md 2b), or the IG account was not ticked in the login dialog (2d)")
+    elif linked != str(ig_user):
+        row["ok"] = False
+        row["detail"] = f"Page {page} is linked to Instagram account {linked}, but IG_USER_ID is {ig_user}"
+    else:
+        row["detail"] = f"Page {page} -> Instagram {linked}"
+    return row
+
+
 def check_meta_tokens(client: posting.MetaClient) -> list[dict[str, Any]]:
-    """Read-only GETs only: the token itself, the IG user, the publishing limit and the Page."""
+    """Read-only GETs only: every token in use, the IG user, the publishing limit, the Page and the
+    Page's linked IG account. Each problem fails its row, and any failed row fails the run."""
     results: list[dict[str, Any]] = []
     ig_user, ig_tok = config.secret("IG_USER_ID"), posting.ig_token()
     page, fb_tok = config.secret("FB_PAGE_ID"), posting.fb_token()
     base = client.base()
 
-    def gets(step: str, url: str, params: dict[str, Any]) -> dict[str, Any]:
-        row: dict[str, Any] = {"step": step}
-        try:
-            data = client.check(client.get(url, params=params, timeout=30), step)
-            row["ok"] = True
-            row["data"] = data
-        except Exception as e:  # noqa: BLE001
-            row["ok"] = False
-            row["detail"] = posting.redact(e)[:400]
-        return row
-
     if not ig_tok:
         results.append({"step": "token", "ok": False, "detail": "IG_ACCESS_TOKEN missing from .env"})
         return results
 
-    token_row = gets("debug_token", f"{base}/debug_token", {"input_token": ig_tok, "access_token": ig_tok})
-    info = (token_row.get("data") or {}).get("data") or {}
-    if token_row.get("ok"):
-        scopes = info.get("scopes") or []
-        expires = info.get("expires_at")
-        token_row["detail"] = (
-            f"type={info.get('type')}, valid={info.get('is_valid')}, "
-            f"expires={'never' if expires == 0 else expires}, "
-            f"{len(scopes)} permissions"
-        )
-        missing_ig = [s for s in ("instagram_basic", "instagram_content_publish") if scopes and s not in scopes]
-        missing_fb = [s for s in ("pages_manage_posts", "pages_read_engagement") if scopes and s not in scopes]
-        token_row["missing_instagram"] = missing_ig
-        token_row["missing_facebook"] = missing_fb
-        if missing_ig or missing_fb:
-            token_row["ok"] = False
-            token_row["detail"] += f"; MISSING: {missing_ig + missing_fb}"
-        if info.get("is_valid") is False:
-            token_row["ok"] = False
-            token_row["detail"] += "; the token is no longer valid"
-    results.append(token_row)
+    if fb_tok and fb_tok != ig_tok:
+        # FB_PAGE_ACCESS_TOKEN is set: the nine permissions are split between the two tokens.
+        results.append(check_token(client, "debug_token_ig", ig_tok, IG_SCOPES, page))
+        results.append(check_token(client, "debug_token_fb", fb_tok, FB_SCOPES, page))
+    else:
+        results.append(check_token(client, "debug_token", ig_tok, tuple(REQUIRED_SCOPES), page))
 
     if ig_user:
-        row = gets("ig_user", f"{base}/{ig_user}", {"fields": "id,username", "access_token": ig_tok})
+        row = _get_row(client, "ig_user", f"{base}/{ig_user}", {"fields": "id,username", "access_token": ig_tok})
         if row.get("ok"):
             row["detail"] = f"@{(row['data'] or {}).get('username')} ({(row['data'] or {}).get('id')})"
         results.append(row)
-        limit = gets("ig_publishing_limit", f"{base}/{ig_user}/content_publishing_limit", {"access_token": ig_tok})
+        limit = _get_row(client, "ig_publishing_limit", f"{base}/{ig_user}/content_publishing_limit",
+                         {"access_token": ig_tok})
         if limit.get("ok"):
             limit["detail"] = json.dumps((limit["data"] or {}).get("data"))
         results.append(limit)
@@ -234,14 +310,13 @@ def check_meta_tokens(client: posting.MetaClient) -> list[dict[str, Any]]:
         results.append({"step": "ig_user", "ok": False, "detail": "IG_USER_ID missing from .env"})
 
     if page:
-        row = gets("fb_page", f"{base}/{page}", {"fields": "id,name", "access_token": fb_tok})
+        row = _get_row(client, "fb_page", f"{base}/{page}", {"fields": "id,name", "access_token": fb_tok})
         if row.get("ok"):
             data = row["data"] or {}
             row["detail"] = f"Page {data.get('name')} ({data.get('id')})"
-            if info.get("type") and info["type"] != "PAGE":
-                row["ok"] = False
-                row["detail"] += f"; the token is a {info['type']} token, Page Reels need a PAGE token"
         results.append(row)
+        if ig_user:
+            results.append(check_ig_link(client, page, ig_user, ig_tok))
     else:
         results.append({"step": "fb_page", "ok": False, "detail": "FB_PAGE_ID missing from .env"})
 
@@ -327,14 +402,23 @@ def main() -> int:
             rows.append({"step": "posting_dry_run", "ok": False, "detail": f"GUARD TRIPPED: {e}"})
         log.info("Meta GETs actually sent: %d", len(guard.gets))
 
+    return print_summary(rows)
+
+
+def print_summary(rows: list[dict[str, Any]]) -> int:
+    """Print every row, each missing permission on its own line; 1 if any row failed, else 0."""
     print("\n" + "=" * 78)
     print(" SUMMARY")
     print("=" * 78)
     for row in rows:
         print(f"  {'OK  ' if row.get('ok') else 'FAIL'}  {row['step']:<22} {str(row.get('detail', ''))[:300]}")
+        for scope in row.get("missing") or []:
+            print(f"          missing {scope:<26} {REQUIRED_SCOPES.get(scope, '')}")
     failed = [r["step"] for r in rows if not r.get("ok")]
     if failed:
         print(f"\n  Needs attention: {', '.join(failed)}")
+        if any(r.get("missing") for r in rows):
+            print("  Add the missing permissions to the app (SETUP.md 2c), then make a new token (2d).")
         print("  Nothing was published, and nothing can be: the dry run sends no write request.")
         return 1
     print("\n  Everything passed. Nothing was published.")

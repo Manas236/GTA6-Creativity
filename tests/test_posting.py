@@ -855,6 +855,149 @@ def test_the_dry_run_script_guard_refuses_every_write_and_publish_endpoint(secre
 
 
 # ---------------------------------------------------------------------------
+# The laptop dry-run script's Meta checks: nine permissions, PAGE token, IG linked to the Page
+# ---------------------------------------------------------------------------
+
+NINE_SCOPES = [
+    "instagram_basic", "instagram_content_publish", "instagram_manage_insights", "business_management",
+    "pages_show_list", "pages_read_engagement", "pages_manage_posts", "read_insights",
+    "pages_manage_engagement",
+]
+
+
+def _meta_secrets(monkeypatch, fb_token: str = "") -> None:
+    values = {"IG_USER_ID": IG_USER, "IG_ACCESS_TOKEN": "page-token-secret", "FB_PAGE_ID": FB_PAGE,
+              "FB_PAGE_ACCESS_TOKEN": fb_token}
+    monkeypatch.setattr(posting.config, "secret", lambda key, default="": values.get(key, default))
+
+
+def _meta_routes(scopes: dict[str, list[str]], token_type: str = "PAGE", profile: str | None = FB_PAGE,
+                 linked: str | None = IG_USER, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    def debug(method, url, kw):
+        info = {"type": token_type, "is_valid": True, "expires_at": 0, "data_access_expires_at": 1_800_000_000,
+                "scopes": scopes[kw["params"]["input_token"]]}
+        if profile:
+            info["profile_id"] = profile
+        return FakeResponse({"data": {**info, **(extra or {})}})
+
+    def page(method, url, kw):
+        if "instagram_business_account" in kw["params"]["fields"]:
+            return FakeResponse({"id": FB_PAGE, **({"instagram_business_account": {"id": linked}} if linked else {})})
+        return FakeResponse({"id": FB_PAGE, "name": "Clips Page"})
+
+    return {
+        "debug_token": debug,
+        f"/{IG_USER}/content_publishing_limit": FakeResponse({"data": [{"quota_usage": 0}]}),
+        f"/{IG_USER}": FakeResponse({"id": IG_USER, "username": "clips"}),
+        f"/{FB_PAGE}": page,
+    }
+
+
+def _run_meta_checks(tmp_db, cfg, routes):
+    script = _load_cp3_script()
+    transport = FakeTransport(routes)
+    clock = Clock()
+    client = posting.MetaClient(transport=transport, cfg=cfg, db_path=tmp_db, clock=clock, sleep=clock.sleep)
+    rows = {r["step"]: r for r in script.check_meta_tokens(client)}
+    assert all(method == "GET" for method, _, _ in transport.calls)
+    return script, rows
+
+
+def test_the_dry_run_script_requires_exactly_the_nine_documented_permissions():
+    script = _load_cp3_script()
+    assert sorted(script.REQUIRED_SCOPES) == sorted(NINE_SCOPES)
+    assert set(script.IG_SCOPES) | set(script.FB_SCOPES) == set(NINE_SCOPES)
+    assert {"read_insights", "pages_manage_engagement", "pages_manage_posts"} <= set(script.FB_SCOPES)
+
+
+def test_the_dry_run_meta_checks_pass_with_one_page_token_carrying_all_nine(tmp_db, cfg, monkeypatch, capsys):
+    _meta_secrets(monkeypatch)
+    script, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": NINE_SCOPES}))
+
+    assert list(rows) == ["debug_token", "ig_user", "ig_publishing_limit", "fb_page", "ig_linked_to_page"]
+    assert all(r["ok"] for r in rows.values()), rows
+    assert rows["debug_token"]["missing"] == []
+    assert "type=PAGE" in rows["debug_token"]["detail"] and "expires=never" in rows["debug_token"]["detail"]
+    assert "9/9 required permissions" in rows["debug_token"]["detail"]
+    assert script.print_summary(list(rows.values())) == 0
+    assert "page-token-secret" not in capsys.readouterr().out
+
+
+def test_the_dry_run_fails_and_lists_every_missing_permission(tmp_db, cfg, monkeypatch, capsys):
+    _meta_secrets(monkeypatch)
+    old_list = [s for s in NINE_SCOPES if s not in ("read_insights", "pages_manage_engagement")]
+    script, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": old_list}))
+
+    token = rows["debug_token"]
+    assert token["ok"] is False
+    assert token["missing"] == ["read_insights", "pages_manage_engagement"]
+    assert "MISSING 2 permission(s): read_insights, pages_manage_engagement" in token["detail"]
+    assert script.print_summary(list(rows.values())) == 1
+    out = capsys.readouterr().out
+    assert "missing read_insights" in out and "missing pages_manage_engagement" in out
+    assert "Needs attention: debug_token" in out
+
+
+def test_the_dry_run_counts_an_answer_with_no_scopes_as_all_nine_missing(tmp_db, cfg, monkeypatch):
+    # The old check read `if scopes and s not in scopes`, so an empty scope list passed.
+    _meta_secrets(monkeypatch)
+    _, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": []}))
+    assert rows["debug_token"]["ok"] is False
+    assert sorted(rows["debug_token"]["missing"]) == sorted(NINE_SCOPES)
+
+
+def test_the_dry_run_fails_a_user_token_even_with_every_permission(tmp_db, cfg, monkeypatch):
+    _meta_secrets(monkeypatch)
+    _, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": NINE_SCOPES},
+                                                         token_type="USER", profile=None))
+    assert rows["debug_token"]["ok"] is False
+    assert "USER token, not a PAGE token" in rows["debug_token"]["detail"]
+    assert rows["fb_page"]["ok"] is True          # the Page itself is fine; the token is the problem
+
+
+def test_the_dry_run_fails_an_invalid_token_or_a_token_for_another_page(tmp_db, cfg, monkeypatch):
+    _meta_secrets(monkeypatch)
+    _, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": NINE_SCOPES},
+                                                         profile="999999999999999"))
+    assert rows["debug_token"]["ok"] is False
+    assert f"token for Page 999999999999999, not for FB_PAGE_ID {FB_PAGE}" in rows["debug_token"]["detail"]
+
+    _, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": NINE_SCOPES},
+                                                         extra={"is_valid": False}))
+    assert rows["debug_token"]["ok"] is False
+    assert "not valid" in rows["debug_token"]["detail"]
+
+
+def test_the_dry_run_fails_when_the_ig_account_is_not_linked_to_the_page(tmp_db, cfg, monkeypatch):
+    _meta_secrets(monkeypatch)
+    script, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": NINE_SCOPES}, linked=None))
+    assert rows["ig_linked_to_page"]["ok"] is False
+    assert "has no Instagram account linked" in rows["ig_linked_to_page"]["detail"]
+    assert script.print_summary(list(rows.values())) == 1
+
+    _, rows = _run_meta_checks(tmp_db, cfg, _meta_routes({"page-token-secret": NINE_SCOPES},
+                                                         linked="17841499999999999"))
+    assert rows["ig_linked_to_page"]["ok"] is False
+    assert f"linked to Instagram account 17841499999999999, but IG_USER_ID is {IG_USER}" in \
+        rows["ig_linked_to_page"]["detail"]
+
+
+def test_the_dry_run_splits_the_nine_permissions_over_two_tokens(tmp_db, cfg, monkeypatch):
+    script = _load_cp3_script()
+    _meta_secrets(monkeypatch, fb_token="fb-page-token-secret")
+    scopes = {"page-token-secret": list(script.IG_SCOPES), "fb-page-token-secret": list(script.FB_SCOPES)}
+    _, rows = _run_meta_checks(tmp_db, cfg, _meta_routes(scopes))
+    assert rows["debug_token_ig"]["ok"] and rows["debug_token_fb"]["ok"], rows
+    assert "debug_token" not in rows
+
+    scopes["fb-page-token-secret"] = [s for s in script.FB_SCOPES if s != "read_insights"]
+    _, rows = _run_meta_checks(tmp_db, cfg, _meta_routes(scopes))
+    assert rows["debug_token_ig"]["ok"] is True
+    assert rows["debug_token_fb"]["ok"] is False
+    assert rows["debug_token_fb"]["missing"] == ["read_insights"]
+
+
+# ---------------------------------------------------------------------------
 # preview_only: filtered explicitly, and a trigger refusal fails one item cleanly
 # ---------------------------------------------------------------------------
 

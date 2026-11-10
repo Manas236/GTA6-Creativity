@@ -2,7 +2,8 @@
 
 ## 0. Laptop: what to run next
 
-Everything below is still yours to do, in this order. Nothing posts publicly until step 7.
+Everything below is still yours to do, in this order. Nothing posts publicly until step 8.
+**Account setup (Telegram, Meta, Twitch) is a step-by-step guide of its own: [SETUP.md](SETUP.md).**
 
 1. **Update and check** (Windows PowerShell, in the project folder):
    ```powershell
@@ -17,26 +18,43 @@ Everything below is still yours to do, in this order. Nothing posts publicly unt
    `style.preset` in `config.yaml`. It is still **P0**. `media/previews/README.txt` ends with the
    endings/SFX check table (also in section 0b below). To re-render later:
    `python scripts/render_previews.py` then `python scripts/verify_previews.py`.
-3. **Fill in `.env`** (copy names from `.env.example`). Missing on this laptop as of 2026-11-10:
-   `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IG_USER_ID`, `IG_ACCESS_TOKEN`, `FB_PAGE_ID`,
-   `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`; optional and also missing: `FB_PAGE_ACCESS_TOKEN`
-   (only if `IG_ACCESS_TOKEN` is not a Page token for the Page) and `HEALTHCHECK_URL`.
-   `GEMINI_API_KEY` is set. Section 5.1 says where to get each value.
+3. **Fill in `.env`** by following [SETUP.md](SETUP.md) sections 1-4. Missing on this laptop as of
+   2026-11-10: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IG_USER_ID`, `IG_ACCESS_TOKEN`, `FB_PAGE_ID`,
+   `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`; optional and also missing: `HEALTHCHECK_URL`.
+   **Leave `FB_PAGE_ACCESS_TOKEN` blank**: one long-lived Page token carrying all nine permissions
+   (section 5.1) covers Instagram and Facebook Page Reels. `GEMINI_API_KEY` is set.
 4. **CP3 real-token dry run** (sends one real Telegram card; Meta is read-only):
    `python scripts/cp3_dry_run.py` - see section 5.2, and tell me what the card looked like and
-   what the summary said.
-5. **Check the insight metric names** in Graph API Explorer before the first 24 h snapshot
-   (`{ig-media-id}/insights?metric=views`, `{video-id}/video_insights`): PLAN.md calls #103-#104.
-   They are config (`analytics.instagram`, `analytics.facebook`), not code.
-6. **Twitch credentials before 19 Nov**: create an app at dev.twitch.tv, put `TWITCH_CLIENT_ID` /
-   `TWITCH_CLIENT_SECRET` in `.env`. Twitch discovery switches itself on 2026-11-19 (UTC); without
-   the keys it is skipped with one Telegram alert.
-7. **Go live on 19 Nov - only after you say go**: set `app.dry_run: false` in `config.yaml` and run
-   `python -m pipeline.runner loop` (or the server service, step 8). The first live post starts
+   what the summary said. It **fails (exit 1)** and lists what is missing if the token lacks any of
+   the nine permissions, is not a PAGE token or is invalid, or if `IG_USER_ID` is not the Instagram
+   account linked to `FB_PAGE_ID` (SETUP.md section 4 has the fix for each FAIL line).
+5. **Go Live in the Meta app - after step 4 passes, before 19 Nov** ([SETUP.md](SETUP.md) 2e). In
+   Development mode Meta shows the app's posts only to people with a role on the app, so nobody but
+   you would see the Reels.
+   1. Meta App Dashboard → **App settings → Basic**:
+      - **Privacy Policy URL** (paste this):
+        `https://github.com/Manas236/GTA6-Creativity/blob/main/PRIVACY.md`
+      - **Data deletion instructions URL:**
+        `https://github.com/Manas236/GTA6-Creativity/blob/main/PRIVACY.md#data-deletion`
+      - Category and a 1024×1024 icon.
+   2. Switch **App Mode** from Development to **Live** (or **Publish** in the newer dashboard).
+   3. Keep every permission at Standard Access: no Advanced Access, no App Review. If going Live
+      says any of the nine needs App Review, stop and report what it says.
+   4. Re-run `python scripts/cp3_dry_run.py`; the Meta rows must still pass.
+   5. After the first real post, open it in a logged-out browser window to confirm it is public.
+6. **Check the Instagram insight metric names** in Graph API Explorer before the first 24 h snapshot
+   (`{ig-media-id}/insights?metric=views`): PLAN.md call #103. They are config
+   (`analytics.instagram`), not code. The Facebook names (`{video-id}/video_insights`, call #104)
+   were confirmed against Meta's Video Insights reference on 2026-11-10 (call #172).
+7. **Twitch credentials before 19 Nov** ([SETUP.md](SETUP.md) section 3, which has a one-line test):
+   put `TWITCH_CLIENT_ID` / `TWITCH_CLIENT_SECRET` in `.env`. Twitch discovery switches itself on
+   2026-11-19 (UTC); without the keys it is skipped with one Telegram alert.
+8. **Go live on 19 Nov - only after you say go**: set `app.dry_run: false` in `config.yaml` and run
+   `python -m pipeline.runner loop` (or the server service, step 9). The first live post starts
    week 1: 50/50 A/B and Telegram cards for 7 days, then the bandit and auto approval.
-8. *Optional*: move to an always-on server (README "Moving to a server": systemd unit in
+9. *Optional*: move to an always-on server (README "Moving to a server": systemd unit in
    `deploy/`, set `posting.profile: "server"`), and set `HEALTHCHECK_URL` for the dead-man switch.
-9. *Optional*: this machine has `HF_HOME=D:\huggingface_cache` set system-wide but no D: drive;
+10. *Optional*: this machine has `HF_HOME=D:\huggingface_cache` set system-wide but no D: drive;
    whisper now falls back to `~/.cache/huggingface` (PLAN calls #136, #158), but you may want to
    remove or fix that variable.
 
@@ -251,16 +269,19 @@ python scripts/fetch_assets.py --check   # verify assets and licences, download 
 > anything publicly; the dry run cannot reach a publish endpoint.
 
 ### 5.1 Fill in `.env`
-Copy the new keys from `.env.example` (each has a one-line comment):
+Follow [SETUP.md](SETUP.md); every key in `.env.example` also has a one-line comment. In short:
 
 | Key | Where to get it |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | @BotFather -> `/newbot` (or `/token` for an existing bot) |
+| `TELEGRAM_BOT_TOKEN` | @BotFather -> `/newbot` (or `/token` for an existing bot) - SETUP.md section 1 |
 | `TELEGRAM_CHAT_ID` | message your bot once, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and take `message.chat.id` |
-| `IG_USER_ID` | Graph API Explorer -> `me/accounts?fields=instagram_business_account` |
-| `IG_ACCESS_TOKEN` | a long-lived **Page** token with `instagram_basic`, `instagram_content_publish`, `instagram_manage_insights`, `pages_read_engagement` |
+| `IG_USER_ID` | Graph API Explorer -> `me/accounts?fields=instagram_business_account` (SETUP.md 2d) |
+| `IG_ACCESS_TOKEN` | the Page's `access_token` from `me/accounts`, made with a long-lived user token (SETUP.md 2d). A **Page** token with **all nine** permissions: `instagram_basic`, `instagram_content_publish`, `instagram_manage_insights`, `business_management`, `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `read_insights`, `pages_manage_engagement` |
 | `FB_PAGE_ID` | the Page's About tab, or `me/accounts` |
-| `FB_PAGE_ACCESS_TOKEN` | optional; only if `IG_ACCESS_TOKEN` is not already a Page token for `FB_PAGE_ID`. Needs `pages_show_list`, `pages_read_engagement`, `pages_manage_posts` |
+| `FB_PAGE_ACCESS_TOKEN` | **leave blank** - `IG_ACCESS_TOKEN` covers Page Reels. Only if you deliberately split the permissions over two Page tokens for the same Page: this one then needs `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `read_insights`, `pages_manage_engagement` |
+
+`read_insights` + `pages_manage_engagement` are what Meta's Video Insights reference requires for
+the Facebook Reel snapshots; without them every Facebook snapshot would be refused.
 
 ### 5.2 Run it (one command, no prompts)
 ```bash
@@ -277,8 +298,11 @@ What it does, in order:
    can still see the card exactly as it will look.
    *The buttons are live:* tapping Approve / Reject / Approve A only really updates that item in
    your local database. Tapping an older card answers "This card is out of date" and does nothing.
-2. **Meta** - read-only GETs: `/debug_token` (type, validity, expiry, permissions, and which
-   permissions are missing), the IG user, the IG `content_publishing_limit`, and the Page.
+2. **Meta** - read-only GETs: `/debug_token` (type, validity, expiry, data-access expiry and the
+   nine required permissions), the IG user, the IG `content_publishing_limit`, the Page, and the
+   Instagram account linked to the Page. A missing permission (each is listed on its own line), a
+   token that is not a PAGE token (or is for another Page) or invalid, and an `IG_USER_ID` that is not
+   the Page's linked Instagram account each **fail** the run.
 3. **Posting flow in dry run** - the full two-phase state machine, logging and writing every request
    it would send to `media/dry_run/post_<id>_<platform>.json`, with every token redacted.
 
@@ -287,8 +311,9 @@ nothing can be: `app.dry_run` and `plan_only` are forced for that process, and a
 non-GET request and on any URL or body naming a write endpoint.
 
 ### 5.3 Then stop
-Report what the card looked like and what the summary said. The first live post needs your explicit
-go; until then leave `app.dry_run: true`.
+Report what the card looked like and what the summary said, then do the Go Live step in the Meta
+app (step 5 of section 0). The first live post needs your explicit go; until then leave
+`app.dry_run: true`.
 
 ### 5.4 Running the pipeline with approvals on
 ```bash

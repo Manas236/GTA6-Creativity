@@ -7,6 +7,9 @@ dedupe → cut → hook → voiceover → render → approve → post → measur
   "Calls I made" engineering log.
 * **`HANDOFF.md`** — current state, what is not in the repository and why, and the
   exact steps to continue on the laptop.
+* **`SETUP.md`** — Telegram, Meta (the nine permissions, the Page token, going Live) and Twitch
+  account setup, step by step. **`PRIVACY.md`** — the privacy policy and data-deletion
+  instructions the Meta app points to.
 
 ## Quick start
 
