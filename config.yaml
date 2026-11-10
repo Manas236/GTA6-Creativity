@@ -367,6 +367,36 @@ autopilot:
   bandit_min_exploration_floor: 0.20
   bandit_min_samples_per_variant: 3 # until both variants have this many measured posts: 50/50
 
+# Metric snapshots for every live post (pipeline/analytics.py). Graph API insight names change
+# often: they are listed here, not in code. If Graph refuses one, it is skipped and alerted once.
+# These names could NOT be checked against the live Meta docs from the build sandbox
+# (developers.facebook.com is blocked there) - see PLAN.md calls 103-104 before the first live run.
+analytics:
+  snapshot_hours: [24, 72]
+  max_snapshot_late_hours: 12 # a snapshot later than this is skipped (insights are cumulative)
+  score_weights: {views: 1.0, likes: 0.0, comments: 0.0, shares: 0.0} # raw score ranked per platform
+  instagram: # GET /{ig-media-id}/insights?metric=...
+    endpoint: "{remote_id}/insights"
+    metrics: ["views", "likes", "comments", "shares", "saved", "reach", "total_interactions"]
+    map:
+      views: ["views", "plays"] # first name present in the answer wins
+      likes: "likes"
+      comments: "comments"
+      shares: "shares"
+  facebook: # GET /{video-id}/video_insights?metric=...
+    endpoint: "{remote_id}/video_insights"
+    metrics:
+      - "fb_reels_total_plays"
+      - "blue_reels_play_count"
+      - "post_impressions_unique"
+      - "post_video_likes_by_reaction_type"
+      - "post_video_social_actions"
+    map:
+      views: ["fb_reels_total_plays", "blue_reels_play_count"]
+      likes: "post_video_likes_by_reaction_type" # a {reaction: count} breakdown, summed
+      comments: "post_video_social_actions.COMMENT" # one key of a breakdown
+      shares: "post_video_social_actions.SHARE"
+
 retention:
   purge_downloads_immediately: true
   purge_renders_after_days: 7
