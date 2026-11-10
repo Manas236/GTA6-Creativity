@@ -154,10 +154,12 @@ def test_approved_items_are_queued_into_the_next_free_slots_two_a_day_as_utc_iso
     ]
     for i in range(5):
         item = db.get_item(f"item-{i}", db_path=tmp_db)
-        assert item["stage"] == "queued" and item["chosen_variant"] in ("A", "B")
+        # the variant is NOT drawn at queue time: it is drawn when the slot comes due
+        assert item["stage"] == "queued" and item["chosen_variant"] is None
         rows = posting.get_posts_for_item(item["id"], db_path=tmp_db)
         assert [r["status"] for r in rows] == ["pending"]
-        assert rows[0]["variant"] == item["chosen_variant"] and rows[0]["style_preset"] == "P0"
+        assert rows[0]["variant"] == posting.UNDECIDED_VARIANT and rows[0]["variant_decided_at"] is None
+        assert rows[0]["style_preset"] == "P0"
         assert rows[0]["slot_datetime"].endswith("Z")
 
 
@@ -168,8 +170,9 @@ def test_scheduling_twice_changes_nothing(tmp_db, tmp_path, cfg, fake_clock):
     db.transition_stage("item-0", "approved", db_path=tmp_db)
     again = scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db, rng=random.Random(99))["scheduled"][0]
     assert (again["slot"], again["variant"]) == (first["slot"], first["variant"])
+    assert first["variant"] == posting.UNDECIDED_VARIANT
     assert len(posting.get_posts_for_item("item-0", db_path=tmp_db)) == 1
-    assert db.get_item("item-0", db_path=tmp_db)["chosen_variant"] == first["variant"]
+    assert db.get_item("item-0", db_path=tmp_db)["chosen_variant"] is None
 
 
 def test_the_min_gap_is_respected_between_slots_and_against_real_live_times(tmp_db, tmp_path, cfg, fake_clock):
@@ -401,9 +404,9 @@ def test_a_post_that_is_already_underway_is_never_re_slotted(tmp_db, tmp_path, c
     cfg["posting"]["platforms"]["facebook"] = True
     approved_item(tmp_db, tmp_path, "item-0")
     scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db, rng=random.Random(1))
-    with db.db(tmp_db) as conn:                      # Instagram went out, Facebook did not, then 3 days asleep
-        conn.execute("UPDATE posts SET status = 'live', posted_at = '2026-11-10T07:30:10Z', remote_id = 'm1' "
-                     "WHERE platform = 'instagram'")
+    with db.db(tmp_db) as conn:                      # Instagram went out (as B), Facebook did not, 3 days asleep
+        conn.execute("UPDATE posts SET status = 'live', posted_at = '2026-11-10T07:30:10Z', remote_id = 'm1', "
+                     "variant = 'B', variant_decided_at = '2026-11-10T07:30:00Z' WHERE platform = 'instagram'")
     fake_clock.set("2026-11-13T09:00:00Z")
 
     assert scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db)["rescheduled"] == []
@@ -513,3 +516,99 @@ def test_live_on_one_platform_and_given_up_on_the_other_counts_as_posted(tmp_db,
     rows = {r["platform"]: r["status"] for r in posting.get_posts_for_item("item-0", db_path=tmp_db)}
     assert rows == {"instagram": "live", "facebook": "failed"}
     assert posting.item_has_open_posts("item-0", cfg, tmp_db) is False
+
+
+
+# ---------------------------------------------------------------------------
+# The variant is drawn when the slot comes due (latest learning), not at queue time
+# ---------------------------------------------------------------------------
+
+class FixedRoll:
+    """An rng whose every draw is `value`: 0.3 means A at 50/50 but B when B leads 80/20."""
+
+    def __init__(self, value: float):
+        self.value = value
+
+    def random(self) -> float:
+        return self.value
+
+
+def test_the_variant_is_drawn_and_logged_when_the_slot_comes_due(tmp_db, tmp_path, cfg, secrets, fake_clock):
+    approved_item(tmp_db, tmp_path, "item-0")
+    out = scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.3))
+    assert out["scheduled"][0]["variant"] == posting.UNDECIDED_VARIANT          # nothing drawn yet
+
+    fake_clock.set(slot_of(tmp_db, "item-0"))
+    publisher, _ = make_publisher(tmp_db, cfg, FakeTransport(routes_for_many()))
+    posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher, rng=FixedRoll(0.3))
+    rows = posting.get_posts_for_item("item-0", db_path=tmp_db)
+    assert {r["variant"] for r in rows} == {"A"}                                # week 1: 0.3 < 0.5 -> A
+    assert all(r["variant_decided_at"] == clock.iso(clock.utcnow()) for r in rows)
+    assert db.get_item("item-0", db_path=tmp_db)["chosen_variant"] == "A"
+    with db.db(tmp_db) as conn:
+        log = [r["message"] for r in conn.execute(
+            "SELECT message FROM stage_log WHERE item_id = 'item-0' AND stage = 'scheduler'")]
+    assert any("drawn at the slot" in m and "week 1" in m for m in log)
+
+
+def test_after_week_one_the_draw_uses_the_bandit_even_for_an_item_queued_in_week_one(tmp_db, tmp_path, cfg, secrets, fake_clock):
+    first_live(tmp_db, "2026-11-03T07:30:00Z")                     # week 1 ends 2026-11-10T07:30Z
+    fake_clock.set("2026-11-10T06:00:00Z")
+    approved_item(tmp_db, tmp_path, "item-0")
+    scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.3))   # queued in week 1
+    assert slot_of(tmp_db, "item-0") == "2026-11-10T07:30:00Z"
+    set_learning(tmp_db, (6, 0.2), (6, 0.8))
+
+    fake_clock.set("2026-11-10T07:30:00Z")                         # the slot: exactly 7 days -> not week 1
+    assert scheduler.in_week_one(cfg, tmp_db) is False
+    publisher, transport = make_publisher(tmp_db, cfg, FakeTransport(routes_for_many()))
+    posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher, rng=FixedRoll(0.3))
+    row = posting.get_posts_for_item("item-0", db_path=tmp_db)[0]
+    assert (row["variant"], row["status"]) == ("B", "live")        # 0.3 is B under 80/20; it was A at 50/50
+
+
+def test_a_drawn_variant_is_frozen_once_a_row_has_begun(tmp_db, tmp_path, cfg, fake_clock):
+    approved_item(tmp_db, tmp_path, "item-0")
+    scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db)
+    assert posting.decide_variant("item-0", cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.9)) == "B"
+    with db.db(tmp_db) as conn:
+        conn.execute("UPDATE posts SET status = 'uploading', remote_container_id = 'c1'")
+    set_learning(tmp_db, (9, 0.9), (9, 0.1))
+    first_live(tmp_db, "2026-10-01T00:00:00Z")                     # long after week 1, A now leads
+    assert posting.decide_variant("item-0", cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.0)) == "B"
+    assert posting.get_posts_for_item("item-0", db_path=tmp_db)[0]["variant"] == "B"
+
+
+def test_an_undecided_row_can_never_be_uploaded(tmp_db, tmp_path, cfg, fake_clock):
+    item = approved_item(tmp_db, tmp_path, "item-0")
+    scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db)
+    row = posting.get_posts_for_item("item-0", db_path=tmp_db)[0]
+    with pytest.raises(posting.PublishError, match="not been decided"):
+        posting.video_for_post(item, row)
+
+
+def test_a_missed_slot_and_a_dry_run_both_leave_the_variant_to_be_drawn_again(tmp_db, tmp_path, cfg, fake_clock):
+    approved_item(tmp_db, tmp_path, "item-0")
+    scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db)
+    posting.decide_variant("item-0", cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.9))   # drawn, but never begun
+    fake_clock.set("2026-11-11T00:00:00Z")                         # the slot was missed
+    moved = scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db)["rescheduled"]
+    assert moved and moved[0][0] == "item-0"
+    assert posting.get_posts_for_item("item-0", db_path=tmp_db)[0]["variant_decided_at"] is None
+
+    posting.decide_variant("item-0", cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.9))
+    with db.db(tmp_db) as conn:
+        conn.execute("UPDATE posts SET status = 'dry_run'")
+    live_cfg = {**cfg, "app": {**cfg.get("app", {}), "dry_run": False}}
+    assert posting.reset_dry_run_rows(cfg=live_cfg, db_path=tmp_db) == 1
+    row = posting.get_posts_for_item("item-0", db_path=tmp_db)[0]
+    assert row["status"] == "pending" and row["variant_decided_at"] is None
+
+
+def test_a_only_is_fixed_at_queue_time(tmp_db, tmp_path, cfg, fake_clock):
+    approved_item(tmp_db, tmp_path, "item-a", a_only=True)
+    out = scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db)
+    assert out["scheduled"][0]["variant"] == "A"
+    row = posting.get_posts_for_item("item-a", db_path=tmp_db)[0]
+    assert row["variant"] == "A" and row["variant_decided_at"]
+    assert posting.decide_variant("item-a", cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.99)) == "A"

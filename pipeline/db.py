@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS posts (
     caption_text TEXT,
     no_retry INTEGER DEFAULT 0,                 -- 1 = failed for good: never retried (e.g. unknown remote state)
     style_preset TEXT,                          -- captured for learning (items.style_preset at scheduling)
+    variant_decided_at TEXT,                    -- NULL until the variant is drawn, when the slot comes due
     error_message TEXT,
     posted_at TEXT,
     created_at TEXT NOT NULL,
@@ -284,6 +285,14 @@ def init_db(db_path: Path | str | None = None) -> None:
         ):
             if col not in post_cols:
                 conn.execute(ddl)
+        if "variant_decided_at" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN variant_decided_at TEXT")
+            # Rows that already began keep the variant they were given; pending ones (queued
+            # by the old queue-time rule) are drawn again when their slot comes due.
+            conn.execute(
+                "UPDATE posts SET variant_decided_at = COALESCE(publish_started_at, posted_at, updated_at) "
+                "WHERE status NOT IN ('pending', 'dry_run') OR remote_container_id IS NOT NULL"
+            )
 
 
 # ---------------------------------------------------------------------------

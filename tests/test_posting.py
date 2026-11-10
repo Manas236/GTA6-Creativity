@@ -128,7 +128,9 @@ def make_publisher(tmp_db, cfg, transport, alerts=None, clock=None):
     ), clock
 
 
-def make_item(tmp_db: Path, tmp_path: Path, item_id: str = "item-1", variant: str | None = None) -> dict[str, Any]:
+def make_item(tmp_db: Path, tmp_path: Path, item_id: str = "item-1", variant: str | None = "B") -> dict[str, Any]:
+    # variant "B": these tests drive the posting state machine with the variant already decided;
+    # the slot-time draw itself is tested in test_scheduler.py.
     db.insert_discovered_item(
         {
             "id": item_id,

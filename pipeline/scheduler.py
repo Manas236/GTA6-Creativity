@@ -15,13 +15,15 @@ MISSED SLOTS (the laptop was asleep)
   An item with a row already `publishing` or `live` is never moved: the two-phase posting machine
   finishes or settles it, which is what rules out a double post.
 
-VARIANT
-  * "Approve A only" stays A and stays ab_excluded.
+VARIANT (drawn when the slot comes due, not when the item is queued: posting.decide_variant)
+  * "Approve A only" stays A and stays ab_excluded (fixed at once).
   * Week 1 (the first `autopilot.week_one_days` days counted from the FIRST LIVE POST, and all the
     time before any post is live): 50/50 random.
   * After week 1: epsilon-greedy over `ab_learning` with a floor - the better variant gets
     1 - floor (80%), the other gets the floor (20%). Until both variants have
     `autopilot.bandit_min_samples_per_variant` measured posts it stays 50/50.
+  Because the draw happens at the slot, an item queued on day 6 for a day-8 slot uses the bandit
+  and the learning as it stands on day 8.
 
 Everything takes `now` and an `rng`, so the tests and the CP4 dry run are deterministic.
 """
@@ -219,6 +221,7 @@ def reschedule_missed(
                                       WHEN status = 'failed' AND COALESCE(no_retry, 0) = 0 THEN 'pending'
                                       ELSE status END,
                         remote_container_id = CASE WHEN status = 'live' THEN remote_container_id ELSE NULL END,
+                        variant_decided_at = CASE WHEN status = 'live' THEN variant_decided_at ELSE NULL END,
                         publish_started_at = NULL
                     WHERE item_id = ?
                     """,
@@ -240,7 +243,10 @@ def schedule_approved(
     db_path: Any = None,
     rng: random.Random | None = None,
 ) -> list[dict[str, Any]]:
-    """Give every approved item a variant and the next free slot, and move it to `queued`."""
+    """Give every approved item the next free slot and move it to `queued`.
+
+    The variant is left undecided (posting.UNDECIDED_VARIANT) unless the item is A-only; it is
+    drawn when the slot comes due, so it always uses the latest learning."""
     cfg = cfg or config.get_config()
     out: list[dict[str, Any]] = []
     for item in db.get_items_by_stage("approved", db_path=db_path):   # highest discovery score first
@@ -253,20 +259,16 @@ def schedule_approved(
             db.log_stage(item_id, "scheduler", "failure", message=refusal or "synthetic dry-run item", db_path=db_path)
             continue
         try:
-            variant, why = choose_variant(item, cfg, db_path, rng)
+            a_only = int(item.get("ab_excluded") or 0) or item.get("approval_type") == "approved_a_only"
+            item["chosen_variant"] = "A" if a_only else None
+            why = ("approved A only: stays A" if a_only
+                   else "drawn when the slot comes due, from the learning at that time")
             slot = clock.iso(next_free_slot(now, cfg, db_path, exclude_item_id=item_id))
-            item["chosen_variant"] = variant
             # Order matters for crash safety: the rows are created (idempotently) first and the
             # stage moves last, so a crash in between re-runs this block and changes nothing.
-            with db.db(db_path) as conn:
-                conn.execute("UPDATE items SET chosen_variant = ?, updated_at = ? WHERE id = ?",
-                             (variant, db.now(), item_id))
             rows = posting.ensure_post_rows(item, slot_datetime=slot, cfg=cfg, db_path=db_path)
             slot = posting.item_slot(rows) or slot           # rows from an earlier attempt keep theirs
-            variant = rows[0]["variant"] if rows else variant
-            if rows and rows[0]["variant"] != item["chosen_variant"]:
-                with db.db(db_path) as conn:
-                    conn.execute("UPDATE items SET chosen_variant = ? WHERE id = ?", (variant, item_id))
+            variant = rows[0]["variant"] if rows else posting.UNDECIDED_VARIANT
             db.transition_stage(item_id, "queued", db_path=db_path)
         except sqlite3.IntegrityError as e:
             posting.fail_refused_item(item_id, e, db_path=db_path)

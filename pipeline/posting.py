@@ -95,6 +95,11 @@ STATUS_DRY_RUN = "dry_run"
 
 # Rows that still have work to do: cleanup must not delete their media, and their slot is taken.
 OPEN_STATUSES = (STATUS_PENDING, STATUS_UPLOADING, STATUS_CONTAINER_READY, STATUS_PUBLISHING)
+# A row created at queue time carries this until its slot comes due and the variant is drawn
+# (decide_variant). It is never a renderable variant, so it can never be uploaded by mistake.
+UNDECIDED_VARIANT = "?"
+# Once a row holds any of these (or a container id), the variant is frozen for the whole item.
+VARIANT_FROZEN_STATUSES = (STATUS_UPLOADING, STATUS_CONTAINER_READY, STATUS_PUBLISHING, STATUS_LIVE)
 # Rows whose publish has (or may have) reached the remote: such an item is never re-slotted.
 STARTED_STATUSES = (STATUS_PUBLISHING, STATUS_LIVE)
 
@@ -401,12 +406,18 @@ def ensure_post_rows(
     cfg: dict[str, Any] | None = None,
     db_path: Any = None,
 ) -> list[dict[str, Any]]:
-    """One `pending` row per enabled platform, created once (UNIQUE(item_id, platform))."""
+    """One `pending` row per enabled platform, created once (UNIQUE(item_id, platform)).
+
+    The variant is NOT drawn here: rows start as UNDECIDED_VARIANT and `decide_variant` draws
+    it when the slot comes due, from the learning as it is then. Only a variant already fixed
+    on the item (Approve A only) is written at once.
+    """
     cfg = cfg or config.get_config()
     refusal = refusal_reason(item, cfg)
     if refusal:
         raise PublishError(refusal)
-    variant = item.get("chosen_variant") or "B"
+    fixed = (item.get("chosen_variant") or "").upper()
+    variant = fixed if fixed in ("A", "B") else UNDECIDED_VARIANT
     slot = slot_datetime or db.now()
     caption = caption_for_item(item, cfg)
     ts = db.now()
@@ -416,10 +427,12 @@ def ensure_post_rows(
                 """
                 INSERT INTO posts (
                     item_id, platform, variant, hook_style, source, authenticity, style_preset,
-                    slot_datetime, status, ab_excluded, caption_text, created_at, updated_at
+                    slot_datetime, status, ab_excluded, caption_text, created_at, updated_at,
+                    variant_decided_at
                 ) VALUES (
                     :item_id, :platform, :variant, :hook_style, :source, :authenticity, :style_preset,
-                    :slot_datetime, :status, :ab_excluded, :caption_text, :created_at, :updated_at
+                    :slot_datetime, :status, :ab_excluded, :caption_text, :created_at, :updated_at,
+                    :variant_decided_at
                 )
                 ON CONFLICT(item_id, platform) DO NOTHING
                 """,
@@ -437,9 +450,63 @@ def ensure_post_rows(
                     "caption_text": caption,
                     "created_at": ts,
                     "updated_at": ts,
+                    "variant_decided_at": ts if variant != UNDECIDED_VARIANT else None,
                 },
             )
     return get_posts_for_item(item["id"], db_path=db_path)
+
+
+def variant_is_frozen(rows: list[dict[str, Any]]) -> bool:
+    """A row has begun uploading (or holds a container): the item's variant can never change."""
+    return any(r["status"] in VARIANT_FROZEN_STATUSES or r.get("remote_container_id") for r in rows)
+
+
+def decide_variant(
+    item_id: str,
+    cfg: dict[str, Any] | None = None,
+    db_path: Any = None,
+    rng: Any = None,
+) -> str | None:
+    """Draw the item's A/B variant NOW - when its slot has come and it is about to be posted -
+    from the week-1 status and the `ab_learning` cache as they are at this moment.
+
+    Idempotent and crash-safe: rows that already carry a decision keep it, and once any row has
+    begun (VARIANT_FROZEN_STATUSES) the variant is frozen for the item. Returns the variant, or
+    None if the item has no rows.
+    """
+    from . import scheduler   # lazy: scheduler imports this module
+
+    rows = get_posts_for_item(item_id, db_path=db_path)
+    if not rows:
+        return None
+    decided = [r for r in rows if r.get("variant_decided_at") and r["variant"] in ("A", "B")]
+    frozen = variant_is_frozen(rows)
+    if decided and (frozen or len(decided) == len(rows)):
+        variant, why = decided[0]["variant"], "already decided"
+    elif frozen:
+        # A row began before decisions were recorded (an older database): keep what it uses.
+        started = next(r for r in rows if r["status"] in VARIANT_FROZEN_STATUSES or r.get("remote_container_id"))
+        if started["variant"] not in ("A", "B"):
+            # Never guess what an already-begun row used; video_for_post refuses to upload it.
+            log.error("item %s: a row began with no known variant; leaving it undecided", item_id)
+            return None
+        variant, why = started["variant"], "frozen: a row had already begun"
+    else:
+        item = db.get_item(item_id, db_path=db_path) or {"id": item_id}
+        variant, why = scheduler.choose_variant(item, cfg, db_path, rng)
+    ts = db.now()
+    with db.db(db_path) as conn:
+        conn.execute(
+            "UPDATE posts SET variant = ?, variant_decided_at = ?, updated_at = ? "
+            "WHERE item_id = ? AND (variant_decided_at IS NULL OR variant NOT IN ('A', 'B'))",
+            (variant, ts, ts, item_id),
+        )
+        conn.execute("UPDATE items SET chosen_variant = ?, updated_at = ? WHERE id = ?", (variant, ts, item_id))
+    if why != "already decided":
+        db.log_stage(item_id, "scheduler", "success", message=f"variant {variant} drawn at the slot ({why})",
+                     db_path=db_path)
+        log.info("variant for %s drawn at its slot: %s (%s)", item_id, variant, why)
+    return variant
 
 
 def is_dry_run(cfg: dict[str, Any] | None) -> bool:
@@ -512,7 +579,8 @@ def reset_dry_run_rows(cfg: dict[str, Any] | None = None, db_path: Any = None) -
         cur = conn.execute(
             f"""
             UPDATE posts SET status = 'pending', remote_container_id = NULL, publish_started_at = NULL,
-                             attempt_count = 0, error_message = 'reset after dry run', updated_at = ?
+                             attempt_count = 0, error_message = 'reset after dry run', updated_at = ?,
+                             variant_decided_at = NULL
             WHERE status = 'dry_run'
               AND item_id IN (SELECT id FROM items WHERE stage IN ('approved', 'queued') AND {db.RELEASABLE_SQL})
             """,
@@ -522,7 +590,9 @@ def reset_dry_run_rows(cfg: dict[str, Any] | None = None, db_path: Any = None) -
 
 
 def video_for_post(item: dict[str, Any], post: dict[str, Any]) -> Path:
-    variant = (post.get("variant") or "B").upper()
+    variant = (post.get("variant") or "").upper()
+    if variant not in ("A", "B"):
+        raise PublishError(f"item {item['id']}: the variant has not been decided (row holds {variant!r})")
     path = item.get("render_a_path") if variant == "A" else item.get("render_b_path")
     if not path:
         raise PublishError(f"item {item['id']} has no variant {variant} render")
@@ -587,9 +657,11 @@ class Publisher:
         alert: Callable[[str, str | None], Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
+        rng: Any = None,
     ):
         self.cfg = cfg or config.get_config()
         self.db_path = db_path
+        self.rng = rng          # the A/B draw (decide_variant); None = the random module
         self.client = client or MetaClient(cfg=self.cfg, db_path=db_path, sleep=sleep, clock=clock)
         self.sleep = sleep
         self.clock = clock
@@ -660,6 +732,11 @@ class Publisher:
             log.warning("meta is paused, %s not sent: %s", post["platform"], why)
             return post["status"]
 
+        if post["variant"] not in ("A", "B") or not post.get("variant_decided_at"):
+            # The post is beginning now: this is when its slot came due, so draw the variant.
+            decide_variant(post["item_id"], cfg=self.cfg, db_path=self.db_path, rng=self.rng)
+            post = get_post(post_id, db_path=self.db_path) or post
+            item = None
         item = item or db.get_item(post["item_id"], db_path=self.db_path)
         if not item:
             return self.fail(post, f"item {post['item_id']} is gone")
@@ -1103,8 +1180,11 @@ def run_posting_for_item(
     db_path: Any = None,
     publisher: Publisher | None = None,
     slot_datetime: str | None = None,
+    rng: Any = None,
 ) -> dict[str, str]:
     """Post one approved item to every enabled platform that is not live yet.
+
+    The A/B variant is drawn here, as the post begins (decide_variant), not when it was queued.
 
     A platform whose row is already `live` is skipped, so a failed Facebook row retries Facebook
     alone. The item becomes `posted` only when every enabled platform row is `live` (or `dry_run`).
@@ -1119,6 +1199,8 @@ def run_posting_for_item(
         raise PublishError(refusal)
 
     ensure_post_rows(item, slot_datetime=slot_datetime, cfg=cfg, db_path=db_path)
+    decide_variant(item_id, cfg=cfg, db_path=db_path, rng=rng)
+    item = db.get_item(item_id, db_path=db_path) or item
     publisher = publisher or Publisher(cfg=cfg, db_path=db_path)
     wanted = set(enabled_platforms(cfg))
     results: dict[str, str] = {}
@@ -1197,6 +1279,7 @@ def run_posting_stage(
     publisher: Publisher | None = None,
     limit: int | None = 1,
     now: datetime | None = None,
+    rng: Any = None,
 ) -> dict[str, dict[str, str]]:
     """One posting pass: settle crashed rows, then post the queued item(s) whose slot has come.
 
@@ -1237,7 +1320,8 @@ def run_posting_stage(
                 continue
             begun += 1
         try:
-            out[item["id"]] = run_posting_for_item(item["id"], cfg=cfg, db_path=db_path, publisher=publisher)
+            out[item["id"]] = run_posting_for_item(item["id"], cfg=cfg, db_path=db_path, publisher=publisher,
+                                                   rng=rng)
         except RateLimitError:
             break
         except PublishError as e:
