@@ -289,6 +289,11 @@ style:
     headroom_db: 6.0 # every SFX peak sits at least this far under the speech peak
     boom_at_s: 0.0 # the hook's first frame
     whoosh_lead_s: 0.06 # whoosh starts just before the punch-in
+    # Density (enforced only in audio_mix.plan_sfx_cues, on the final output timeline):
+    # the hook boom first, then a whoosh only on a punch-in that is min_gap_s clear of
+    # every other cue (start to start); other punch-ins zoom silently.
+    min_gap_s: 5.0
+    max_per_clip: 2
 
   # A2 -- music bed (no sidechaincompress; volume automation from word timestamps) ----
   music_bed:

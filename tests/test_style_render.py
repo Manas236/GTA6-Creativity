@@ -281,14 +281,18 @@ def test_a2_music_is_padded_when_the_bed_is_shorter_than_the_clip(tmp_path: Path
 
 
 def test_a1_sfx_peaks_sit_at_least_6db_under_the_speech(tmp_path: Path):
-    """The real mix, measured: the boom never comes within headroom_db of the speech."""
+    """The real mix, measured: the boom never comes within headroom_db of the speech.
+
+    The punch-in sits at 6.3 s so its whoosh (6.24 s) is >= min_gap_s 5.0 after the boom
+    (A1 density rule) and is actually placed."""
     sr = 48000
     speech = tmp_path / "speech.wav"
-    _ffmpeg("-f", "lavfi", "-i", f"sine=frequency=250:sample_rate={sr}:duration=6",
+    _ffmpeg("-f", "lavfi", "-i", f"sine=frequency=250:sample_rate={sr}:duration=8",
             "-af", "volume='0.7*between(t,1,2)+0.7*between(t,4,5)':eval=frame",
             "-ac", "2", "-c:a", "pcm_s16le", str(speech))
     speech_peak = audio_mix.file_peak_db(speech)
-    cues = audio_mix.plan_sfx_cues([edits.Punch(3.0, 0.8, 0.12, 0.12)], SS, hook_at=0.0, duration=6.0)
+    cues = audio_mix.plan_sfx_cues([edits.Punch(6.3, 0.8, 0.12, 0.12)], SS, hook_at=0.0, duration=8.0)
+    assert [c.kind for c in cues] == ["boom", "whoosh"]
     gains = {k: audio_mix.sfx_gain_db(speech_peak, audio_mix.file_peak_db(p, -1.0), SS)
              for k, p in audio_mix.sfx_files(SS).items()}
     inputs, chain = audio_mix.sfx_chain(cues, gains, sr, "a_main", "a_sfx")
@@ -296,9 +300,9 @@ def test_a1_sfx_peaks_sit_at_least_6db_under_the_speech(tmp_path: Path):
     out = tmp_path / "mix.wav"
     _ffmpeg("-i", str(speech), *inputs,
             "-filter_complex", f"[0:a]aformat=sample_fmts=fltp:sample_rates={sr}:channel_layouts=stereo[a_main];{chain}",
-            "-map", "[a_sfx]", "-t", "6", "-ac", "2", "-ar", str(sr), "-c:a", "pcm_s16le", str(out))
+            "-map", "[a_sfx]", "-t", "8", "-ac", "2", "-ar", str(sr), "-c:a", "pcm_s16le", str(out))
     boom = _peak(out, 0.0, 0.7)                     # the hook's first frame
-    whoosh = _peak(out, 2.9, 3.4)
+    whoosh = _peak(out, 6.2, 6.7)
     voice = _peak(out, 1.0, 2.0)
     headroom = SS["sfx"]["headroom_db"]
     for name, p in (("boom", boom), ("whoosh", whoosh)):

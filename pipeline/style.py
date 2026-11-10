@@ -15,7 +15,7 @@ Flags
     hook_pop       M2  hook scale-in plus a small shake
     punch_ins      M3  1.12x punch-ins on loudness peaks / scene cuts
     slow_push      M4  1.00 -> 1.06 push across static segments and the B freeze
-    sfx            A1  boom on the hook, whoosh on each punch-in
+    sfx            A1  boom on the hook, a whoosh on at most one well-spaced punch-in
     music_bed      A2  CC0 music bed under the clip, ducked under speech
     dead_air       A3  drop silent + motionless stretches, remap captions
     loop_end       A4  end on the frame closest to frame 1 (dHash)
@@ -130,6 +130,8 @@ STYLE_DEFAULTS: dict[str, Any] = {
         "headroom_db": 6.0,
         "boom_at_s": 0.0,
         "whoosh_lead_s": 0.06,
+        "min_gap_s": 5.0,
+        "max_per_clip": 2,
     },
     # A2 ------------------------------------------------------------------
     "music_bed": {

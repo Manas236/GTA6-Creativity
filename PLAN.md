@@ -507,8 +507,9 @@ the filtergraph is where label collisions and ordering bugs live, so `render.py`
 
 ### A1–A4 audio
 
-- **A1 SFX**: boom on the hook's first frame, whoosh `whoosh_lead_s 0.06` before each
-  punch-in. Each cue is gain-staged so its peak lands `headroom_db 6.0` **under the clip's
+- **A1 SFX**: boom on the hook's first frame, then a whoosh `whoosh_lead_s 0.06` before a
+  punch-in **only if** it starts ≥ `min_gap_s 5.0` from every other cue, at most
+  `max_per_clip 2` cues per clip (calls #137-#139); other punch-ins zoom silently. Each cue is gain-staged so its peak lands `headroom_db 6.0` **under the clip's
   measured speech peak** (`volumedetect`). The CC0 sources (Kenney.nl, OpenGameArt,
   Freesound, Pixabay) are all blocked from the build sandbox (proxy `403` on `CONNECT`), so
   both cues were **synthesized with ffmpeg** and committed at −1.0 dBFS; see
@@ -1042,6 +1043,12 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 134. **The end fade never covers the last word**: it is shortened to the silence after the last spoken word (floor 0.05 s), because an end 0.1 s after a word with a 0.25 s fade would audibly fade the word itself.
 135. **`render_previews.py`**: re-cuts any cut the current cut stage did not verify; re-downloads a source the current downloader would refuse (the laptop's three were AV1 1440p, which is what made scene detection take ~4 min each) and keeps the old file if that fails; with no `--items`, uses the CP2 ids present in `pipeline.db`, topped up with the best real items (the hard-coded ids are the cloud database's and do not exist on the laptop); an item that fails with `no_clean_ending` is replaced by the next real item.
 136. **Whisper loads from the default cache when `HF_HOME` points at a missing drive**: on the laptop `HF_HOME` is set machine-wide to `D:\huggingface_cache` and there is no D: drive, while `base.en` sits in `~/.cache/huggingface/hub`. Now that the cut stage needs whisper, that would fail every cut. `render.whisper_download_root()` falls back to the default cache (with a warning) only when HF_HOME's drive/root does not exist; the machine setting itself was left alone (it is the user's system configuration).
+
+**Task 2: SFX density**
+
+137. **One rule, one place**: `audio_mix.plan_sfx_cues` is the only code that decides SFX cues, and it gets times already on the variant's final output timeline (punch-ins are planned after A3's remap and with the B freeze offset; the hook starts at 0 in both variants). Boom first; a whoosh only where it starts ≥ `style.sfx.min_gap_s` 5.0 s from every placed cue, start to start; at most `style.sfx.max_per_clip` 2. `audio_mix.sfx_spacing_problems` re-checks a cue list and is used by the tests and the real-clip verification; it never decides anything.
+138. **The whoosh goes to the strongest clear punch-in, not the first**: `edits.Punch.rank` records M3's loudness order, and whooshes are offered in that order. With the boom at 0 s and a cap of 2, a clip gets one whoosh, so it should mark the biggest moment rather than whichever came first after 5 s.
+139. **Bug found and fixed: Variant B punch-ins were spaced on mixed timelines.** `plan_punch_ins` compared each candidate's cut-timeline time with already-taken punch-ins stored on the output timeline (+freeze), so on B the 3 s spacing was measured against the wrong times (B got punch-ins 1.5 s apart, at different moments than A). Both sides of the comparison are now output time; B's punch-ins are A's shifted by the freeze.
 
 ---
 

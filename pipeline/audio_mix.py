@@ -2,7 +2,9 @@
 
   A1  ensure_sfx_assets  boom / whoosh, synthesized with ffmpeg when no CC0 download is
                          reachable (see assets/sfx/LICENSES.md)
-      plan_sfx_cues      boom on the hook's first frame, whoosh on every punch-in
+      plan_sfx_cues      boom on the hook's first frame, then a whoosh only on a punch-in
+                         that is min_gap_s clear of every other cue, max_per_clip in all
+                         (THE one place the SFX density rule is enforced)
       sfx_chain          one delayed, gain-staged input per cue, summed with amix
   A2  music_chain        CC0 bed at level_db, trimmed/padded to exactly the clip length
       duck_expr          whisper word timestamps as volume automation (no sidechaincompress)
@@ -136,23 +138,62 @@ def plan_sfx_cues(
     hook_at: float = 0.0,
     duration: float | None = None,
 ) -> list[SfxCue]:
-    """Boom on the hook's first frame, whoosh just before each punch-in."""
+    """The SFX cues for one variant, on its FINAL output timeline.
+
+    Every time here is already an output time: punch-ins are planned after A3's dead-air
+    remap and with the Variant B freeze offset, and the hook starts at 0 in both variants.
+
+    Density rule (style.sfx.min_gap_s, style.sfx.max_per_clip), enforced here and only here:
+      1. the boom on the hook's first frame comes first;
+      2. a whoosh is added to a punch-in only if it starts >= min_gap_s (start to start)
+         from every cue already placed and the clip is still under max_per_clip;
+         punch-ins are offered strongest first (their M3 rank), so the one whoosh a clip
+         usually gets lands on its biggest moment;
+      3. every other punch-in still zooms, silently.
+    """
     files = sfx_files(ss)
     s = ss["sfx"]
+    min_gap = float(s.get("min_gap_s", 5.0))
+    cap = int(s.get("max_per_clip", 2))
     cues: list[SfxCue] = []
+    if cap <= 0:
+        return cues
+
+    def clear(at: float) -> bool:
+        return all(abs(at - c.at) >= min_gap - 1e-6 for c in cues)
+
     boom = files["boom"]
     if boom.exists():
-        cues.append(SfxCue(round(max(0.0, float(hook_at) + float(s["boom_at_s"])), 3), "boom", str(boom)))
+        at = round(max(0.0, float(hook_at) + float(s["boom_at_s"])), 3)
+        if duration is None or at < float(duration):
+            cues.append(SfxCue(at, "boom", str(boom)))
     whoosh = files["whoosh"]
     if whoosh.exists():
         lead = float(s["whoosh_lead_s"])
-        for p in punches:
-            at = max(0.0, float(p.at) - lead)
+        ranked = sorted(punches, key=lambda p: (int(getattr(p, "rank", 0)), float(p.at)))
+        for p in ranked:
+            if len(cues) >= cap:
+                break
+            at = round(max(0.0, float(p.at) - lead), 3)
             if duration is not None and at >= float(duration):
                 continue
-            cues.append(SfxCue(round(at, 3), "whoosh", str(whoosh)))
+            if clear(at):
+                cues.append(SfxCue(at, "whoosh", str(whoosh)))
     cues.sort(key=lambda c: c.at)
     return cues
+
+
+def sfx_spacing_problems(cues: Sequence[SfxCue], ss: dict[str, Any]) -> list[str]:
+    """What breaks the density rule in a cue list (empty = fine). Used by the tests and the
+    real-clip verification; it checks, it does not decide."""
+    s = ss["sfx"]
+    min_gap = float(s.get("min_gap_s", 5.0))
+    cap = int(s.get("max_per_clip", 2))
+    ats = sorted(float(c.at) for c in cues)
+    out = [f"{len(ats)} cues > max_per_clip {cap}"] if len(ats) > cap else []
+    out += [f"cues at {a:.3f}s and {b:.3f}s are {b - a:.3f}s apart (< {min_gap}s)"
+            for a, b in zip(ats, ats[1:]) if b - a < min_gap - 1e-6]
+    return out
 
 
 def sfx_chain(

@@ -395,16 +395,15 @@ def test_a1_sfx_sits_at_least_6db_under_the_speech():
     assert (-1.0 + gain) == pytest.approx(-2.0 - headroom)      # resulting SFX peak
 
 
-def test_a1_boom_on_the_hook_whoosh_on_each_punch():
-    punches = [edits.Punch(4.0, 0.8, 0.12, 0.12), edits.Punch(9.0, 0.8, 0.12, 0.12)]
+def test_a1_boom_on_the_hook_then_a_whoosh_only_where_it_is_clear():
+    punches = [edits.Punch(4.0, 0.8, 0.12, 0.12), edits.Punch(9.0, 0.8, 0.12, 0.12, rank=1)]
     cues = audio_mix.plan_sfx_cues(punches, SS, hook_at=0.0, duration=20.0)
-    assert [c.kind for c in cues] == ["boom", "whoosh", "whoosh"]
-    assert cues[0].at == 0.0                                     # the hook's first frame
     lead = SS["sfx"]["whoosh_lead_s"]
-    assert [c.at for c in cues[1:]] == [4.0 - lead, 9.0 - lead]
+    # 3.94 s is under 5.0 s from the boom: that punch-in zooms silently
+    assert [(c.kind, c.at) for c in cues] == [("boom", 0.0), ("whoosh", round(9.0 - lead, 3))]
     _, chain = audio_mix.sfx_chain(cues, {"boom": -10.0, "whoosh": -12.0}, 48000, "a_main", "a_sfx")
-    assert "adelay=0:all=1" in chain and f"adelay={int((4.0 - lead) * 1000)}:all=1" in chain
-    assert "amix=inputs=4:normalize=0:duration=first" in chain
+    assert "adelay=0:all=1" in chain and f"adelay={int(round((9.0 - lead) * 1000))}:all=1" in chain
+    assert "amix=inputs=3:normalize=0:duration=first" in chain
     assert "sidechaincompress" not in chain
 
 

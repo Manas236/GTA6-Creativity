@@ -329,6 +329,7 @@ class Punch:
     ease_in: float
     ease_out: float
     reason: str = "peak"
+    rank: int = 0          # 0 = the strongest punch-in of the clip (A1 offers whooshes in this order)
 
     @property
     def end(self) -> float:
@@ -369,9 +370,10 @@ def plan_punch_ins(
     for score, t, reason in sorted(cands, key=lambda c: (-c[0], c[1])):
         if not (first <= t <= last_allowed):
             continue
-        if any(abs(t - p.at) < gap for p in taken):
+        # p.at is on the output timeline (+offset); compare like with like.
+        if any(abs((t + offset) - p.at) < gap for p in taken):
             continue
-        taken.append(Punch(round(t + offset, 3), hold, ease_in, ease_out, reason))
+        taken.append(Punch(round(t + offset, 3), hold, ease_in, ease_out, reason, rank=len(taken)))
         if len(taken) >= int(pz["max_count"]):
             break
     taken.sort(key=lambda p: p.at)
