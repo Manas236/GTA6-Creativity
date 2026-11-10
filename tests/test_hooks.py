@@ -264,7 +264,7 @@ def test_transcribe_words_raise_errors_reraises_instead_of_returning_empty(tmp_p
     clip = tmp_path / "c.mp4"
     clip.write_bytes(b"0")
     boom = OSError("[WinError 3] The system cannot find the path specified: 'D:\\\\'")
-    with patch.object(render, "get_whisper_model", side_effect=boom):
+    with patch.object(render.transcribe, "get_model", side_effect=boom):
         assert render.transcribe_words(clip) == []                 # default: unchanged for render
         with pytest.raises(OSError, match="WinError 3"):
             render.transcribe_words(clip, raise_errors=True)
@@ -273,7 +273,7 @@ def test_transcribe_words_raise_errors_reraises_instead_of_returning_empty(tmp_p
 def test_hooks_stage_whisper_error_fails_the_item_without_calling_gemini(tmp_db, tmp_path):
     iid = _cut_item(tmp_db, tmp_path, hook_text="OLD HOOK?", keywords='["GTA"]')
     boom = OSError("[WinError 3] The system cannot find the path specified: 'D:\\\\'")
-    with patch.object(render, "get_whisper_model", side_effect=boom), \
+    with patch.object(render.transcribe, "get_model", side_effect=boom), \
          patch("pipeline.hooks.generate_hook_and_voiceover") as gen:
         ok, msg = hooks.run_hooks_for_item(iid, cfg=config.get_config(), db_path=tmp_db)
     assert ok is False and "Whisper transcription failed" in msg
@@ -348,13 +348,13 @@ def test_hooks_stage_passes_the_cut_transcript_into_the_prompt_and_caches_it(tmp
     assert json.loads(item["keywords"]) == ["LUCIA", "VICE", "CITY"]
     cached = json.loads(item["transcript_words"])
     assert cached["words"] == WORDS and (cached["cut_start"], cached["cut_end"]) == (10.0, 30.0)
-    assert render.cached_cut_words(item, render.render_settings()["whisper_model"]) == WORDS
+    assert render.cached_cut_words(item, render.transcribe.cache_key()) == WORDS
 
 
 def test_hooks_stage_reuses_its_own_cached_transcript(tmp_db, tmp_path):
     iid = _cut_item(tmp_db, tmp_path)
     item = db.get_item(iid, db_path=tmp_db)
-    render.store_cut_words(iid, item, WORDS, render.render_settings()["whisper_model"], db_path=tmp_db)
+    render.store_cut_words(iid, item, WORDS, render.transcribe.cache_key(), db_path=tmp_db)
     with patch.object(render, "transcribe_words") as tw, \
          patch("pipeline.hooks.generate_hook_and_voiceover", return_value=dict(GOOD)), \
          patch("pipeline.hooks.verify_hook_grounding", return_value=(True, "ok")):

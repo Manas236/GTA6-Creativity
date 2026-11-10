@@ -430,18 +430,18 @@ def _clear_hook_fields(item_id: str, db_path: Any = None) -> None:
 
 def _cut_transcript(item: dict[str, Any], cut_path: Path, cfg: dict[str, Any], db_path: Any) -> list[dict[str, Any]]:
     """faster-whisper words for the cut window, cached on the item for render to reuse."""
-    from . import render  # lazy: render imports this module
+    from . import render, transcribe  # lazy: render imports this module
 
-    model_name = render.render_settings(cfg)["whisper_model"]
-    words = render.cached_cut_words(item, model_name)
+    key = transcribe.cache_key(cfg)
+    words = render.cached_cut_words(item, key)
     if words is not None:
         return words
-    log.info("Transcribing cut %s with faster-whisper (%s)...", cut_path.name, model_name)
+    log.info("Transcribing cut %s with faster-whisper (%s)...", cut_path.name, key)
     # raise_errors: a broken whisper (missing model cache, bad HF_HOME, ...) must fail the
     # stage, not silently hand Gemini an empty transcript.
-    words = render.transcribe_words(cut_path, model_name=model_name, raise_errors=True)
+    words = render.transcribe_words(cut_path, raise_errors=True, cfg=cfg)
     if words:  # nothing spoken: nothing worth caching (render will simply transcribe again)
-        render.store_cut_words(item["id"], item, words, model_name, db_path=db_path)
+        render.store_cut_words(item["id"], item, words, key, db_path=db_path)
     return words
 
 

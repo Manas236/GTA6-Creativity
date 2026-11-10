@@ -387,22 +387,24 @@ def test_render_item_variants_snaps_end_to_pause(tmp_path: Path):
 
 # ----------------------------------------------------------------------------- cached cut words
 
+KEY = render.transcribe.cache_key()
+
 CACHED_WORDS = [{"word": "VICE", "start": 0.5, "end": 0.9, "prob": 0.9},
                 {"word": "CITY", "start": 0.9, "end": 1.3, "prob": 0.9}]
 
 
 def _cached_item(cut_start=10.0, cut_end=30.0, model=None, words=CACHED_WORDS):
     import json
-    payload = {"cut_start": 10.0, "cut_end": 30.0, "model": model or RS["whisper_model"], "words": words}
+    payload = {"cut_start": 10.0, "cut_end": 30.0, "key": model or KEY, "words": words}
     return {"id": "item_r", "cut_start": cut_start, "cut_end": cut_end, "transcript_words": json.dumps(payload)}
 
 
 def test_cached_cut_words_only_valid_for_the_same_cut_window_and_model():
-    assert render.cached_cut_words(_cached_item(), RS["whisper_model"]) == CACHED_WORDS
-    assert render.cached_cut_words(_cached_item(cut_start=12.0), RS["whisper_model"]) is None    # re-cut
-    assert render.cached_cut_words(_cached_item(model="small.en"), RS["whisper_model"]) is None  # other model
-    assert render.cached_cut_words({"id": "x", "cut_start": 1, "cut_end": 2}, RS["whisper_model"]) is None
-    assert render.cached_cut_words({"transcript_words": "{not json"}, RS["whisper_model"]) is None
+    assert render.cached_cut_words(_cached_item(), KEY) == CACHED_WORDS
+    assert render.cached_cut_words(_cached_item(cut_start=12.0), KEY) is None    # re-cut
+    assert render.cached_cut_words(_cached_item(model="small.en|other"), KEY) is None  # other model / glossary
+    assert render.cached_cut_words({"id": "x", "cut_start": 1, "cut_end": 2}, KEY) is None
+    assert render.cached_cut_words({"transcript_words": "{not json"}, KEY) is None
 
 
 def test_run_render_item_reuses_the_cached_cut_words(tmp_db: Path, tmp_path: Path):
@@ -423,7 +425,7 @@ def test_run_render_item_reuses_the_cached_cut_words(tmp_db: Path, tmp_path: Pat
         "voiceover_audio_path": str(vo), "keywords": '["VICE", "CITY", "GTA"]',
     }, db_path=tmp_db)
     render.store_cut_words("item_r", db.get_item("item_r", db_path=tmp_db), CACHED_WORDS,
-                           RS["whisper_model"], db_path=tmp_db)
+                           KEY, db_path=tmp_db)
 
     fake = {"elapsed_a_s": 1.0, "elapsed_b_s": 1.0, "probe_a": {"video_duration": 20.0},
             "probe_b": {"video_duration": 23.0}, "preset": "P0"}

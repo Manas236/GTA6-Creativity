@@ -40,7 +40,7 @@ from typing import Any, Sequence
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline import config, cut as cutmod, db, download, endings, hooks, keywords as kwmod, render, style  # noqa: E402
+from pipeline import config, cut as cutmod, db, download, endings, hooks, keywords as kwmod, render, style, transcribe  # noqa: E402
 
 log = logging.getLogger("render_previews")
 
@@ -62,6 +62,8 @@ class ItemResult:
     renders: dict[str, dict[str, Any]] = field(default_factory=dict)   # preset -> info
     grids: dict[str, str] = field(default_factory=dict)
     no_clean_ending: bool = False      # the cut stage found no speech-safe end: swap the item
+    transcript: list[str] = field(default_factory=list)   # last cut-stage words, when not rendered
+    transcript_note: str = ""
     replaces: str = ""                 # the item this one was swapped in for
 
 
@@ -101,7 +103,7 @@ def cut_is_current(item: dict[str, Any], cfg: dict[str, Any]) -> bool:
     existing = item.get("cut_path")
     if not existing or not Path(existing).exists():
         return False
-    return render.cut_end_verified(item, render.render_settings(cfg)["whisper_model"])
+    return render.cut_end_verified(item, transcribe.cache_key(cfg))
 
 
 def ensure_cut(item: dict[str, Any], cfg: dict[str, Any], db_path: Any = None) -> Path:
@@ -235,6 +237,13 @@ def render_item(
     except Exception as e:
         result.message = str(e)
         result.no_clean_ending = "no_clean_ending" in str(e)
+        try:   # show what the speech said even though nothing was rendered
+            raw = json.loads((db.get_item(item_id, db_path=db_path) or {}).get("transcript_words") or "{}")
+            result.transcript = [str(w.get("word", "")) for w in raw.get("words") or []]
+            result.transcript_note = (f"{raw.get('key', '?')}, window {raw.get('cut_start')}-{raw.get('cut_end')} s "
+                                      "from an earlier cut")
+        except Exception:  # noqa: BLE001
+            pass
         return result
 
     hook = item.get("hook_text") or "IS THIS REALLY GTA 6?"
@@ -243,8 +252,9 @@ def render_item(
 
     rs = render.render_settings(cfg)
     # Cut words cached by the cut/hooks stage when they match this cut window; else transcribe.
-    words = render.cut_speech_words(item, cut_path, rs["whisper_model"])
-    clean_cut_end = render.cut_end_verified(item, rs["whisper_model"])
+    tkey = transcribe.cache_key(cfg)
+    words = render.cut_speech_words(item, cut_path, tkey, cfg)
+    clean_cut_end = render.cut_end_verified(item, tkey)
 
     vo_path = item.get("voiceover_audio_path")
     if not vo_path or not Path(vo_path).exists():
@@ -256,7 +266,7 @@ def render_item(
             result.message = f"voiceover failed: {msg}"
             return result
     vo_path = Path(vo_path)
-    vo_words = render.transcribe_words(vo_path, model_name=rs["whisper_model"])
+    vo_words = render.transcribe_words(vo_path, cfg=cfg)
     if not vo_words:
         vo_words = render.estimate_words_from_script(
             item.get("voiceover_script") or "", render.media_duration(vo_path)
@@ -288,6 +298,8 @@ def render_item(
             "a_s": res["probe_a"]["video_duration"], "b_s": res["probe_b"]["video_duration"],
             "elapsed_a_s": res["elapsed_a_s"], "elapsed_b_s": res["elapsed_b_s"],
             "style_a": res["style_a"],
+            "captions_a": res.get("caption_words_a") or [],
+            "captions_b": res.get("caption_words_b") or [],
         }
         # What scripts/verify_previews.py checks: where the end sits in the source, and the
         # SFX cues each variant was mixed with (both on that variant's output timeline).
@@ -327,6 +339,48 @@ def render_item(
 
 # --------------------------------------------------------------------------------------
 
+def _wrap(words: Sequence[str], width: int = 96) -> list[str]:
+    lines, line = [], ""
+    for w in words:
+        if line and len(line) + len(w) + 1 > width:
+            lines.append(line)
+            line = ""
+        line = f"{line} {w}".strip()
+    return lines + ([line] if line else [])
+
+
+def caption_lines(r: ItemResult, presets: Sequence[str]) -> list[str]:
+    """Every caption word burned into this item's renders, so they can be read and checked.
+    One list per variant; a preset whose captions differ (e.g. A4 ended it earlier) gets its own."""
+    out: list[str] = []
+    if not r.ok and r.transcript:
+        out.append(f"  NOT RENDERED. Last cut-stage transcript ({r.transcript_note}) - not burned in anywhere:")
+        out += ["    " + line for line in _wrap(r.transcript)]
+    ok = [(p, r.renders[p]) for p in presets if (r.renders.get(p) or {}).get("ok")]
+    for v in ("a", "b"):
+        groups: list[tuple[list[str], list[str]]] = []          # (presets, words)
+        for p, info in ok:
+            words = list(info.get(f"captions_{v}") or [])
+            for g in groups:
+                if g[1] == words:
+                    g[0].append(p)
+                    break
+            else:
+                groups.append(([p], words))
+        for ps, words in groups:
+            label = f"captions {v.upper()} ({'/'.join(ps)}, {len(words)} words)"
+            out.append(f"  {label}:")
+            line = "    "
+            for w in words:
+                if len(line) + len(w) + 1 > 100:
+                    out.append(line.rstrip())
+                    line = "    "
+                line += w + " "
+            if line.strip():
+                out.append(line.rstrip())
+    return out
+
+
 def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequence[str]) -> Path:
     lines = [
         "GTA 6 clipping pipeline - style layer previews",
@@ -350,6 +404,10 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
         "Pick a preset, then set `style.preset` in config.yaml. The pipeline default",
         "stays P0 until that choice is made.",
         "",
+        "Every caption word that is burned in is listed under each item (transcribed with",
+        "transcribe.model and the GTA glossary from config.yaml). Variant B starts with the",
+        "voiceover's words.",
+        "",
     ]
     for r in results:
         lines.append(f"{r.item_id}" + (f"  (swapped in for {r.replaces}: no_clean_ending)" if r.replaces else ""))
@@ -371,6 +429,7 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
                 lines.append(f"  {preset}: FAILED - {info.get('error')}")
         for v, g in r.grids.items():
             lines.append(f"  grid_{v}: {Path(g).name}")
+        lines += caption_lines(r, presets)
         lines.append("")
     path = out_root / "README.txt"
     path.write_text("\n".join(lines), encoding="utf-8")

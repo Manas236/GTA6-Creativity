@@ -218,8 +218,8 @@ def test_render_previews_cached_keywords_skip_both_paths(tmp_path):
 
 def _verified_payload(cut_start=5.0, cut_end=25.0, words=None, ending="sentence"):
     import json
-    model = render_previews.render.render_settings()["whisper_model"]
-    return json.dumps({"cut_start": cut_start, "cut_end": cut_end, "model": model,
+    key = render_previews.transcribe.cache_key()
+    return json.dumps({"cut_start": cut_start, "cut_end": cut_end, "key": key,
                        "words": words or [], "ending": ending, "ending_rule": render_previews.endings.RULE_VERSION, "source": "cut"})
 
 
@@ -232,7 +232,7 @@ def test_render_previews_reuses_an_existing_download_and_a_current_cut(tmp_path)
     with patch.object(render_previews.download, "download_single_item") as dl, \
          patch.object(render_previews.cutmod, "run_cut_item") as rc:
         assert render_previews.ensure_source(item, {}) == src
-        assert render_previews.ensure_cut(item, {}) == cut
+        assert render_previews.ensure_cut(item, config.get_config()) == cut
     dl.assert_not_called()
     rc.assert_not_called()
 
@@ -373,7 +373,6 @@ def test_render_previews_reuses_the_hooks_stage_cut_words(tmp_path):
     cut.write_bytes(b"0")
     vo.write_bytes(b"0")
     words = [{"word": "VICE", "start": 0.1, "end": 0.5}]
-    model = render_previews.render.render_settings()["whisper_model"]
     item = {"id": "i", "download_path": str(cut), "cut_path": str(cut), "voiceover_audio_path": str(vo),
             "hook_text": "H", "author_name": "C", "keywords": '["VICE","CITY","MAP"]',
             "cut_start": 5.0, "cut_end": 25.0, "transcript_words": _verified_payload(words=words)}
@@ -405,3 +404,18 @@ def test_render_previews_rejects_an_unknown_preset_before_rendering(tmp_path):
         with pytest.raises(KeyError):
             render_previews.main(["--presets", "P9", "--out", str(tmp_path)])
     ri.assert_not_called()
+
+
+def test_render_previews_lists_every_caption_word_per_variant(tmp_path):
+    r = render_previews.ItemResult(item_id="item_x", ok=True)
+    words_a = ["get", "rid", "of", "your", "wanted", "level."]
+    r.renders = {
+        "P0": {"ok": True, "a": "a", "b": "b", "a_s": 1.0, "b_s": 1.0, "elapsed_a_s": 1.0, "elapsed_b_s": 1.0,
+               "captions_a": words_a, "captions_b": ["VO"] + words_a},
+        "P1": {"ok": True, "a": "a", "b": "b", "a_s": 1.0, "b_s": 1.0, "elapsed_a_s": 1.0, "elapsed_b_s": 1.0,
+               "captions_a": words_a[:-2], "captions_b": ["VO"] + words_a},
+    }
+    text = render_previews.write_readme(tmp_path, [r], ["P0", "P1"]).read_text(encoding="utf-8")
+    assert "captions A (P0, 6 words):" in text and "get rid of your wanted level." in text
+    assert "captions A (P1, 4 words):" in text                       # a preset that ended earlier
+    assert "captions B (P0/P1, 7 words):" in text and "VO get rid of your wanted level." in text

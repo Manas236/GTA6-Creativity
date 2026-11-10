@@ -93,14 +93,49 @@ cut:
     end_after_word_s: 0.35 # in a long gap, keep this much room on both sides of the end
     tail_s: 2.0 # transcribe this far past the window's max end, to see the gap after it
     max_windows: 8 # scored windows to try before failing with no_clean_ending
+    retry_spacing_s: 2.0 # skip windows starting this close to one that had no sentence end (near-copies)
     # whisper's word timestamps are not precise enough for short gaps (0.00 s reported over a
     # real pause; a 0.15 s gap reported where the speaker ran on). After . ? ! the AUDIO decides:
     # the end goes in the middle of the earliest measured pause after the word.
     audio_gap_drop_db: 12.0 # this far under the clip's speech level...
-    audio_gap_min_s: 0.06 # ...for at least this long...
+    audio_gap_min_s: 0.2 # ...for at least this long (0.15 s after "level" read as "." or "," by turns: comma-length)
     audio_gap_search_s: 0.4 # ...within this far after whisper's word end
     pause_drop_db: 8.0 # with audio, the >= pause_gap_s case is a measured stretch this far under the speech
-    no_speech_gap_s: 2.0 # ...or whisper hearing nobody at all for this long (music / gameplay only)
+    no_speech_gap_s: null # disabled: whisper silently dropping words once made a "nobody speaks" gap over live speech
+
+# Every faster-whisper transcription (cut stage, hooks, render captions, VO, scripts) uses this
+# model and passes this glossary, so GTA names come out right on the burned-in captions.
+# Changing the model, the glossary or glossary_as invalidates every cached cut transcript
+# (items.transcript_words is keyed on all three) - the next cut/render transcribes again.
+transcribe:
+  model: "small.en" # chosen by scripts/benchmark_captions.py on the laptop: PLAN.md calls #155-#159
+  glossary_as: "hotwords" # hotwords | initial_prompt | both | none. NOT initial_prompt: with small.en it dropped 42 of 79 words on a real clip
+  glossary:
+    - "GTA 6"
+    - "GTA VI"
+    - "Grand Theft Auto"
+    - "Rockstar"
+    - "Rockstar Games"
+    - "Leonida"
+    - "Leonida Keys"
+    - "Vice City"
+    - "Port Gellhorn"
+    - "Ambrosia"
+    - "Grassrivers"
+    - "Mount Kalaga"
+    - "Everglades"
+    - "Miami"
+    - "Lucia"
+    - "Jason"
+    - "Cal"
+    - "Boobie"
+    - "Dre'Quan"
+    - "Raul"
+    - "Brian"
+    - "Trevor"
+    - "Michael"
+    - "Franklin"
+    - "wanted level"
 
 gemini:
   model: "gemini-2.5-flash"
@@ -125,7 +160,7 @@ render:
   fonts_dir: "assets/fonts"
   font_path: "assets/fonts/Montserrat-Black.ttf"
   font_name: "Montserrat Black" # static Black (900) face; nameID 1 of Montserrat-Black.ttf
-  whisper_model: "base.en"
+  # (the whisper model moved to transcribe.model below)
   target_lufs: -14.0
   voiceover_target_duration_s: 4.5
   # Variant B freeze-frame format: first frame held for VO duration + pad, then the cut plays at full level.

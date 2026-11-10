@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import math
 import sqlite3
 import subprocess
@@ -28,7 +29,7 @@ from typing import Any, Sequence
 
 from . import audio_mix, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, voiceover
 from .cut import audio_envelope, extract_audio_loudness_profile, snap_end_to_pause
-from . import endings
+from . import endings, transcribe
 from .download import verify_video_file
 from .rendercore import (  # re-exported for callers and tests
     RENDER_DEFAULTS,
@@ -53,7 +54,6 @@ from .rendercore import (  # re-exported for callers and tests
 
 log = logging.getLogger(__name__)
 
-_WHISPER_INSTANCE: Any = None
 
 __all__ = [
     "RENDER_DEFAULTS", "RenderVerificationError", "render_settings", "escape_filter_path",
@@ -80,23 +80,26 @@ def whisper_download_root() -> str | None:
     anchor = Path(hf_home).anchor or hf_home
     if Path(anchor).exists():
         return None
-    fallback = Path.home() / ".cache" / "huggingface" / "hub"
+    home = Path.home() / ".cache" / "huggingface"
+    fallback = home / "hub"
     log.warning("HF_HOME=%s is on a drive that does not exist; loading whisper from %s", hf_home, fallback)
+    # huggingface_hub keeps more than the model cache under HF_HOME (its xet download cache,
+    # the token): point the whole thing at the default for this process, before it is
+    # imported, and fix its constants if it already was. Without this a NEW model (small.en)
+    # cannot be downloaded at all ("cannot find the path specified").
+    os.environ["HF_HOME"] = str(home)
+    hub_consts = sys.modules.get("huggingface_hub.constants")
+    if hub_consts is not None:
+        for name, value in (("HF_HOME", home), ("HF_HUB_CACHE", fallback), ("HUGGINGFACE_HUB_CACHE", fallback),
+                            ("HF_XET_CACHE", home / "xet")):
+            if hasattr(hub_consts, name):
+                setattr(hub_consts, name, str(value))
     return str(fallback)
 
 
 def get_whisper_model(model_name: str = "base.en") -> Any:
-    """Return shared WhisperModel singleton on CPU (faster_whisper imported lazily)."""
-    global _WHISPER_INSTANCE
-    if _WHISPER_INSTANCE is None:
-        import faster_whisper
-
-        log.info("Loading faster-whisper model '%s' (device=cpu, compute_type=int8)...", model_name)
-        _WHISPER_INSTANCE = faster_whisper.WhisperModel(
-            model_name, device="cpu", compute_type="int8", download_root=whisper_download_root()
-        )
-        log.info("WhisperModel '%s' loaded.", model_name)
-    return _WHISPER_INSTANCE
+    """The loaded WhisperModel for `model_name` (one per name; see pipeline/transcribe.py)."""
+    return transcribe.get_model(model_name)
 
 
 def format_ass_timestamp(seconds: float) -> str:
@@ -112,61 +115,34 @@ def format_ass_timestamp(seconds: float) -> str:
 
 
 def transcribe_words(
-    audio_or_video_path: Path | str, model_name: str = "base.en", raise_errors: bool = False
+    audio_or_video_path: Path | str,
+    model_name: str | None = None,
+    raise_errors: bool = False,
+    cfg: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Transcribe audio with word-level timestamps using faster-whisper.
+    """Word-level transcript with the configured model AND the GTA glossary
+    (pipeline/transcribe.py). `model_name` overrides `transcribe.model`.
 
     By default a failure is logged and [] is returned. raise_errors=True re-raises instead,
     so a caller can tell "whisper broke" from "nobody speaks" (the hooks stage needs that).
     """
-    path_str = str(audio_or_video_path)
-    if not Path(path_str).exists():
-        if raise_errors:
-            raise FileNotFoundError(f"cannot transcribe, file not found: {path_str}")
-        return []
-
-    try:
-        model = get_whisper_model(model_name=model_name)
-        segments, _ = model.transcribe(
-            path_str,
-            word_timestamps=True,
-            language="en",
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-        )
-        words: list[dict[str, Any]] = []
-        for segment in segments:
-            if not segment.words:
-                continue
-            for w in segment.words:
-                word_clean = w.word.strip()
-                if word_clean:
-                    words.append({
-                        "word": word_clean,
-                        "start": float(w.start),
-                        "end": float(w.end),
-                        "prob": float(w.probability),
-                    })
-        return words
-    except Exception as e:
-        if raise_errors:
-            raise
-        log.warning("Whisper transcription failed for %s: %s", path_str, e)
-        return []
+    return transcribe.transcribe_words(audio_or_video_path, cfg, model_name=model_name, raise_errors=raise_errors)
 
 
-# The hooks stage transcribes the cut once (Gemini needs the transcript) and caches the
-# words on the item; render reuses them. The cache is keyed on the cut window and the
-# whisper model, so a re-cut (new cut_start/cut_end) silently invalidates it.
+# The cut stage (or hooks) transcribes the cut once and caches the words on the item; render
+# reuses them. The cache is keyed on the cut window AND on transcribe.cache_key() (model +
+# glossary + how the glossary is passed), so a re-cut or a different model / glossary
+# invalidates it.
 
-def cached_cut_words(item: dict[str, Any] | None, model_name: str) -> list[dict[str, Any]] | None:
-    """Cut-timeline words cached on the item, or None when absent/stale/corrupt."""
+def cached_cut_words(item: dict[str, Any] | None, key: str) -> list[dict[str, Any]] | None:
+    """Cut-timeline words cached on the item, or None when absent/stale/corrupt.
+    `key` is transcribe.cache_key(cfg)."""
     raw = (item or {}).get("transcript_words")
     if not raw:
         return None
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
-        if data.get("model") != model_name:
+        if data.get("key") != key:
             return None
         for k in ("cut_start", "cut_end"):
             if item.get(k) is None or abs(float(data[k]) - float(item[k])) > 1e-6:
@@ -178,13 +154,14 @@ def cached_cut_words(item: dict[str, Any] | None, model_name: str) -> list[dict[
 
 
 def store_cut_words(
-    item_id: str, item: dict[str, Any], words: Sequence[dict[str, Any]], model_name: str, db_path: Any = None
+    item_id: str, item: dict[str, Any], words: Sequence[dict[str, Any]], key: str, db_path: Any = None
 ) -> None:
-    """Cache the cut transcript on the item (tagged with the cut window it belongs to)."""
+    """Cache the cut transcript on the item (tagged with the cut window and transcribe key)."""
     payload = {
         "cut_start": item.get("cut_start"),
         "cut_end": item.get("cut_end"),
-        "model": model_name,
+        "model": key.split("|", 1)[0],
+        "key": key,
         "words": list(words),
     }
     with db.db(db_path) as conn:
@@ -194,13 +171,13 @@ def store_cut_words(
         )
 
 
-def cut_end_verified(item: dict[str, Any] | None, model_name: str) -> bool:
+def cut_end_verified(item: dict[str, Any] | None, key: str) -> bool:
     """True when the cut stage checked this cut's end against the audio AFTER the cut
     (it transcribed a tail), so render may treat the cut's own end as a sentence end.
 
     Only the cut stage writes the `ending` key, and only for the window it chose; a cache
     for another window or another model never counts."""
-    if cached_cut_words(item, model_name) is None:
+    if cached_cut_words(item, key) is None:
         return False
     try:
         raw = item.get("transcript_words")
@@ -211,16 +188,17 @@ def cut_end_verified(item: dict[str, Any] | None, model_name: str) -> bool:
         return False
 
 
-def cut_speech_words(item: dict[str, Any], cut_path: Path | str, model_name: str) -> list[dict[str, Any]]:
-    """Render-side read: the cached cut words when valid, else a fresh transcription.
-
-    Render never writes the cache; the hooks stage owns it.
+def cut_speech_words(
+    item: dict[str, Any], cut_path: Path | str, key: str, cfg: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """Render-side read: the cached cut words when valid for `key`, else a fresh transcription
+    (configured model + glossary). Render never writes the cache; the cut/hooks stages own it.
     """
-    cached = cached_cut_words(item, model_name)
+    cached = cached_cut_words(item, key)
     if cached is not None:
         log.info("Reusing %d cached cut words for %s (no re-transcription).", len(cached), item.get("id"))
         return cached
-    return transcribe_words(cut_path, model_name=model_name)
+    return transcribe_words(cut_path, cfg=cfg)
 
 
 # --------------------------------------------------------------------------------------
@@ -886,6 +864,9 @@ def render_item_variants(
         "ass_a": str(ass_a),
         "ass_b": str(ass_b),
         "style_a": plan_a.summary(),
+        # The exact words burned in as captions (B: the VO words during the freeze, then speech).
+        "caption_words_a": [str(w["word"]) for w in plan_a.words],
+        "caption_words_b": [str(w["word"]) for w in plan_b.words],
         "style_b": plan_b.summary(),
     }
 
@@ -950,12 +931,12 @@ def run_render_item(
         return False, "Voiceover audio missing", {}
 
     rs = render_settings(cfg)
-    whisper_model = rs["whisper_model"]
-    speech_words = cut_speech_words(item, cut_path, whisper_model)
+    tkey = transcribe.cache_key(cfg)
+    speech_words = cut_speech_words(item, cut_path, tkey, cfg)
     log.info("%d speech words on the cut timeline.", len(speech_words))
 
     # VO words on the VO timeline (VO starts at 0 in Variant B's freeze).
-    vo_words = transcribe_words(vo_path, model_name=whisper_model)
+    vo_words = transcribe_words(vo_path, cfg=cfg)
     if not vo_words:
         vo_words = estimate_words_from_script(item.get("voiceover_script") or "", media_duration(vo_path))
 
@@ -982,7 +963,7 @@ def run_render_item(
             preset=preset,
             channel_name=item.get("author_name") or "",
             keyword_list=keyword_list,
-            clean_cut_end=cut_end_verified(item, whisper_model),
+            clean_cut_end=cut_end_verified(item, tkey),
         )
     except (RenderVerificationError, endings.NoCleanEnding) as e:
         db.mark_failed(item_id, "render", str(e), db_path=db_path)

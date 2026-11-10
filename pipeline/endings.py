@@ -21,9 +21,11 @@ The "gap >= ``pause_gap_s``" case is measured in the audio too (rule 4): a stret
 ``pause_gap_s`` long that is ``pause_drop_db`` under the speaker. Whisper's word ends moved by
 ~0.3 s between two transcriptions of the same audio; it reported 0.63 s after "download," where
 the real pause was 0.32 s (after a comma - not a sentence end), and an end placed "0.07 s after"
-that word by whisper's clock was +7 dB loud. Whisper's own gaps only count when it hears nobody
-for at least ``no_speech_gap_s`` (music or gameplay with no speech under it). Every end, in
-every stage, is therefore in audio quieter than the speech.
+that word by whisper's clock was +7 dB loud. Whisper's own gaps can be allowed to count when it hears
+nobody for at least ``no_speech_gap_s`` (music or gameplay under no speech), but that is OFF
+in config (rule 5): small.en once dropped 42 words and reported a "nobody speaks" gap over
+live speech, so the end landed +4 dB loud. Every end, in every stage, is therefore in audio
+quieter than the speech.
 
 Its *safe span* is ``[word_end + min_after_word_s, next_start - next_word_margin_s]``:
 an end anywhere inside sits in silence after a finished sentence, never inside a word.
@@ -49,11 +51,12 @@ DEFAULTS: dict[str, Any] = {
     "end_after_word_s": 0.35,     # in a long gap, keep at least this much room on both sides
     "tail_s": 2.0,                # cut stage: transcribe this far past the window's max end
     "max_windows": 8,             # cut stage: scored windows to try before no_clean_ending
+    "retry_spacing_s": 2.0,       # ...skipping windows this close to one that had no sentence end
     "audio_gap_drop_db": 12.0,    # a measured pause is this far under the speech level...
-    "audio_gap_min_s": 0.06,      # ...for at least this long
+    "audio_gap_min_s": 0.2,       # ...for at least this long (shorter pauses are comma-length)
     "audio_gap_search_s": 0.4,    # looked for up to this far after whisper's word end
     "pause_drop_db": 8.0,         # an end in a long pause must be at least this far under speech
-    "no_speech_gap_s": 2.0,       # whisper hearing nobody this long counts without a level test
+    "no_speech_gap_s": None,      # if set: whisper hearing nobody this long counts without a level test
     "abbreviations": ["mr.", "mrs.", "ms.", "dr.", "st.", "vs.", "etc.", "jr.", "sr.", "e.g.", "i.e."],
 }
 
@@ -63,7 +66,7 @@ _EPS = 1e-6
 
 # Bumped whenever the rule changes in a way that can invalidate an end the cut stage already
 # verified: render only trusts a cut-stage verdict made under the current rule.
-RULE_VERSION = 4
+RULE_VERSION = 6
 
 
 class NoCleanEnding(RuntimeError):
@@ -304,7 +307,10 @@ def safe_spans(
             if b.reason == "punct":
                 continue
             gap_end = b.gap_end if math.isfinite(b.gap_end) else float(audio_end)
-            if not math.isfinite(b.word_end) or gap_end - b.word_end >= float(es["no_speech_gap_s"]):
+            no_speech = es.get("no_speech_gap_s")
+            if no_speech is None:
+                continue                  # disabled (config): every end needs measured quiet
+            if not math.isfinite(b.word_end) or gap_end - b.word_end >= float(no_speech):
                 start = b.start if not math.isfinite(b.word_end) else max(b.start, b.word_end + room)
                 if start <= b.end:
                     confirmed.append(SafeSpan(start, b.end, b.word_end, b.gap_end, b.reason))

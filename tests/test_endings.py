@@ -10,11 +10,13 @@ from unittest.mock import patch
 
 import pytest
 
-from pipeline import cut, db, edits, endings, hooks, plan as planning, render, style
+from pipeline import config, cut, db, edits, endings, hooks, plan as planning, render, style
 
 ES = endings.ending_settings({"cut": {}})
 SS = style.style_settings()
-MODEL = render.render_settings()["whisper_model"]
+from pipeline import transcribe  # noqa: E402
+
+MODEL = transcribe.cache_key()          # the transcript cache key (model + glossary)
 
 
 def W(word: str, start: float, end: float) -> dict:
@@ -172,7 +174,7 @@ def test_whisper_failure_fails_the_cut_rather_than_shipping_an_unchecked_end(tmp
 
 
 def test_cut_caches_its_words_for_hooks_and_a_new_window_invalidates_the_old_cache(tmp_db, tmp_path):
-    old = {"cut_start": 5.0, "cut_end": 25.0, "model": MODEL, "words": [W("stale", 0.0, 0.5)]}
+    old = {"cut_start": 5.0, "cut_end": 25.0, "key": MODEL, "words": [W("stale", 0.0, 0.5)]}
     _seed_item(tmp_db, tmp_path, transcript=old)
     before = db.get_item("item_c", db_path=tmp_db)
     assert render.cached_cut_words(before, MODEL) == old["words"]
@@ -185,7 +187,7 @@ def test_cut_caches_its_words_for_hooks_and_a_new_window_invalidates_the_old_cac
     item = db.get_item("item_c", db_path=tmp_db)
     payload = json.loads(item["transcript_words"])
     assert (payload["cut_start"], payload["cut_end"]) == (item["cut_start"], item["cut_end"]) != (5.0, 25.0)
-    assert payload["model"] == MODEL and payload["ending"] == "sentence"
+    assert payload["key"] == MODEL and payload["ending"] == "sentence"
     words = render.cached_cut_words(item, MODEL)
     assert words and words[-1]["word"] == "done." and words[0]["start"] == pytest.approx(0.0)
     assert render.cut_end_verified(item, MODEL) is True
@@ -194,15 +196,15 @@ def test_cut_caches_its_words_for_hooks_and_a_new_window_invalidates_the_old_cac
 
     # hooks reuses the cut-stage words: whisper is never called again
     with patch.object(render, "transcribe_words", side_effect=AssertionError("re-transcribed")):
-        assert hooks._cut_transcript(item, Path(item["cut_path"]), {"render": {}}, tmp_db) == words
+        assert hooks._cut_transcript(item, Path(item["cut_path"]), config.get_config(), tmp_db) == words
 
 
 def test_a_cache_without_the_cut_stage_verdict_does_not_verify_the_end():
     item = {"cut_start": 1.0, "cut_end": 21.0,
-            "transcript_words": json.dumps({"cut_start": 1.0, "cut_end": 21.0, "model": MODEL, "words": []})}
+            "transcript_words": json.dumps({"cut_start": 1.0, "cut_end": 21.0, "key": MODEL, "words": []})}
     assert render.cut_end_verified(item, MODEL) is False                       # hooks-written cache
     item2 = {**item, "cut_end": 22.0}
-    item2["transcript_words"] = json.dumps({"cut_start": 1.0, "cut_end": 21.0, "model": MODEL,
+    item2["transcript_words"] = json.dumps({"cut_start": 1.0, "cut_end": 21.0, "key": MODEL,
                                             "words": [], "ending": "sentence"})
     assert render.cut_end_verified(item2, MODEL) is False                      # other window
 
@@ -320,18 +322,18 @@ def _env(dur: float, dips: list[tuple[float, float]], speech_db: float = -20.0, 
 
 
 def test_a_full_stop_with_no_whisper_gap_counts_when_the_audio_pauses():
-    # whisper: "so." ends 19.00 and "The" starts 19.00 (0.00 s); the audio dips 19.08-19.24
+    # whisper: "so." ends 19.00 and "The" starts 19.00 (0.00 s); the audio dips 19.00-19.25
     words = continuous(0.0, 18.8) + [W("so.", 18.8, 19.0), W("The", 19.0, 19.3)] + continuous(19.3, 25.0)
     assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES) == []                       # whisper alone: none
-    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.08, 19.24)]))
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.0, 19.25)]))
     assert len(spans) == 1 and spans[0].reason == "punct_audio"
     end = endings.choose_end(spans, 20.0, ES)
-    assert 19.10 <= end <= 19.22                                                       # inside the measured pause
+    assert 19.05 <= end <= 19.22                                                       # inside the measured pause
 
 
 def test_a_measured_pause_after_a_word_without_a_full_stop_is_not_an_end():
     words = continuous(0.0, 18.8) + [W("so", 18.8, 19.0), W("the", 19.0, 19.3)] + continuous(19.3, 25.0)
-    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.08, 19.24)])) == []
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.0, 19.25)])) == []
 
 
 def test_a_dip_shorter_than_audio_gap_min_s_is_a_consonant_not_a_pause():
@@ -343,8 +345,8 @@ def test_the_cut_stage_uses_the_measured_pause():
     words = continuous(0.0, 18.8) + [W("so.", 18.8, 19.0), W("The", 19.0, 19.3)] + continuous(19.3, 25.0)
     sc = scan([(0.0, 1.0)])
     assert cut.clean_end_for_window(sc.windows[0], sc, words, 24.0, ES) is None
-    choice = cut.clean_end_for_window(sc.windows[0], sc, words, 24.0, ES, env=_env(25.0, [(19.08, 19.24)]))
-    assert choice is not None and 19.1 <= choice.end <= 19.22 and choice.words[-1]["word"] == "so."
+    choice = cut.clean_end_for_window(sc.windows[0], sc, words, 24.0, ES, env=_env(25.0, [(19.0, 19.25)]))
+    assert choice is not None and 19.05 <= choice.end <= 19.22 and choice.words[-1]["word"] == "so."
 
 
 def test_windows_snapped_to_the_same_start_are_tried_once():
@@ -361,12 +363,18 @@ def test_a_whisper_gap_after_a_full_stop_without_an_audio_pause_is_not_an_end():
     words = continuous(0.0, 18.6) + [W("online.", 18.6, 19.0), W("So", 19.2, 19.4)] + continuous(19.4, 25.0)
     assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES)                                  # whisper alone: yes
     assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [])) == []       # the audio: no
-    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.02, 19.12)]))
-    assert len(spans) == 1 and spans[0].reason == "punct_audio" and 19.02 < spans[0].start < spans[0].end < 19.12
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(19.0, 19.25)]))
+    assert len(spans) == 1 and spans[0].reason == "punct_audio" and 19.0 < spans[0].start < spans[0].end < 19.25
+
+
+def test_a_comma_length_pause_after_a_full_stop_is_not_enough():
+    # item_5a67: "wanted level" + 0.15 s; whisper wrote "level." and "level," by turns.
+    words = continuous(0.0, 18.6) + [W("level.", 18.6, 19.0), W("They're", 19.15, 19.4)] + continuous(19.4, 25.0)
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [(18.98, 19.13)])) == []
 
 
 def test_a_cut_verified_under_an_older_rule_is_not_trusted():
-    payload = {"cut_start": 1.0, "cut_end": 21.0, "model": MODEL, "words": [], "ending": "sentence"}
+    payload = {"cut_start": 1.0, "cut_end": 21.0, "key": MODEL, "words": [], "ending": "sentence"}
     item = {"cut_start": 1.0, "cut_end": 21.0, "transcript_words": json.dumps(payload)}
     assert render.cut_end_verified(item, MODEL) is False                                     # rule 1
     item["transcript_words"] = json.dumps({**payload, "ending_rule": endings.RULE_VERSION})
@@ -401,9 +409,12 @@ def test_a_long_whisper_pause_with_loud_audio_is_not_an_end():
     assert len(spans) == 1 and spans[0].reason == "pause" and 18.65 < spans[0].start < spans[0].end < 19.3
 
 
-def test_with_audio_whisper_gaps_only_count_when_it_hears_nobody_for_a_long_time():
-    words = continuous(0.0, 10.0) + [W("over", 10.0, 10.3)]          # then 13.7 s of music, no speech
-    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, []))   # loud music
+def test_a_long_whisper_silence_over_loud_audio_is_not_an_end_unless_explicitly_enabled():
+    words = continuous(0.0, 10.0) + [W("over", 10.0, 10.3)]          # whisper hears nobody after 10.3 s
+    # Off by default (rule 5): whisper once dropped 42 words and "heard nobody" over live speech.
+    assert endings.safe_spans(words, 18.0, 22.0, 24.0, ES, env=_env(25.0, [])) == []
+    on = {**ES, "no_speech_gap_s": 2.0}
+    spans = endings.safe_spans(words, 18.0, 22.0, 24.0, on, env=_env(25.0, []))
     assert spans and spans[0].reason == "pause" and spans[0].start == 18.0
 
 
@@ -414,3 +425,22 @@ def test_the_verified_cut_end_only_reaches_back_over_its_measured_quiet_tail():
     quiet = endings.safe_spans(words, 18.0, 19.0, 19.0, ES, trusted_end=19.0, env=_env(19.0, [(18.8, 19.01)]))
     v = [s for s in quiet if s.reason == "verified"][0]
     assert 18.8 < v.start < 18.85 and v.end == 19.0
+
+
+def test_near_copies_of_a_window_without_a_sentence_end_are_skipped(tmp_db, tmp_path):
+    _seed_item(tmp_db, tmp_path)
+    sc = scan([(10.0, 0.9), (11.0, 0.88), (11.8, 0.87), (60.0, 0.5)])
+    calls = []
+
+    def transcriber(_p, a, b):
+        calls.append(a)
+        if a < 50:
+            return continuous(a, b)
+        return continuous(a, a + 19.0) + [W("finished.", a + 19.0, a + 19.4)] + continuous(a + 19.8, b)
+
+    es = {**ES, "max_windows": 2}
+    with patch.object(cut.endings, "ending_settings", return_value=es):
+        ok, msg = _run_cut(tmp_db, tmp_path, sc, transcriber)
+    assert ok, msg
+    assert calls == [10.0, 60.0]                       # 11 and 11.8 s were near-copies of the failed 10 s
+    assert db.get_item("item_c", db_path=tmp_db)["cut_start"] == 60.0

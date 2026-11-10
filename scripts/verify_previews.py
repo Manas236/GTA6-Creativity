@@ -7,8 +7,8 @@ One command, no prompts (run after scripts/render_previews.py):
 For every media/previews/<item>/P{n}_{A,B}.mp4 it
   1. transcribes the LAST 3 s of the render with faster-whisper and checks that the final
      word ends a sentence (. ? !) or that nobody speaks there;
-  2. checks the same end against the SOURCE: the source audio from 3 s before the end to
-     2 s after it is transcribed and measured, and the end must sit in a sentence break by
+  2. checks the same end against the SOURCE: the source audio from up to 20 s before the end
+     (from the cut start) to 2 s after it is transcribed and measured, and the end must sit in a sentence break by
      the pipeline's own rule (pipeline/endings.py, audio-confirmed); the audio level at the
      cut point relative to the speaker is printed - this is the ground truth for "was the
      speaker cut off", since whisper can mishear or punctuate a truncated 3 s snippet;
@@ -73,16 +73,16 @@ def _extract_wav(src: Path | str, start: float, dur: float, out: Path) -> None:
     subprocess.run(cmd, capture_output=True, check=True, timeout=120)
 
 
-def tail_words(mp4: Path, model: str, seconds: float = TAIL_S) -> tuple[float, list[dict[str, Any]]]:
+def tail_words(mp4: Path, cfg: dict[str, Any], seconds: float = TAIL_S) -> tuple[float, list[dict[str, Any]]]:
     dur = render.media_duration(mp4)
     with tempfile.TemporaryDirectory(prefix="gta6_verify_") as tmp:
         wav = Path(tmp) / "tail.wav"
         _extract_wav(mp4, dur - seconds, seconds, wav)
-        words = render.transcribe_words(wav, model_name=model, raise_errors=True)
+        words = render.transcribe_words(wav, raise_errors=True, cfg=cfg)
     return dur, words
 
 
-def source_check(plan: dict[str, Any], es: dict[str, Any], model: str,
+def source_check(plan: dict[str, Any], es: dict[str, Any], cfg: dict[str, Any],
                  cache: dict[tuple, tuple[bool, str]]) -> tuple[bool | None, str]:
     """Is the end, placed back in the source, in a sentence break of the source speech?"""
     src = plan.get("download_path")
@@ -92,8 +92,11 @@ def source_check(plan: dict[str, Any], es: dict[str, Any], model: str,
     key = (src, round(end_abs, 3))
     if key in cache:
         return cache[key]
-    a, b = end_abs - 3.0, end_abs + 2.0
-    words = cutmod.transcribe_source_span(src, a, b, model_name=model)
+    # 20 s of context before the end: whisper's punctuation (and spelling) on a 5 s snippet is
+    # unreliable - it wrote "level," + "they're" where 24 s of context gives "level." - and the
+    # check must not be weaker than the decision it checks.
+    a, b = max(float(plan.get("cut_start") or 0.0), end_abs - 20.0), end_abs + 2.0
+    words = cutmod.transcribe_source_span(src, a, b, cfg=cfg)
     env = cutmod.audio_envelope(src, a - 5.0, b)          # 10 s of context for the speech level
     speech = env.speech_level() if env else None
     rel = (env.at(env.index(end_abs)) - speech
@@ -126,7 +129,6 @@ def source_check(plan: dict[str, Any], es: dict[str, Any], model: str,
 
 def check(out_root: Path, items: Sequence[str] | None = None, cfg: dict[str, Any] | None = None) -> list[Row]:
     cfg = cfg if cfg is not None else config.get_config()
-    model = render.render_settings(cfg)["whisper_model"]
     es = endings.ending_settings(cfg)
     ss = style.style_settings(cfg)
     rows: list[Row] = []
@@ -140,11 +142,11 @@ def check(out_root: Path, items: Sequence[str] | None = None, cfg: dict[str, Any
             plan_file = d / f"{preset}.plan.json"
             plan = json.loads(plan_file.read_text(encoding="utf-8")) if plan_file.exists() else {}
             try:
-                row.duration, words = tail_words(mp4, model)
+                row.duration, words = tail_words(mp4, cfg)
                 row.last_words = " ".join(w["word"] for w in words[-4:]) or "(no speech)"
                 row.final_word = words[-1]["word"] if words else ""
                 row.snippet_ok = (not words) or endings.ends_sentence(row.final_word, es)
-                row.source_ok, row.source_note = source_check(plan, es, model, cache) if plan else (None, "no plan")
+                row.source_ok, row.source_note = source_check(plan, es, cfg, cache) if plan else (None, "no plan")
             except Exception as e:  # noqa: BLE001 - reported per row
                 row.error = f"{type(e).__name__}: {e}"
             cues = (plan.get("sfx") or {}).get(variant, [])

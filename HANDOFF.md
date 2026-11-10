@@ -37,12 +37,19 @@ Everything below is still yours to do, in this order. Nothing posts publicly unt
 8. *Optional*: move to an always-on server (README "Moving to a server": systemd unit in
    `deploy/`, set `posting.profile: "server"`), and set `HEALTHCHECK_URL` for the dead-man switch.
 9. *Optional*: this machine has `HF_HOME=D:\huggingface_cache` set system-wide but no D: drive;
-   whisper now falls back to `~/.cache/huggingface` (PLAN call #136), but you may want to remove or
-   fix that variable.
+   whisper now falls back to `~/.cache/huggingface` (PLAN calls #136, #158), but you may want to
+   remove or fix that variable.
 
 ## 0b. Fix pass 2026-11-10: results
 
-### Task 3: real-clip check of every preview (`python scripts/verify_previews.py`): 24/24 pass
+> **Superseded by the captions pass (later on 2026-11-10):** captions now use small.en + the GTA glossary,
+> and the ending rule got stricter (a full stop needs a ≥ 0.2 s pause; every end in measured quiet).
+> Current state: item_00983 and item_1032 render and pass 16/16; **item_5a67 (Hazard) now fails
+> `no_clean_ending`** - its old end "…your wanted level" + 0.15 s was most likely mid-sentence - and its
+> previews were removed. `media/previews/README.txt` lists every burned-in caption word. To get a third
+> preview item: `python -m pipeline.runner discover`, `download`, `hooks`, then `render_previews.py`.
+
+### Task 3: real-clip check of every preview (`python scripts/verify_previews.py`): 24/24 pass (first fix pass)
 Items: item_00983f85d1fd (GamingBolt), item_1032dd2c31da (Tridzo GTA), item_5a67cc8642ed (Hazard),
 the three in this laptop's `pipeline.db` (none was swapped out). All were re-downloaded as H.264
 1080p and re-cut under the final rule; item_1032 needed its 8th-best window (the first 7 had no
@@ -113,6 +120,12 @@ invariants  : no double post / no burst / nothing preview_only, rejected or unap
 - **Endings** (fix pass 2026-11-10): a clip only ends after a completed sentence, checked against
   the audio; an item with no clean ending fails at `cut` with `no_clean_ending` (PLAN.md §7,
   calls #124-#136, #146-#151).
+- **Captions** (2026-11-10): every transcription uses `transcribe.model` (**small.en**) with the GTA
+  glossary from `config.yaml` (`transcribe.glossary`, passed as faster-whisper hotwords). base.en, with or
+  without the glossary, kept hearing "wanted level" as "wanna love" on short audio; small.en with the
+  glossary did not (PLAN calls #155-#159, `python scripts/benchmark_captions.py`). Changing the model
+  or the glossary re-transcribes and re-cuts on the next run. Every burned-in caption word is listed
+  in `media/previews/README.txt`.
 - **SFX** (fix pass 2026-11-10): the hook boom, then at most one whoosh at least 5 s from any other
   cue; max 2 per clip (calls #137-#139).
 - **CP3** (Telegram approval + Meta posting): built and tested with mocks on `main`. **Not yet run

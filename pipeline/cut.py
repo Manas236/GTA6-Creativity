@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import config, db, dedupe, endings
+from . import config, db, dedupe, endings, transcribe
 from .download import verify_video_file
 
 log = logging.getLogger(__name__)
@@ -379,16 +379,16 @@ def audio_envelope(video_path: Path | str, start_s: float, end_s: float,
 
 
 def whisper_model_name(cfg: dict[str, Any] | None = None) -> str:
-    cfg = cfg if cfg is not None else config.get_config()
-    return str((cfg.get("render") or {}).get("whisper_model") or "base.en")
+    return transcribe.model_name(cfg)
 
 
 def transcribe_source_span(
-    video_path: Path | str, start_s: float, end_s: float, model_name: str = "base.en"
+    video_path: Path | str, start_s: float, end_s: float, model_name: str | None = None,
+    cfg: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """faster-whisper words (same settings as the hooks stage) for [start_s, end_s] of the
-    source, on the SOURCE timeline. Raises if whisper itself fails: an end that cannot be
-    checked must not be shipped."""
+    """faster-whisper words (configured model + GTA glossary, as everywhere) for
+    [start_s, end_s] of the source, on the SOURCE timeline. Raises if whisper itself fails:
+    an end that cannot be checked must not be shipped."""
     from . import render  # lazy: render imports this module
 
     with tempfile.TemporaryDirectory(prefix="gta6_cut_") as tmp:
@@ -401,7 +401,7 @@ def transcribe_source_span(
         res = subprocess.run(cmd, capture_output=True, timeout=120)
         if res.returncode != 0 or not wav.exists():
             raise RuntimeError(f"could not extract audio {start_s:.2f}-{end_s:.2f}s for transcription")
-        words = render.transcribe_words(wav, model_name=model_name, raise_errors=True)
+        words = render.transcribe_words(wav, model_name=model_name, raise_errors=True, cfg=cfg)
     return [{**w, "start": round(float(w["start"]) + start_s, 3), "end": round(float(w["end"]) + start_s, 3)}
             for w in words]
 
@@ -459,13 +459,15 @@ def clean_end_for_window(
     return EndChoice(win.start, end, "sentence", cut_words)
 
 
-def transcript_payload(choice: EndChoice, model_name: str) -> str:
-    """The items.transcript_words value for a cut: keyed on the window and the model, so
-    hooks and render reuse it and a changed window can never pass for it."""
+def transcript_payload(choice: EndChoice, key: str) -> str:
+    """The items.transcript_words value for a cut: keyed on the window and on
+    transcribe.cache_key() (model + glossary), so hooks and render reuse it and a changed
+    window, model or glossary can never pass for it."""
     return json.dumps({
         "cut_start": choice.start,
         "cut_end": choice.end,
-        "model": model_name,
+        "model": key.split("|", 1)[0],
+        "key": key,
         "words": choice.words,
         "ending": choice.kind,          # the cut stage checked this end: render may trust it
         "ending_rule": endings.RULE_VERSION,
@@ -523,10 +525,10 @@ def run_cut_item(
     consecutive_n = int(cfg.get("dedupe", {}).get("consecutive_frames", 3))
     hamming_thresh = int(cfg.get("dedupe", {}).get("hamming_threshold", 8))
     es = endings.ending_settings(cfg)
-    model_name = whisper_model_name(cfg)
+    tkey = transcribe.cache_key(cfg)
     if transcriber is None:
         def transcriber(path: Path, a: float, b: float) -> list[dict[str, Any]]:
-            return transcribe_source_span(path, a, b, model_name=model_name)
+            return transcribe_source_span(path, a, b, cfg=cfg)
     envelope = envelope or audio_envelope
 
     scan = scan_cut_windows(download_path, cfg=cfg)
@@ -543,7 +545,22 @@ def run_cut_item(
     duplicates: list[str] = []
     transcribed: dict[tuple[float, float], list[dict[str, Any]]] = {}
 
-    for rank, win in enumerate(scan.windows[:max_windows], start=1):
+    # A window starting within `retry_spacing_s` of one that had no sentence end shares most of
+    # its 18-22 s end range, so it almost always fails the same way (item_5a67 tried 326, 327,
+    # 328, 329.3 s ...). Such near-copies are skipped and do not use up a try.
+    spacing = float(es.get("retry_spacing_s") or 0.0)
+    failed_starts: list[float] = []
+    pool = iter(scan.windows)
+    rank = 0
+    tried = 0
+    while tried < max_windows:
+        win = next(pool, None)
+        if win is None:
+            break
+        rank += 1
+        if spacing and any(abs(win.start - f) < spacing for f in failed_starts):
+            continue
+        tried += 1
         audio_end = min(scan.total_duration, win.start + scan.max_dur + tail)
         key = (round(win.start, 2), round(audio_end, 2))
         try:
@@ -560,6 +577,7 @@ def run_cut_item(
         choice = clean_end_for_window(win, scan, words_abs, audio_end, es, env=env)
         if choice is None:
             no_end.append(f"#{rank} {win.start:.1f}s")
+            failed_starts.append(win.start)
             log.info("Cut window #%d [%.1fs +%.0f-%.0fs] has no sentence end; trying the next",
                      rank, win.start, scan.min_dur, scan.max_dur)
             continue
@@ -605,7 +623,7 @@ def run_cut_item(
                 "cut_duration": actual_dur,
                 "cut_path": str(cut_path),
                 # Always rewritten, so a stale transcript of an older window is gone too.
-                "transcript_words": transcript_payload(choice, model_name),
+                "transcript_words": transcript_payload(choice, tkey),
             },
             db_path=db_path,
         )
@@ -614,7 +632,6 @@ def run_cut_item(
         db.log_stage(item_id, "cut", "success", message=msg, db_path=db_path)
         return True, msg
 
-    tried = min(len(scan.windows), max_windows)
     if duplicates and not no_end:
         prior = duplicates[0]
         db.mark_rejected(

@@ -30,7 +30,6 @@ RENDER_DEFAULTS: dict[str, Any] = {
     "fonts_dir": "assets/fonts",
     "font_path": "assets/fonts/Montserrat-Black.ttf",
     "font_name": "Montserrat Black",
-    "whisper_model": "base.en",
     "target_lufs": -14.0,
     "freeze_pad_s": 0.3,
     "end_fade_s": 0.25,
