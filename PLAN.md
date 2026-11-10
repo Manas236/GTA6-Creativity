@@ -1022,6 +1022,10 @@ Upon deploying to a cloud Linux server (AWS/Hetzner/DigitalOcean), YouTube frequ
 121. **Twitch candidates**: top clips by views for the game id over `lookback_hours` (48), `limit` 20, `languages: ["en"]`; credit goes to the **broadcaster**. They are downloaded by yt-dlp from the clip URL with the same capped format selector (step 5 of #81 exists for them) and go through the same download- and cut-level dedupe.
 122. **A global test guard forbids real HTTP**: an autouse fixture makes `requests.Session.request` raise in every non-`live` test, so a test that forgets to inject a transport fails loudly instead of talking to Telegram, Meta, Twitch or Gemini (relevant once `.env` on the laptop holds real keys).
 
+### Fix pass 2026-11-10 (laptop): endings, SFX density, CP4 completion
+
+123. **A2 music bed moved from FreePD to OpenGameArt**: freepd.com closed permanently in 2025 (its home page is now a closure notice, and every candidate URL returned 404), so `fetch_assets.py` could never succeed. The candidates are now OpenGameArt pages, and a track is downloaded only if its page's licence field reads exactly `CC0` and the page links that file; the page URL is recorded in `assets/music/LICENSES.md`. Installed: "Trace Agent" by Vitalezzz (158 s). Checking the licence on the page, not trusting a hard-coded list, is what makes "real CC0" verifiable.
+
 ---
 
 ## 14. Checkpoint 1 Re-Proof Verification Data

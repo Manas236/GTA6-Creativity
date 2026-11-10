@@ -45,7 +45,7 @@ writes `samples/synthetic/presets_sheet.png`) and render real previews with
 | `assets/fonts/Montserrat-*.ttf` | [JulietaUla/Montserrat](https://github.com/JulietaUla/Montserrat) | SIL Open Font License 1.1 — see `assets/fonts/OFL.txt` |
 | `assets/emoji/*.png` | **[Twemoji](https://github.com/jdecked/twemoji)** (jdecked/twemoji, 72×72 PNG set) | **Graphics © Twitter, Inc and other contributors, licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/)** |
 | `assets/sfx/*.wav` | Synthesized in this repository with ffmpeg | CC0 1.0 — see `assets/sfx/LICENSES.md` |
-| `assets/music/bed.mp3` | [FreePD](https://freepd.com) (fetched by `scripts/fetch_assets.py`, not committed) | CC0 1.0 — see `assets/music/LICENSES.md` after fetching |
+| `assets/music/bed.mp3` | "Trace Agent" by Vitalezzz, [OpenGameArt](https://opengameart.org/content/trace-agent) (fetched by `scripts/fetch_assets.py`, not committed; FreePD closed in 2025) | CC0 1.0 — see `assets/music/LICENSES.md` after fetching |
 
 The Twemoji PNGs are used by style element **C2** (keyword emojis), because libass
 cannot rasterise colour emoji — they are composited as image overlays instead. Only the

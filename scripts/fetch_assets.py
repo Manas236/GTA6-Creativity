@@ -5,10 +5,11 @@ What is already in the repository (nothing to download):
   * assets/sfx/*.wav     boom / whoosh, synthesized here, CC0 - A1 (see LICENSES.md)
 
 What this script fetches:
-  * assets/music/bed.mp3  a CC0 music bed from FreePD - A2
-                          (freepd.com is blocked from the cloud sandbox: the proxy
-                          answers 403 to CONNECT, so A2 was built and tested against a
-                          generated tone and no synthetic "music" track was committed)
+  * assets/music/bed.mp3  a CC0 music bed from OpenGameArt - A2
+                          (FreePD, the original source, closed permanently in 2025. Each
+                          candidate's OpenGameArt page is read first and the track is
+                          installed only if the page's licence field is exactly CC0 and
+                          the page links that file.)
   * optionally, the Kenney CC0 impact pack to replace the synthesized SFX
     (--prefer-download)
 
@@ -27,6 +28,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -42,17 +44,17 @@ from pipeline import audio_mix, config, overlay, style  # noqa: E402
 
 USER_AGENT = "GTA6-Clipping-Pipeline/1.0 (asset fetcher)"
 
-# FreePD publishes everything under CC0 1.0 (public domain). These filenames were taken
-# from published projects that credit FreePD; they are tried in order and verified.
-MUSIC_CANDIDATES: list[str] = [
-    "https://freepd.com/music/Arpent.mp3",
-    "https://freepd.com/music/Evil%20Incoming.mp3",
-    "https://freepd.com/music/Lucky%20Break.mp3",
-    "https://freepd.com/music/Think%20About%20It.mp3",
-    "https://freepd.com/music/Floating%20Cities.mp3",
+# FreePD (the original source) closed permanently in 2025. OpenGameArt shows each work's
+# licence on its page; a candidate is used only if that page says CC0 and links the file.
+# (page_url, file_url), tried in order.
+MUSIC_CANDIDATES: list[tuple[str, str]] = [
+    ("https://opengameart.org/content/trace-agent",
+     "https://opengameart.org/sites/default/files/trace_agent_0.mp3"),
+    ("https://opengameart.org/content/main-menu-music-loop",
+     "https://opengameart.org/sites/default/files/main_menu_music_mastered_0.mp3"),
 ]
-MUSIC_LICENSE = "CC0 1.0 (public domain) - https://freepd.com (all FreePD music is CC0)"
-MUSIC_BROWSE = "https://freepd.com/epic.php or https://freepd.com/electronic.php"
+MUSIC_LICENSE = "CC0 1.0 (public domain), as stated on the OpenGameArt page"
+MUSIC_BROWSE = "https://opengameart.org (Browse > Music, filter License: CC0)"
 MUSIC_MIN_SECONDS = 25.0
 
 KENNEY_SFX_URL = "https://kenney.nl/media/pages/assets/impact-sounds/6e1a3e6a52-1677669547/kenney_impact-sounds.zip"
@@ -109,6 +111,20 @@ def verify_music(path: Path) -> tuple[bool, str]:
     return True, f"{dur:.1f}s"
 
 
+def page_says_cc0(page_html: str, file_url: str) -> tuple[bool, str]:
+    """True only if the page's licence field lists exactly CC0 and the page links the file."""
+    m = re.search(r"field-name-field-art-licenses.*?License\(s\):(.*?)Collections:", page_html, re.S)
+    if not m:
+        return False, "no licence field on the page"
+    text = re.sub(r"<[^>]+>", " ", m.group(1)).replace("&nbsp;", " ")
+    labels = text.split()
+    if labels != ["CC0"]:
+        return False, f"page licence is {' '.join(labels) or 'empty'}, not CC0 only"
+    if file_url not in page_html:
+        return False, "the page does not link that file"
+    return True, "CC0"
+
+
 def fetch_music(dest: Path, force: bool = False, check: bool = False) -> bool:
     ok, why = verify_music(dest)
     if ok and not force:
@@ -118,10 +134,19 @@ def fetch_music(dest: Path, force: bool = False, check: bool = False) -> bool:
         log(f"  music bed NOT usable: {dest} ({why})")
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    for url in MUSIC_CANDIDATES:
+    for page_url, url in MUSIC_CANDIDATES:
         log(f"  trying {url}")
         try:
-            data = _get(url)
+            page = _get(page_url).decode("utf-8", "replace")
+        except (urllib.error.URLError, RuntimeError, TimeoutError, OSError) as e:
+            log(f"    failed to read its page {page_url}: {e}")
+            continue
+        lic_ok, lic_why = page_says_cc0(page, url)
+        if not lic_ok:
+            log(f"    rejected: {lic_why}")
+            continue
+        try:
+            data = _get(url, timeout=120)
         except (urllib.error.URLError, RuntimeError, TimeoutError, OSError) as e:
             log(f"    failed: {e}")
             continue
@@ -133,12 +158,13 @@ def fetch_music(dest: Path, force: bool = False, check: bool = False) -> bool:
             tmp.unlink(missing_ok=True)
             continue
         tmp.replace(dest)
-        write_licenses(dest.parent / "LICENSES.md", [(dest.name, url, MUSIC_LICENSE)])
+        write_licenses(dest.parent / "LICENSES.md",
+                       [(dest.name, f"{url} (page: {page_url})", MUSIC_LICENSE)])
         log(f"    installed {dest} ({why}) - {MUSIC_LICENSE}")
         return True
     log(
         "  Could not fetch a CC0 bed automatically.\n"
-        f"  MANUAL STEP: open {MUSIC_BROWSE}, download any track (all FreePD music is CC0),\n"
+        f"  MANUAL STEP: open {MUSIC_BROWSE}, download a track whose page says CC0,\n"
         f"  save it as {dest}, then re-run this script to verify it.\n"
         "  Until then the renders simply skip A2 (the music bed); nothing else breaks."
     )

@@ -1,7 +1,7 @@
 """Zero-network tests for the two laptop scripts (everything external is mocked).
 
 scripts/fetch_assets.py and scripts/render_previews.py cannot be exercised for real from
-the cloud sandbox (no YouTube, no freepd.com, no Kokoro/whisper weights), so their
+the cloud sandbox (no YouTube, no OpenGameArt, no Kokoro/whisper weights), so their
 orchestration is tested with mocks: what they call, in what order, what they write, and
 what they do when a step fails.
 """
@@ -35,46 +35,69 @@ SS = style.style_settings()
 
 # ============================================================ fetch_assets.py
 
-def test_fetch_assets_music_candidates_are_cc0_freepd():
+def _oga_page(file_url: str, licence: str = "CC0") -> bytes:
+    """The shape of an OpenGameArt page's licence field, as served in Nov 2026."""
+    return (
+        '<div class="field field-name-field-art-licenses field-type-taxonomy-term-reference '
+        'field-label-above"><div class="field-label">License(s):&nbsp;</div>'
+        f'<div class="license-name">{licence}</div></div>'
+        '<div class="field-label">Collections:&nbsp;</div>'
+        f'<a href="{file_url}">track.mp3</a>'
+    ).encode()
+
+
+def test_fetch_assets_music_candidates_are_opengameart_pages_and_files():
     assert fetch_assets.MUSIC_CANDIDATES
-    for url in fetch_assets.MUSIC_CANDIDATES:
-        assert url.startswith("https://freepd.com/music/") and url.endswith(".mp3")
+    for page_url, file_url in fetch_assets.MUSIC_CANDIDATES:
+        assert page_url.startswith("https://opengameart.org/content/")
+        assert file_url.startswith("https://opengameart.org/sites/default/files/")
+        assert file_url.endswith(".mp3")
     assert "CC0" in fetch_assets.MUSIC_LICENSE
     assert "CC0" in fetch_assets.KENNEY_LICENSE
+
+
+def test_page_says_cc0_only_for_an_exact_cc0_licence_that_links_the_file():
+    url = "https://opengameart.org/sites/default/files/a.mp3"
+    assert fetch_assets.page_says_cc0(_oga_page(url).decode(), url)[0] is True
+    assert fetch_assets.page_says_cc0(_oga_page(url, "CC-BY 4.0").decode(), url)[0] is False
+    assert fetch_assets.page_says_cc0(_oga_page(url, "CC0 CC-BY 3.0").decode(), url)[0] is False
+    assert fetch_assets.page_says_cc0(_oga_page(url).decode(), url + "x")[0] is False
+    assert fetch_assets.page_says_cc0("<html>no licence</html>", url)[0] is False
 
 
 def test_fetch_assets_is_idempotent_when_the_bed_already_verifies(tmp_path):
     dest = tmp_path / "bed.mp3"
     dest.write_bytes(b"x" * 200_000)
-    with patch.object(fetch_assets, "audio_seconds", return_value=120.0), \
-         patch.object(fetch_assets, "_get") as get:
+    with patch.object(fetch_assets, "audio_seconds", return_value=120.0),          patch.object(fetch_assets, "_get") as get:
         assert fetch_assets.fetch_music(dest) is True
         get.assert_not_called()                      # nothing downloaded a second time
 
 
 def test_fetch_assets_downloads_the_first_candidate_that_verifies(tmp_path):
     dest = tmp_path / "music" / "bed.mp3"
+    (page1, file1), (page2, file2) = fetch_assets.MUSIC_CANDIDATES[:2]
     calls: list[str] = []
 
     def fake_get(url, timeout=60):
         calls.append(url)
-        if len(calls) == 1:
-            raise RuntimeError("HTTP 404")
+        if url == page1:
+            return _oga_page(file1, "CC-BY 3.0")         # first candidate is not CC0
+        if url == page2:
+            return _oga_page(file2)
         return b"y" * 300_000
 
-    with patch.object(fetch_assets, "_get", side_effect=fake_get), \
-         patch.object(fetch_assets, "audio_seconds", return_value=95.0):
+    with patch.object(fetch_assets, "_get", side_effect=fake_get),          patch.object(fetch_assets, "audio_seconds", return_value=95.0):
         assert fetch_assets.fetch_music(dest) is True
-    assert calls == fetch_assets.MUSIC_CANDIDATES[:2]
+    assert calls == [page1, page2, file2]                # the non-CC0 file is never fetched
     assert dest.exists() and not dest.with_suffix(".mp3.part").exists()
     lic = (dest.parent / "LICENSES.md").read_text()
-    assert "CC0" in lic and fetch_assets.MUSIC_CANDIDATES[1] in lic and "bed.mp3" in lic
+    assert "CC0" in lic and file2 in lic and page2 in lic and "bed.mp3" in lic
 
 
 def test_fetch_assets_rejects_a_download_that_is_not_real_audio(tmp_path):
     dest = tmp_path / "bed.mp3"
-    with patch.object(fetch_assets, "_get", return_value=b"<html>404</html>"), \
-         patch.object(fetch_assets, "audio_seconds", return_value=0.0):
+    pages = {p: _oga_page(f) for p, f in fetch_assets.MUSIC_CANDIDATES}
+    with patch.object(fetch_assets, "_get", side_effect=lambda u, timeout=60: pages.get(u, b"<html>404</html>")),          patch.object(fetch_assets, "audio_seconds", return_value=0.0):
         assert fetch_assets.fetch_music(dest) is False
     assert not dest.exists()
     assert not (dest.parent / "LICENSES.md").exists()
