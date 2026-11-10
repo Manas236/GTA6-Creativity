@@ -39,8 +39,8 @@ SYNTH_WORDS = [
     ("VICE", 8.0, 8.4), ("CITY", 8.45, 8.9), ("LOOKS", 9.0, 9.4), ("INSANE", 9.45, 10.1),
     ("THE", 13.0, 13.15), ("DETAIL", 13.2, 13.7), ("ON", 13.75, 13.9), ("THOSE", 13.95, 14.3), ("CARS", 14.35, 14.9),
     ("WAIT", 16.6, 17.0), ("FOR", 17.05, 17.25), ("IT", 17.3, 17.5),
-    ("RIGHT", 18.4, 18.75), ("THERE", 18.8, 19.1),
-    # pause 19.1 -> 19.5, then a word that runs past the 20.0 s cut end (the old cut-off)
+    ("RIGHT", 18.4, 18.75), ("THERE.", 18.8, 19.1),
+    # sentence ends 19.1, pause -> 19.5, then a word that runs past the 20.0 s cut end (the old cut-off)
     ("BOOM", 19.5, 20.4),
 ]
 SYNTH_VO_SCRIPT = "Is this the craziest GTA six moment yet?"

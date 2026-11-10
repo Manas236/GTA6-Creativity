@@ -1,4 +1,11 @@
-"""Stage 4: Audio loudness and visual scene-cut window selection with cut-level deduplication."""
+"""Stage 4: Audio loudness and visual scene-cut window selection with cut-level deduplication.
+
+The END of a cut must follow a completed sentence (pipeline.endings): each candidate
+window is transcribed with faster-whisper (plus a tail, so the gap after the last word is
+known), and a window whose allowed end range has no sentence break is skipped for the
+next-best scored window. No window with a clean ending -> the item fails with
+``no_clean_ending``. Windows with no speech keep the loudness-trough end.
+"""
 from __future__ import annotations
 
 import json
@@ -7,10 +14,12 @@ import math
 import os
 import re
 import subprocess
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
-from . import config, db, dedupe
+from . import config, db, dedupe, endings
 from .download import verify_video_file
 
 log = logging.getLogger(__name__)
@@ -188,25 +197,46 @@ def snap_end_to_pause(
     return round(target, 3)
 
 
-def select_best_cut_window(
-    video_path: Path | str,
-    cfg: dict[str, Any] | None = None,
-) -> tuple[float, float, float] | None:
-    """Find the optimal cut window [start_s, end_s, score] using audio energy and visual scene density.
+@dataclass
+class CutWindow:
+    start: float
+    end: float           # proposed end (start of the window + target duration)
+    score: float
 
-    Returns (start_s, end_s, score) or None if source fails static floor check.
-    """
-    cfg = cfg or config.get_config()
-    cut_cfg = cfg.get("cut", {})
+
+@dataclass
+class CutScan:
+    """Everything window scoring learned about a source, probed once."""
+    total_duration: float
+    loudness: list[tuple[float, float]]
+    scene_cuts: list[float]
+    windows: list[CutWindow]          # best score first
+    min_dur: float
+    max_dur: float
+    target_dur: float
+
+
+def _cut_bounds(cfg: dict[str, Any]) -> tuple[float, float, float]:
+    cut_cfg = cfg.get("cut", {}) or {}
     min_dur = float(cut_cfg.get("min_duration", cut_cfg.get("min_duration_seconds", 18.0)))
     max_dur = float(cut_cfg.get("max_duration", cut_cfg.get("max_duration_seconds", 22.0)))
     target_dur = float(cut_cfg.get("target_duration", cut_cfg.get("target_duration_seconds", 20.0)))
+    return min_dur, max_dur, target_dur
+
+
+def scan_cut_windows(video_path: Path | str, cfg: dict[str, Any] | None = None) -> CutScan | None:
+    """Score every window of the source (audio energy + scene density), best first.
+
+    Returns None if the source is too short, invalid, or fails the static-source floor.
+    """
+    cfg = cfg or config.get_config()
+    cut_cfg = cfg.get("cut", {})
+    min_dur, max_dur, target_dur = _cut_bounds(cfg)
     static_floor = float(cut_cfg.get("min_scene_change_density", 0.05))
 
     audio_weight = float(cut_cfg.get("weights", {}).get("audio_energy", 0.75))
     scene_weight = float(cut_cfg.get("weights", {}).get("visual_interest", 0.25))
 
-    # Get total video duration
     is_valid, total_duration = verify_video_file(video_path)
     if not is_valid or total_duration < min_dur:
         log.warning("Video too short or invalid for cut: %s (duration %.1fs)", video_path, total_duration)
@@ -214,7 +244,9 @@ def select_best_cut_window(
 
     # For videos shorter than or equal to target_dur, take full video
     if total_duration <= target_dur:
-        return 0.0, total_duration, 1.0
+        loud = extract_audio_loudness_profile(video_path)
+        return CutScan(total_duration, loud, [], [CutWindow(0.0, total_duration, 1.0)],
+                       min_dur, max_dur, target_dur)
 
     # 1. Visual scene cuts
     scene_cuts = extract_scene_cuts(video_path, threshold=0.3)
@@ -236,8 +268,7 @@ def select_best_cut_window(
     w_dur = target_dur
     num_windows = max(1, int((total_duration - w_dur) / step) + 1)
 
-    candidate_windows: list[dict[str, Any]] = []
-
+    windows: list[CutWindow] = []
     for i in range(num_windows):
         t_start = i * step
         t_end = t_start + w_dur
@@ -275,70 +306,143 @@ def select_best_cut_window(
                 snapped_start = c
                 break
 
-        snapped_dur = t_end - snapped_start
-        candidate_windows.append({
-            "start": round(snapped_start, 2),
-            "end": round(t_end, 2),
-            "duration": round(snapped_dur, 2),
-            "score": score,
-        })
+        windows.append(CutWindow(round(snapped_start, 2), round(t_end, 2), score))
 
-    # Sort candidates by score descending
-    candidate_windows.sort(key=lambda w: w["score"], reverse=True)
-    if not candidate_windows:
-        return 0.0, min(total_duration, target_dur), 0.5
-
-    best = candidate_windows[0]
-    # Snap the END to a loudness trough inside the 18-22 s bounds so the clip does not
-    # stop mid-sound (whisper words are not available at this stage; the render stage
-    # refines the end with word gaps).
-    snapped_end = snap_end_to_pause(
-        best["start"],
-        best["end"],
-        loudness=loudness_profile,
-        min_dur=min_dur,
-        max_dur=max_dur,
-        hard_max_end=total_duration,
-    )
-    return best["start"], round(snapped_end, 2), best["score"]
+    # Best score first; a stable sort keeps the earlier window on a tie.
+    windows.sort(key=lambda w: w.score, reverse=True)
+    if not windows:
+        windows = [CutWindow(0.0, min(total_duration, target_dur), 0.5)]
+    return CutScan(total_duration, loudness_profile, scene_cuts, windows, min_dur, max_dur, target_dur)
 
 
-def run_cut_item(
-    item_id: str,
+def select_best_cut_window(
+    video_path: Path | str,
     cfg: dict[str, Any] | None = None,
-    db_path: Any = None,
-) -> tuple[bool, str]:
-    """Execute cut stage for a downloaded item, with cut-level deduplication."""
-    cfg = cfg or config.get_config()
-    item = db.get_item(item_id, db_path=db_path)
-    if not item:
-        return False, f"Item {item_id} not found"
+) -> tuple[float, float, float] | None:
+    """The best-scoring window [start_s, end_s, score] with a loudness-trough end.
 
-    download_path_str = item.get("download_path")
-    if not download_path_str or not Path(download_path_str).exists():
-        db.mark_failed(item_id, "cut", "Download path missing on disk", db_path=db_path)
-        return False, "Download file not found"
+    Kept for callers that only need the audio/scene choice; the cut stage itself uses
+    `choose_cut`, which also demands a speech-safe end.
+    """
+    scan = scan_cut_windows(video_path, cfg)
+    if scan is None:
+        return None
+    best = scan.windows[0]
+    snapped_end = snap_end_to_pause(
+        best.start,
+        best.end,
+        loudness=scan.loudness,
+        min_dur=scan.min_dur,
+        max_dur=scan.max_dur,
+        hard_max_end=scan.total_duration,
+    )
+    return best.start, round(snapped_end, 2), best.score
 
-    download_path = Path(download_path_str)
-    cut_cfg = cfg.get("cut", {})
-    consecutive_n = int(cfg.get("dedupe", {}).get("consecutive_frames", 3))
-    hamming_thresh = int(cfg.get("dedupe", {}).get("hamming_threshold", 8))
 
-    # Evaluate cut window
-    result = select_best_cut_window(download_path, cfg=cfg)
-    if not result:
-        # Static source or duration floor failed
-        db.mark_rejected(item_id, "rejected: static_source (low scene density)", db_path=db_path)
-        return False, "Rejected: static_source"
+# --------------------------------------------------------------------------------------
+# Speech-safe end per window
+# --------------------------------------------------------------------------------------
 
-    start_s, end_s, score = result
-    duration_s = end_s - start_s
+# (video_path, span_start_s, span_end_s) -> whisper words with ABSOLUTE source times.
+Transcriber = Callable[[Path, float, float], list[dict[str, Any]]]
 
-    # Destination paths
-    cuts_dir = config.media_dir("cuts")
-    cut_path = cuts_dir / f"{item_id}_cut.mp4"
 
-    # Extract cut via ffmpeg
+def whisper_model_name(cfg: dict[str, Any] | None = None) -> str:
+    cfg = cfg if cfg is not None else config.get_config()
+    return str((cfg.get("render") or {}).get("whisper_model") or "base.en")
+
+
+def transcribe_source_span(
+    video_path: Path | str, start_s: float, end_s: float, model_name: str = "base.en"
+) -> list[dict[str, Any]]:
+    """faster-whisper words (same settings as the hooks stage) for [start_s, end_s] of the
+    source, on the SOURCE timeline. Raises if whisper itself fails: an end that cannot be
+    checked must not be shipped."""
+    from . import render  # lazy: render imports this module
+
+    with tempfile.TemporaryDirectory(prefix="gta6_cut_") as tmp:
+        wav = Path(tmp) / "span.wav"
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-nostats",
+            "-ss", f"{max(0.0, start_s):.3f}", "-t", f"{max(0.1, end_s - start_s):.3f}",
+            "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav),
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=120)
+        if res.returncode != 0 or not wav.exists():
+            raise RuntimeError(f"could not extract audio {start_s:.2f}-{end_s:.2f}s for transcription")
+        words = render.transcribe_words(wav, model_name=model_name, raise_errors=True)
+    return [{**w, "start": round(float(w["start"]) + start_s, 3), "end": round(float(w["end"]) + start_s, 3)}
+            for w in words]
+
+
+@dataclass
+class EndChoice:
+    start: float
+    end: float
+    kind: str                                           # "sentence" | "no_speech"
+    words: list[dict[str, Any]] = field(default_factory=list)   # CUT timeline (0 = start)
+
+
+def clean_end_for_window(
+    win: CutWindow,
+    scan: CutScan,
+    words_abs: Sequence[dict[str, Any]],
+    audio_end: float,
+    es: dict[str, Any],
+) -> EndChoice | None:
+    """Pick this window's end, or None when speech runs through its whole end range.
+
+    `words_abs` cover [win.start, audio_end] on the source timeline. With speech, the end
+    is the sentence break nearest the window's proposed end (ties: the earlier one), inside
+    [start + min_dur, start + max_dur]. Without speech, the loudness-trough snap is kept.
+    """
+    lo = win.start + scan.min_dur
+    hi = min(win.start + scan.max_dur, scan.total_duration)
+    if hi < lo:                                          # a source shorter than min_dur
+        lo = hi
+    in_window = [w for w in words_abs if float(w["end"]) > win.start and float(w["start"]) < audio_end]
+
+    if not in_window:
+        end = snap_end_to_pause(
+            win.start, win.end, loudness=scan.loudness, min_dur=scan.min_dur, max_dur=scan.max_dur,
+            hard_max_end=scan.total_duration,
+        )
+        return EndChoice(win.start, round(end, 2), "no_speech", [])
+
+    spans = endings.safe_spans(in_window, lo, hi, audio_end, es)
+    target = min(max(win.end, lo), hi)
+    end = endings.choose_end(spans, target, es)
+    if end is None:
+        return None
+    span = endings.span_at(end, spans)
+    end = endings.snap_inside(end, span, 0.01) if span else round(end, 2)   # DB keeps 2 decimals
+    end = round(end, 2)
+    cut_words = [
+        {**w, "start": round(max(0.0, float(w["start"]) - win.start), 3),
+         "end": round(float(w["end"]) - win.start, 3)}
+        for w in in_window if float(w["start"]) < end
+    ]
+    return EndChoice(win.start, end, "sentence", cut_words)
+
+
+def transcript_payload(choice: EndChoice, model_name: str) -> str:
+    """The items.transcript_words value for a cut: keyed on the window and the model, so
+    hooks and render reuse it and a changed window can never pass for it."""
+    return json.dumps({
+        "cut_start": choice.start,
+        "cut_end": choice.end,
+        "model": model_name,
+        "words": choice.words,
+        "ending": choice.kind,          # the cut stage checked this end: render may trust it
+        "source": "cut",
+    })
+
+
+# --------------------------------------------------------------------------------------
+# Stage
+# --------------------------------------------------------------------------------------
+
+def _extract_cut(download_path: Path, start_s: float, end_s: float, cut_path: Path) -> None:
     cmd = [
         "ffmpeg",
         "-y",
@@ -354,65 +458,139 @@ def run_cut_item(
         "-b:a", "192k",
         str(cut_path),
     ]
-    try:
-        subprocess.run(cmd, capture_output=True, check=True, timeout=60)
-    except Exception as e:
-        db.mark_failed(item_id, "cut", f"ffmpeg cut extraction failed: {e}", db_path=db_path)
-        return False, f"ffmpeg cut extraction failed: {e}"
+    subprocess.run(cmd, capture_output=True, check=True, timeout=120)
 
-    # Verify cut clip
-    is_valid, actual_dur = verify_video_file(cut_path)
-    if not is_valid:
-        cut_path.unlink(missing_ok=True)
-        db.mark_failed(item_id, "cut", "Cut file failed ffprobe validation", db_path=db_path)
-        return False, "Cut validation failed"
 
-    # Cut-level deduplication: extract 1fps hashes of the cut
-    cut_hashes = dedupe.extract_1fps_hashes(cut_path, crop=cfg.get("dedupe", {}).get("crop_black_bars", True))
-    cand_hashes_only = [h for _, h in cut_hashes]
+def run_cut_item(
+    item_id: str,
+    cfg: dict[str, Any] | None = None,
+    db_path: Any = None,
+    transcriber: Transcriber | None = None,
+) -> tuple[bool, str]:
+    """Execute cut stage for a downloaded item: a speech-safe end, then cut-level dedupe.
 
-    # Compare against prior cut-level fingerprints
-    stored_cuts = db.get_stored_fingerprints_by_item("cut", exclude_item_id=item_id, db_path=db_path)
-    for prior_id, prior_tuples in stored_cuts.items():
-        prior_hashes_only = [h for _, h in prior_tuples]
-        if dedupe.check_consecutive_match(
-            cand_hashes_only,
-            prior_hashes_only,
-            consecutive_n=consecutive_n,
-            hamming_threshold=hamming_thresh,
-        ):
+    Windows are tried best score first (up to cut.ending.max_windows). A window is skipped
+    when its end range holds no sentence break, or when its cut duplicates an earlier
+    item's cut; the first window that passes both is kept.
+    """
+    cfg = cfg or config.get_config()
+    item = db.get_item(item_id, db_path=db_path)
+    if not item:
+        return False, f"Item {item_id} not found"
+
+    download_path_str = item.get("download_path")
+    if not download_path_str or not Path(download_path_str).exists():
+        db.mark_failed(item_id, "cut", "Download path missing on disk", db_path=db_path)
+        return False, "Download file not found"
+
+    download_path = Path(download_path_str)
+    consecutive_n = int(cfg.get("dedupe", {}).get("consecutive_frames", 3))
+    hamming_thresh = int(cfg.get("dedupe", {}).get("hamming_threshold", 8))
+    es = endings.ending_settings(cfg)
+    model_name = whisper_model_name(cfg)
+    if transcriber is None:
+        def transcriber(path: Path, a: float, b: float) -> list[dict[str, Any]]:
+            return transcribe_source_span(path, a, b, model_name=model_name)
+
+    scan = scan_cut_windows(download_path, cfg=cfg)
+    if not scan:
+        # Static source or duration floor failed
+        db.mark_rejected(item_id, "rejected: static_source (low scene density)", db_path=db_path)
+        return False, "Rejected: static_source"
+
+    cuts_dir = config.media_dir("cuts")
+    cut_path = cuts_dir / f"{item_id}_cut.mp4"
+    tail = float(es["tail_s"])
+    max_windows = max(1, int(es["max_windows"]))
+    no_end: list[str] = []
+    duplicates: list[str] = []
+    transcribed: dict[tuple[float, float], list[dict[str, Any]]] = {}
+
+    for rank, win in enumerate(scan.windows[:max_windows], start=1):
+        audio_end = min(scan.total_duration, win.start + scan.max_dur + tail)
+        key = (round(win.start, 2), round(audio_end, 2))
+        try:
+            if key not in transcribed:
+                transcribed[key] = transcriber(download_path, win.start, audio_end)
+            words_abs = transcribed[key]
+        except Exception as e:
+            reason = f"Whisper transcription failed at cut: {type(e).__name__}: {e}"
+            log.error("%s (item %s)", reason, item_id)
+            db.mark_failed(item_id, "cut", reason, db_path=db_path)
+            return False, reason
+
+        choice = clean_end_for_window(win, scan, words_abs, audio_end, es)
+        if choice is None:
+            no_end.append(f"#{rank} {win.start:.1f}s")
+            log.info("Cut window #%d [%.1fs +%.0f-%.0fs] has no sentence end; trying the next",
+                     rank, win.start, scan.min_dur, scan.max_dur)
+            continue
+
+        try:
+            _extract_cut(download_path, choice.start, choice.end, cut_path)
+        except Exception as e:
+            db.mark_failed(item_id, "cut", f"ffmpeg cut extraction failed: {e}", db_path=db_path)
+            return False, f"ffmpeg cut extraction failed: {e}"
+
+        is_valid, actual_dur = verify_video_file(cut_path)
+        if not is_valid:
             cut_path.unlink(missing_ok=True)
-            db.mark_rejected(
-                item_id,
-                f"duplicate_cut: {consecutive_n} matching consecutive frames with {prior_id}",
-                is_duplicate=True,
-                db_path=db_path,
-            )
-            return False, f"Rejected: duplicate_cut of {prior_id}"
+            db.mark_failed(item_id, "cut", "Cut file failed ffprobe validation", db_path=db_path)
+            return False, "Cut validation failed"
 
-    # Save cut fingerprints to database
-    db.save_fingerprints(item_id, "cut", cut_hashes, db_path=db_path)
+        # Cut-level deduplication: extract 1fps hashes of the cut
+        cut_hashes = dedupe.extract_1fps_hashes(cut_path, crop=cfg.get("dedupe", {}).get("crop_black_bars", True))
+        cand_hashes_only = [h for _, h in cut_hashes]
+        stored_cuts = db.get_stored_fingerprints_by_item("cut", exclude_item_id=item_id, db_path=db_path)
+        dup_of = next(
+            (prior_id for prior_id, prior_tuples in stored_cuts.items()
+             if dedupe.check_consecutive_match(
+                 cand_hashes_only, [h for _, h in prior_tuples],
+                 consecutive_n=consecutive_n, hamming_threshold=hamming_thresh)),
+            None,
+        )
+        if dup_of:
+            cut_path.unlink(missing_ok=True)
+            duplicates.append(dup_of)
+            log.info("Cut window #%d duplicates %s; trying the next", rank, dup_of)
+            continue
 
-    # Transition to 'cut' stage
-    db.transition_stage(
-        item_id,
-        "cut",
-        extra_fields={
-            "cut_start": start_s,
-            "cut_end": end_s,
-            "cut_duration": actual_dur,
-            "cut_path": str(cut_path),
-        },
-        db_path=db_path,
-    )
-    db.log_stage(
-        item_id,
-        "cut",
-        "success",
-        message=f"Cut window [{start_s:.1f}s - {end_s:.1f}s] extracted ({actual_dur:.1f}s)",
-        db_path=db_path,
-    )
-    return True, f"Cut extracted successfully ({actual_dur:.1f}s)"
+        # Replace (never append to) this item's cut fingerprints: a re-cut moves the window.
+        db.delete_fingerprints(item_id, "cut", db_path=db_path)
+        db.save_fingerprints(item_id, "cut", cut_hashes, db_path=db_path)
+        db.transition_stage(
+            item_id,
+            "cut",
+            extra_fields={
+                "cut_start": choice.start,
+                "cut_end": choice.end,
+                "cut_duration": actual_dur,
+                "cut_path": str(cut_path),
+                # Always rewritten, so a stale transcript of an older window is gone too.
+                "transcript_words": transcript_payload(choice, model_name),
+            },
+            db_path=db_path,
+        )
+        msg = (f"Cut window #{rank} [{choice.start:.2f}s - {choice.end:.2f}s] extracted "
+               f"({actual_dur:.1f}s, end: {choice.kind}, {len(choice.words)} words)")
+        db.log_stage(item_id, "cut", "success", message=msg, db_path=db_path)
+        return True, msg
+
+    tried = min(len(scan.windows), max_windows)
+    if duplicates and not no_end:
+        prior = duplicates[0]
+        db.mark_rejected(
+            item_id,
+            f"duplicate_cut: {consecutive_n} matching consecutive frames with {prior}",
+            is_duplicate=True,
+            db_path=db_path,
+        )
+        return False, f"Rejected: duplicate_cut of {prior}"
+    reason = (f"no_clean_ending: speech runs through the end range of all {tried} window(s) tried"
+              f" ({', '.join(no_end)})" + (f"; {len(duplicates)} more duplicated a prior cut" if duplicates else ""))
+    db.mark_failed(item_id, "cut", reason, db_path=db_path)
+    db.log_stage(item_id, "cut", "failure", message=reason, db_path=db_path)
+    return False, reason
 
 
 def run_cut_pipeline(cfg: dict[str, Any] | None = None, db_path: Any = None) -> list[str]:
@@ -433,4 +611,3 @@ def run_cut_pipeline(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
             log.warning("Cut failed or rejected for item %s: %s", item_id, msg)
 
     return cut_ids
-

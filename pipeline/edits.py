@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from . import endings
 from .dedupe import dhash_from_raw_gray_9x8, hamming_distance
 
 log = logging.getLogger(__name__)
@@ -220,11 +221,17 @@ def plan_dead_air(
     motion: Sequence[tuple[float, float]],
     ss: dict[str, Any],
     grid_s: float = 0.1,
+    words: Sequence[dict[str, Any]] | None = None,
+    es: dict[str, Any] | None = None,
 ) -> Timeline:
     """Drop stretches longer than `min_silence_s` that are BOTH quiet and motionless.
 
     Longest candidates go first and dropping stops as soon as the remaining length would
     fall to `min_output_s`, so a sparse clip never shrinks below the floor.
+
+    With `words`, a stretch is only dropped when it lies in a sentence break (or before
+    the first / after the last word) and touches no word: silence inside a sentence is
+    kept, even when the loudness meter calls it dead air.
     """
     da = ss["dead_air"]
     duration = float(duration)
@@ -261,10 +268,16 @@ def plan_dead_air(
         runs.append((run_start, duration))
 
     candidates: list[tuple[float, float]] = []
+    kept_in_sentence = 0
     for s, e in runs:
         s2, e2 = s + pad, e - pad
         if e2 - s2 >= min_sil:
+            if words and not endings.gap_is_sentence_break(s2, e2, words, es):
+                kept_in_sentence += 1
+                continue
             candidates.append((round(s2, 3), round(e2, 3)))
+    if kept_in_sentence:
+        log.info("A3 kept %d quiet stretch(es) that sit inside a sentence", kept_in_sentence)
 
     chosen: list[tuple[float, float]] = []
     remaining = duration
@@ -521,10 +534,17 @@ def choose_loop_end(
     words: Sequence[dict[str, Any]],
     ss: dict[str, Any],
     proposed_end: float | None = None,
+    safe_spans: Sequence[endings.SafeSpan] | None = None,
+    es: dict[str, Any] | None = None,
 ) -> LoopEnd | None:
     """Pick the end frame whose dHash is closest to frame 1, preferring a speech pause.
 
     `hashes` comes from gray_hashes(); index 0 is frame 1 (the loop reference).
+
+    With `safe_spans` (the clip has speech) only ends inside a span are candidates, so A4
+    can never move the end into a word or into an unfinished sentence. A span too narrow
+    to hold a sampled frame is still a candidate: its preferred point is scored with the
+    nearest sampled frame's hash (at most half a search step away).
     """
     le = ss["loop_end"]
     if not hashes or max_end <= min_end:
@@ -534,21 +554,41 @@ def choose_loop_end(
     step = float(le["search_step_s"])
     target = float(proposed_end if proposed_end is not None else max_end)
 
+    cands: list[tuple[float, int, bool]] = []       # (t, hash, in_pause)
+    if safe_spans is None:
+        last_t = -1.0
+        for t, h in hashes:
+            if not (min_end <= t <= max_end):
+                continue
+            if t - last_t < step - 1e-6:
+                continue
+            last_t = t
+            cands.append((t, h, _in_speech_pause(t, words)))
+    else:
+        es = es or endings.DEFAULTS
+        for span in safe_spans:
+            inside = [(t, h) for t, h in hashes if span.contains(t) and min_end <= t <= max_end]
+            if inside:
+                last_t = -1.0
+                for t, h in inside:
+                    if t - last_t < step - 1e-6:
+                        continue
+                    last_t = t
+                    cands.append((t, h, True))
+                continue
+            p = span.point_for(target, es)
+            if not (min_end - 1e-6 <= p <= max_end + 1e-6):
+                continue
+            t_near, h_near = min(hashes, key=lambda th: abs(th[0] - p))
+            if abs(t_near - p) <= step / 2.0 + 1e-6:
+                cands.append((p, h_near, True))
+
     best: LoopEnd | None = None
-    seen = 0
-    last_t = -1.0
-    for t, h in hashes:
-        if not (min_end <= t <= max_end):
-            continue
-        if t - last_t < step - 1e-6:
-            continue
-        last_t = t
-        seen += 1
+    for t, h, pause in cands:
         dist = hamming_distance(ref, h)
-        pause = _in_speech_pause(t, words)
         score = dist - (bonus if pause else 0.0)
         if best is None or (score, abs(t - target)) < (best.score, abs(best.end_s - target)):
-            best = LoopEnd(round(t, 3), dist, round(score, 3), pause, seen)
+            best = LoopEnd(round(t, 3), dist, round(score, 3), pause, 0)
     if best:
-        best.candidates = seen
+        best.candidates = len(cands)
     return best

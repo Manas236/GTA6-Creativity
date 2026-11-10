@@ -216,17 +216,57 @@ def test_render_previews_cached_keywords_skip_both_paths(tmp_path):
     assert kws == ["VICE", "CITY"] and src == "cached (db)"
 
 
-def test_render_previews_reuses_an_existing_download_and_cut(tmp_path):
+def _verified_payload(cut_start=5.0, cut_end=25.0, words=None, ending="sentence"):
+    import json
+    model = render_previews.render.render_settings()["whisper_model"]
+    return json.dumps({"cut_start": cut_start, "cut_end": cut_end, "model": model,
+                       "words": words or [], "ending": ending, "source": "cut"})
+
+
+def test_render_previews_reuses_an_existing_download_and_a_current_cut(tmp_path):
     src, cut = tmp_path / "src.mp4", tmp_path / "cut.mp4"
     src.write_bytes(b"0")
     cut.write_bytes(b"0")
-    item = {"id": "i", "download_path": str(src), "cut_path": str(cut)}
+    item = {"id": "i", "download_path": str(src), "cut_path": str(cut),
+            "cut_start": 5.0, "cut_end": 25.0, "transcript_words": _verified_payload()}
     with patch.object(render_previews.download, "download_single_item") as dl, \
          patch.object(render_previews.cutmod, "run_cut_item") as rc:
         assert render_previews.ensure_source(item, {}) == src
         assert render_previews.ensure_cut(item, {}) == cut
     dl.assert_not_called()
     rc.assert_not_called()
+
+
+def test_render_previews_recuts_a_cut_that_predates_the_sentence_end_check(tmp_path):
+    cut = tmp_path / "cut.mp4"
+    cut.write_bytes(b"0")
+    old = {"id": "i", "cut_path": str(cut), "cut_start": 5.0, "cut_end": 25.0,
+           "transcript_words": _verified_payload(ending=None)}           # hooks-era cache: no verdict
+    new = {**old, "transcript_words": _verified_payload()}
+    with patch.object(render_previews.cutmod, "run_cut_item", return_value=(True, "ok")) as rc, \
+         patch.object(render_previews.db, "get_item", return_value=new):
+        assert render_previews.ensure_cut(old, {}) == cut
+    rc.assert_called_once()
+
+
+def test_render_previews_swaps_in_the_next_real_item_on_no_clean_ending(tmp_path):
+    def fake_render_item(item_id, *a, **k):
+        r = render_previews.ItemResult(item_id=item_id)
+        if item_id == "item_b":
+            r.message, r.no_clean_ending = "cut failed: no_clean_ending: speech runs through", True
+        else:
+            r.ok, r.message = True, "1/1 presets rendered"
+        return r
+
+    with patch.object(render_previews.db, "init_db"), \
+         patch.object(render_previews, "default_items", return_value=["item_a", "item_b", "item_c"]), \
+         patch.object(render_previews, "candidate_items", return_value=["item_a", "item_b", "item_c", "item_d"]), \
+         patch.object(render_previews, "render_item", side_effect=fake_render_item) as ri:
+        rc = render_previews.main(["--presets", "P0", "--out", str(tmp_path)])
+    assert rc == 0
+    assert [c.args[0] for c in ri.call_args_list] == ["item_a", "item_b", "item_c", "item_d"]
+    text = (tmp_path / "README.txt").read_text()
+    assert "item_d  (swapped in for item_b: no_clean_ending)" in text
 
 
 def test_render_previews_download_failure_is_reported_not_swallowed(tmp_path):
@@ -267,6 +307,7 @@ def test_render_previews_renders_every_preset_and_writes_the_readme(tmp_path):
         }
 
     with patch.object(render_previews.db, "get_item", return_value=item), \
+         patch.object(render_previews, "ensure_cut", return_value=cut), \
          patch.object(render_previews.render, "transcribe_words", return_value=[{"word": "VICE", "start": 0.0, "end": 0.4}]), \
          patch.object(render_previews.render, "render_item_variants", side_effect=fake_variants) as rv, \
          patch.object(render_previews, "build_grid", return_value=(True, 3.0)) as grid:
@@ -315,6 +356,7 @@ def test_render_previews_a_failed_preset_does_not_stop_the_others(tmp_path):
                 "style_a": {}}
 
     with patch.object(render_previews.db, "get_item", return_value=item), \
+         patch.object(render_previews, "ensure_cut", return_value=cut), \
          patch.object(render_previews.render, "transcribe_words", return_value=[]), \
          patch.object(render_previews.render, "render_item_variants", side_effect=flaky), \
          patch.object(render_previews, "build_grid", return_value=(True, 1.0)):
@@ -334,8 +376,7 @@ def test_render_previews_reuses_the_hooks_stage_cut_words(tmp_path):
     model = render_previews.render.render_settings()["whisper_model"]
     item = {"id": "i", "download_path": str(cut), "cut_path": str(cut), "voiceover_audio_path": str(vo),
             "hook_text": "H", "author_name": "C", "keywords": '["VICE","CITY","MAP"]',
-            "cut_start": 5.0, "cut_end": 25.0,
-            "transcript_words": json.dumps({"cut_start": 5.0, "cut_end": 25.0, "model": model, "words": words})}
+            "cut_start": 5.0, "cut_end": 25.0, "transcript_words": _verified_payload(words=words)}
 
     def ok_variants(*a, **k):
         subs = Path(a[7])
@@ -355,6 +396,7 @@ def test_render_previews_reuses_the_hooks_stage_cut_words(tmp_path):
     assert r.ok
     assert [Path(c.args[0]) for c in tw.call_args_list] == [vo]
     assert rv.call_args.args[3] == words
+    assert rv.call_args.kwargs["clean_cut_end"] is True        # the cut stage verified this end
 
 
 def test_render_previews_rejects_an_unknown_preset_before_rendering(tmp_path):

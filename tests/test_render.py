@@ -361,11 +361,13 @@ def test_silent_cut_still_gets_matching_audio(tmp_path: Path):
 
 
 def test_render_item_variants_snaps_end_to_pause(tmp_path: Path):
-    """Full A+B pass on a 20 s cut: end snapped into the 19.1-19.5 s pause, B = freeze + A."""
+    """Full A+B pass on a 20 s cut: end snapped into the 19.1-19.5 s pause after the
+    sentence-final "RIGHT." (a 0.4 s gap after a word WITHOUT . ? ! is not an end any
+    more), B = freeze + A."""
     cut = _make_cut(tmp_path / "cut20.mp4", 20.0, color="navy")
     vo = _make_vo(tmp_path / "vo.wav", 1.5)
     words = [{"word": "W", "start": float(t), "end": float(t) + 0.8} for t in range(0, 18)]
-    words += [{"word": "RIGHT", "start": 18.4, "end": 19.1}, {"word": "BOOM", "start": 19.5, "end": 20.4}]
+    words += [{"word": "RIGHT.", "start": 18.4, "end": 19.1}, {"word": "BOOM", "start": 19.5, "end": 20.4}]
     res = render.render_item_variants(
         cut, vo, "VICE CITY LOOKS INSANE", words, [{"word": "VO", "start": 0.0, "end": 1.4}],
         tmp_path / "A.mp4", tmp_path / "B.mp4", tmp_path / "subs",

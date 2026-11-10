@@ -518,6 +518,13 @@ def save_fingerprints(
         )
 
 
+def delete_fingerprints(item_id: str, scope: str, db_path: Path | str | None = None) -> int:
+    """Remove an item's fingerprints for one scope (a re-cut replaces its cut hashes)."""
+    with db(db_path) as conn:
+        cur = conn.execute("DELETE FROM fingerprints WHERE item_id = ? AND scope = ?", (item_id, scope))
+        return cur.rowcount
+
+
 def get_stored_fingerprints_by_item(
     scope: str, exclude_item_id: str | None = None, db_path: Path | str | None = None
 ) -> dict[str, list[tuple[int, int]]]:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import math
 import sqlite3
 import subprocess
@@ -27,6 +28,7 @@ from typing import Any, Sequence
 
 from . import audio_mix, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, voiceover
 from .cut import extract_audio_loudness_profile, snap_end_to_pause
+from . import endings
 from .download import verify_video_file
 from .rendercore import (  # re-exported for callers and tests
     RENDER_DEFAULTS,
@@ -68,6 +70,21 @@ class RenderVerificationError(RuntimeError):
     """Raised / reported when an output fails the ffprobe stream checks."""
 
 
+def whisper_download_root() -> str | None:
+    """None (huggingface_hub's own choice) unless HF_HOME points at a drive or folder root
+    that does not exist - then the default ~/.cache/huggingface/hub, where the model was
+    cached before. Without this, a stale HF_HOME fails every cut and every hooks run."""
+    hf_home = os.environ.get("HF_HOME")
+    if not hf_home:
+        return None
+    anchor = Path(hf_home).anchor or hf_home
+    if Path(anchor).exists():
+        return None
+    fallback = Path.home() / ".cache" / "huggingface" / "hub"
+    log.warning("HF_HOME=%s is on a drive that does not exist; loading whisper from %s", hf_home, fallback)
+    return str(fallback)
+
+
 def get_whisper_model(model_name: str = "base.en") -> Any:
     """Return shared WhisperModel singleton on CPU (faster_whisper imported lazily)."""
     global _WHISPER_INSTANCE
@@ -75,7 +92,9 @@ def get_whisper_model(model_name: str = "base.en") -> Any:
         import faster_whisper
 
         log.info("Loading faster-whisper model '%s' (device=cpu, compute_type=int8)...", model_name)
-        _WHISPER_INSTANCE = faster_whisper.WhisperModel(model_name, device="cpu", compute_type="int8")
+        _WHISPER_INSTANCE = faster_whisper.WhisperModel(
+            model_name, device="cpu", compute_type="int8", download_root=whisper_download_root()
+        )
         log.info("WhisperModel '%s' loaded.", model_name)
     return _WHISPER_INSTANCE
 
@@ -173,6 +192,22 @@ def store_cut_words(
             "UPDATE items SET transcript_words = :tw, updated_at = :now WHERE id = :id",
             {"id": item_id, "tw": json.dumps(payload), "now": db.now()},
         )
+
+
+def cut_end_verified(item: dict[str, Any] | None, model_name: str) -> bool:
+    """True when the cut stage checked this cut's end against the audio AFTER the cut
+    (it transcribed a tail), so render may treat the cut's own end as a sentence end.
+
+    Only the cut stage writes the `ending` key, and only for the window it chose; a cache
+    for another window or another model never counts."""
+    if cached_cut_words(item, model_name) is None:
+        return False
+    try:
+        raw = item.get("transcript_words")
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return data.get("ending") in ("sentence", "no_speech")
+    except Exception:
+        return False
 
 
 def cut_speech_words(item: dict[str, Any], cut_path: Path | str, model_name: str) -> list[dict[str, Any]]:
@@ -730,21 +765,32 @@ def snap_render_end(
     cut_duration: float,
     speech_words: list[dict[str, Any]] | None,
     cfg: dict[str, Any] | None = None,
+    clean_cut_end: bool = False,
 ) -> float:
-    """Pick the Variant A/B content length inside the existing cut: a whisper word gap
-    (>= 0.25 s) or an ebur128 trough within [min_duration, min(max_duration, cut_duration)]."""
+    """Pick the Variant A/B content length inside the existing cut.
+
+    With speech: the sentence break nearest the cut's end inside
+    [min_duration, min(max_duration, cut_duration)] (pipeline.endings), so it never cuts
+    earlier than the last completed sentence in the cut and never inside a word;
+    `clean_cut_end` lets the cut's own end count when the cut stage verified it. Raises
+    endings.NoCleanEnding when speech runs through every allowed end.
+    Without speech: the ebur128 trough, as before."""
     cfg = cfg if cfg is not None else config.get_config()
     cut_cfg = cfg.get("cut", {})
     min_dur = float(cut_cfg.get("min_duration", 18.0))
     max_dur = float(cut_cfg.get("max_duration", 22.0))
+    if speech_words:
+        end, _spans = endings.content_end(
+            speech_words, cut_duration, min_dur, max_dur, endings.ending_settings(cfg),
+            trusted_end=cut_duration if clean_cut_end else None,
+        )
+        return end
     if cut_duration <= min_dur:
         return cut_duration
-    loud = None if speech_words else extract_audio_loudness_profile(cut_path)
     return snap_end_to_pause(
         0.0,
         cut_duration,
-        words=speech_words or None,
-        loudness=loud,
+        loudness=extract_audio_loudness_profile(cut_path),
         min_dur=min_dur,
         max_dur=max_dur,
         hard_max_end=cut_duration,
@@ -766,12 +812,15 @@ def render_item_variants(
     preset: str | None = None,
     channel_name: str = "",
     keyword_list: Sequence[str] | None = None,
+    clean_cut_end: bool = False,
 ) -> dict[str, Any]:
     """Analyze the cut, plan the style for both variants, render A and B, verify both.
 
     speech_words are on the cut timeline (0 = cut start); vo_words on the VO timeline.
-    `preset` defaults to `style.preset` in config (P0).
-    Raises RenderVerificationError if either output fails verification.
+    `preset` defaults to `style.preset` in config (P0). `clean_cut_end`: the cut stage
+    verified the cut's own end (see cut_end_verified).
+    Raises RenderVerificationError if either output fails verification, and
+    endings.NoCleanEnding if no speech-safe end exists.
     """
     cfg = cfg if cfg is not None else config.get_config()
     rs = render_settings(cfg)
@@ -780,7 +829,8 @@ def render_item_variants(
     preset_name = preset or style.default_preset(cfg)
 
     cut_dur = media_duration(cut_path)
-    analysis = planning.analyze_clip(cut_path, speech_words, cfg=cfg, preset=preset_name, duration=cut_dur)
+    analysis = planning.analyze_clip(cut_path, speech_words, cfg=cfg, preset=preset_name, duration=cut_dur,
+                                     clean_cut_end=clean_cut_end)
     vo_dur = media_duration(vo_path)
     freeze_s = freeze_duration(vo_dur, cfg)
 
@@ -930,8 +980,9 @@ def run_render_item(
             preset=preset,
             channel_name=item.get("author_name") or "",
             keyword_list=keyword_list,
+            clean_cut_end=cut_end_verified(item, whisper_model),
         )
-    except RenderVerificationError as e:
+    except (RenderVerificationError, endings.NoCleanEnding) as e:
         db.mark_failed(item_id, "render", str(e), db_path=db_path)
         return False, str(e), {}
 

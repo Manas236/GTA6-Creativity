@@ -5,7 +5,10 @@ One command, no prompts:
     python scripts/render_previews.py
 
 For each of the three CP2 items it:
-  1. re-downloads the source (yt-dlp, idempotent) and re-cuts it,
+  1. re-downloads the source (yt-dlp, idempotent) and re-cuts it unless the cut on disk
+     was made by the current cut stage (its end checked against a completed sentence);
+     an item whose cut fails with no_clean_ending is replaced by the next real item in
+     pipeline.db (highest discovery score first) so there are still three,
   2. reuses the hook, voiceover script and authenticity already stored in pipeline.db,
   3. generates the C1 keywords with Gemini when GEMINI_API_KEY is set, else the rules,
   4. renders P0, P1, P2 and P3, variants A and B, into
@@ -15,7 +18,8 @@ For each of the three CP2 items it:
   6. writes media/previews/README.txt and prints the render time of every file.
 
 Options:
-    --items ID [ID ...]   override the three default item ids
+    --items ID [ID ...]   override the three default item ids (default: the CP2 ids that
+                          exist in pipeline.db, topped up with the best-scoring real items)
     --presets P0 P3       render a subset
     --skip-download       reuse the cut already on disk (fails if there is none)
     --no-grid             skip the 2x2 comparison grids
@@ -35,7 +39,7 @@ from typing import Any, Sequence
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline import config, cut as cutmod, db, download, hooks, keywords as kwmod, render, style  # noqa: E402
+from pipeline import config, cut as cutmod, db, download, endings, hooks, keywords as kwmod, render, style  # noqa: E402
 
 log = logging.getLogger("render_previews")
 
@@ -56,6 +60,8 @@ class ItemResult:
     keyword_source: str = ""
     renders: dict[str, dict[str, Any]] = field(default_factory=dict)   # preset -> info
     grids: dict[str, str] = field(default_factory=dict)
+    no_clean_ending: bool = False      # the cut stage found no speech-safe end: swap the item
+    replaces: str = ""                 # the item this one was swapped in for
 
 
 # --------------------------------------------------------------------------------------
@@ -63,9 +69,21 @@ class ItemResult:
 # --------------------------------------------------------------------------------------
 
 def ensure_source(item: dict[str, Any], cfg: dict[str, Any], db_path: Any = None) -> Path:
-    """Re-download the item's source if it is not already on disk. Idempotent."""
+    """Re-download the item's source if it is not already on disk, or if the file on disk
+    is one the current downloader would refuse (AV1 / above the height cap: those decode
+    slowly enough to time out dedupe and scene detection). Idempotent."""
     existing = item.get("download_path")
     if existing and Path(existing).exists():
+        acceptable, why = download.source_is_acceptable(existing, cfg)
+        if acceptable:
+            return Path(existing)
+        log.info("  the source on disk is %s; re-downloading in the capped format ...", why)
+        ok, msg = download.download_single_item(item, cfg=cfg, db_path=db_path)
+        path = (db.get_item(item["id"], db_path=db_path) or {}).get("download_path")
+        if ok and path and Path(path).exists():
+            return Path(path)
+        # The download writes to a temp file first, so the old source is still intact.
+        log.warning("  re-download failed (%s); keeping the existing source", msg)
         return Path(existing)
     log.info("  downloading %s ...", item.get("source_url"))
     ok, msg = download.download_single_item(item, cfg=cfg, db_path=db_path)
@@ -76,12 +94,22 @@ def ensure_source(item: dict[str, Any], cfg: dict[str, Any], db_path: Any = None
     return Path(path)
 
 
-def ensure_cut(item: dict[str, Any], cfg: dict[str, Any], db_path: Any = None) -> Path:
-    """Re-cut the item if the cut is not already on disk. Idempotent."""
+def cut_is_current(item: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """The cut on disk was made by the current cut stage: its end was checked for a
+    completed sentence (render.cut_end_verified) for exactly this window."""
     existing = item.get("cut_path")
-    if existing and Path(existing).exists():
+    if not existing or not Path(existing).exists():
+        return False
+    return render.cut_end_verified(item, render.render_settings(cfg)["whisper_model"])
+
+
+def ensure_cut(item: dict[str, Any], cfg: dict[str, Any], db_path: Any = None) -> Path:
+    """Re-cut the item unless its cut is on disk AND was made by the current cut stage.
+    Idempotent: a second run reuses the cut the first run made."""
+    existing = item.get("cut_path")
+    if existing and Path(existing).exists() and cut_is_current(item, cfg):
         return Path(existing)
-    log.info("  cutting ...")
+    log.info("  cutting%s ...", " (the cut on disk predates the sentence-end check)" if existing else "")
     ok, msg = cutmod.run_cut_item(item["id"], cfg=cfg, db_path=db_path)
     refreshed = db.get_item(item["id"], db_path=db_path) or {}
     path = refreshed.get("cut_path")
@@ -205,6 +233,7 @@ def render_item(
         item = db.get_item(item_id, db_path=db_path) or item
     except Exception as e:
         result.message = str(e)
+        result.no_clean_ending = "no_clean_ending" in str(e)
         return result
 
     hook = item.get("hook_text") or "IS THIS REALLY GTA 6?"
@@ -212,8 +241,9 @@ def render_item(
     result.hook, result.channel = hook, channel
 
     rs = render.render_settings(cfg)
-    # Cut words cached by the hooks stage when they match this cut window; else transcribe.
+    # Cut words cached by the cut/hooks stage when they match this cut window; else transcribe.
     words = render.cut_speech_words(item, cut_path, rs["whisper_model"])
+    clean_cut_end = render.cut_end_verified(item, rs["whisper_model"])
 
     vo_path = item.get("voiceover_audio_path")
     if not vo_path or not Path(vo_path).exists():
@@ -243,9 +273,9 @@ def render_item(
             res = render.render_item_variants(
                 cut_path, vo_path, hook, words, vo_words, a, b, item_dir / ".subs",
                 cfg=cfg, name=f"{item_id}_{preset}", preset=preset,
-                channel_name=channel, keyword_list=result.keywords,
+                channel_name=channel, keyword_list=result.keywords, clean_cut_end=clean_cut_end,
             )
-        except render.RenderVerificationError as e:
+        except (render.RenderVerificationError, endings.NoCleanEnding) as e:
             log.error("  %s FAILED: %s", preset, e)
             result.renders[preset] = {"ok": False, "error": str(e)}
             continue
@@ -310,7 +340,7 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
         "",
     ]
     for r in results:
-        lines.append(f"{r.item_id}")
+        lines.append(f"{r.item_id}" + (f"  (swapped in for {r.replaces}: no_clean_ending)" if r.replaces else ""))
         lines.append(f"  channel  : {r.channel}")
         lines.append(f"  hook     : {r.hook}")
         lines.append(f"  keywords : {', '.join(r.keywords) or '-'}  (source: {r.keyword_source or '-'})")
@@ -335,9 +365,31 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
     return path
 
 
+def candidate_items(db_path: Any = None) -> list[str]:
+    """Real items worth previewing, best discovery score first: not synthetic, with a
+    source URL, and not rejected or failed."""
+    with db.db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM items WHERE source_url LIKE 'http%' AND id NOT LIKE 'synthetic%' "
+            "AND stage NOT IN ('rejected', 'failed') ORDER BY discovery_score DESC"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def default_items(db_path: Any = None, want: int = 3) -> list[str]:
+    """The CP2 ids that exist in this pipeline.db, topped up with the best real items."""
+    ids = [i for i in CP2_ITEM_IDS if db.get_item(i, db_path=db_path)]
+    for i in candidate_items(db_path):
+        if len(ids) >= want:
+            break
+        if i not in ids:
+            ids.append(i)
+    return ids
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Render the P0-P3 x A/B style previews for the CP2 items.")
-    ap.add_argument("--items", nargs="*", default=CP2_ITEM_IDS)
+    ap.add_argument("--items", nargs="*", default=None)
     ap.add_argument("--presets", nargs="*", default=PRESETS)
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--no-grid", action="store_true")
@@ -353,20 +405,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_root = Path(args.out) if args.out else config.media_dir("previews")
     out_root.mkdir(parents=True, exist_ok=True)
 
+    queue = list(args.items) if args.items else default_items()
+    want = len(queue)
     started = time.time()
     results: list[ItemResult] = []
-    for item_id in args.items:
-        print(f"\n{item_id}")
+    tried: set[str] = set()
+    replaces: dict[str, str] = {}
+    while queue:
+        item_id = queue.pop(0)
+        tried.add(item_id)
+        print(f"\n{item_id}" + (f"  (replacing {replaces[item_id]})" if item_id in replaces else ""))
         r = render_item(item_id, cfg, args.presets, out_root,
                         skip_download=args.skip_download, make_grid=not args.no_grid)
+        r.replaces = replaces.get(item_id, "")
         if not r.ok:
             print(f"  FAILED: {r.message}")
         results.append(r)
+        if r.no_clean_ending:
+            spare = next((i for i in candidate_items() if i not in tried and i not in queue), None)
+            if spare:
+                print(f"  {item_id} has no clean ending; swapping in {spare}")
+                replaces[spare] = item_id
+                queue.append(spare)
+            else:
+                print(f"  {item_id} has no clean ending and pipeline.db has no other real item; "
+                      "run `python -m pipeline.runner discover` and `download`, then re-run")
+    ok_count = sum(1 for r in results if r.ok)
+    if ok_count < want:
+        print(f"\nOnly {ok_count} of {want} items rendered.")
 
     readme = write_readme(out_root, results, args.presets)
     print(f"\nWrote {readme}")
     print(f"Total {time.time() - started:.1f} s for {len(results)} item(s)")
-    return 0 if all(r.ok for r in results) else 1
+    return 0 if ok_count >= want else 1
 
 
 if __name__ == "__main__":

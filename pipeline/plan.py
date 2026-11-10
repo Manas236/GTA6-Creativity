@@ -18,6 +18,7 @@ from typing import Any, Sequence
 
 from . import audio_mix, config, edits, keywords as kwmod, overlay, style
 from .cut import extract_audio_loudness_profile, extract_scene_cuts, snap_end_to_pause
+from . import endings
 from .rendercore import ascent_px, cap_height_px, descent_px, layout_hook, media_duration, render_settings
 
 log = logging.getLogger(__name__)
@@ -136,10 +137,16 @@ def analyze_clip(
     cfg: dict[str, Any] | None = None,
     preset: str | None = None,
     duration: float | None = None,
+    clean_cut_end: bool = False,
 ) -> ClipAnalysis:
     """Probe the cut once: scene cuts, motion, loudness, frame hashes; then decide the
-    content end (A4 or the existing pause snap), the dead-air timeline (A3) and the
-    framing segments (F1). Probes are only run for the flags the preset enables."""
+    content end (A4 or the speech-safe snap), the dead-air timeline (A3) and the
+    framing segments (F1). Probes are only run for the flags the preset enables.
+
+    With speech, the end always follows a completed sentence (pipeline.endings); A4 may
+    only choose among those ends. `clean_cut_end` says the cut stage verified the cut's
+    own end (it saw the audio after the cut). Raises endings.NoCleanEnding when no end is
+    speech-safe."""
     cfg = cfg if cfg is not None else config.get_config()
     rs = render_settings(cfg)
     ss = style.style_settings(cfg)
@@ -157,32 +164,46 @@ def analyze_clip(
     motion = edits.motion_profile(cut_path, float(ss["zoom_fill"]["motion_step_s"])) if need_motion else []
     loudness = extract_audio_loudness_profile(cut_path) if need_loud else []
 
-    # --- content end: A4 loop-friendly frame, else the existing pause snap -----------
+    # --- content end: speech-safe (pipeline.endings), then A4 among the safe ends -----
+    es = endings.ending_settings(cfg)
     min_dur = float(cut_cfg.get("min_duration", 18.0))
     max_dur = min(float(cut_cfg.get("max_duration", 22.0)), dur)
-    proposed = snap_end_to_pause(
-        0.0, dur,
-        words=words or None,
-        loudness=None if words else loudness,
-        min_dur=min_dur, max_dur=float(cut_cfg.get("max_duration", 22.0)),
-        hard_max_end=dur,
-    )
+    spans: list[endings.SafeSpan] | None = None
+    if words:
+        proposed, spans = endings.content_end(
+            words, dur, min_dur, float(cut_cfg.get("max_duration", 22.0)), es,
+            trusted_end=dur if clean_cut_end else None,
+        )
+    else:
+        proposed = snap_end_to_pause(
+            0.0, dur,
+            loudness=loudness,
+            min_dur=min_dur, max_dur=float(cut_cfg.get("max_duration", 22.0)),
+            hard_max_end=dur,
+        )
     end_s = proposed
     loop = None
     if flags["loop_end"] and dur > min_dur:
         hashes = edits.gray_hashes(cut_path, fps=1.0 / max(0.05, float(ss["loop_end"]["search_step_s"])))
-        loop = edits.choose_loop_end(hashes, min_dur, max_dur, words, ss, proposed_end=proposed)
+        loop = edits.choose_loop_end(hashes, min_dur, max_dur, words, ss, proposed_end=proposed,
+                                     safe_spans=spans, es=es)
         if loop:
             end_s = loop.end_s
             notes.append(
                 f"A4 end {loop.end_s:.2f}s (dHash distance {loop.distance} bits from frame 1, "
                 f"{'in' if loop.in_pause else 'not in'} a speech pause, {loop.candidates} candidates)"
             )
-    end_s = min(_snap(end_s, fps), dur)
+    if spans:
+        span = endings.span_at(end_s, spans)
+        end_s = min(endings.snap_inside(end_s, span, 1.0 / fps) if span else _snap(end_s, fps), dur)
+        if span is None or endings.speaks_through(end_s, words):
+            raise endings.NoCleanEnding(f"no_clean_ending: end {end_s:.3f}s is not after a completed sentence")
+    else:
+        end_s = min(_snap(end_s, fps), dur)
 
     # --- A3 dead air, measured on the content region only ---------------------------
     if flags["dead_air"]:
-        timeline = edits.plan_dead_air(end_s, loudness, motion, ss)
+        timeline = edits.plan_dead_air(end_s, loudness, motion, ss, words=words, es=es)
         timeline = edits.Timeline(
             kept=[(_snap(s, fps), _snap(e, fps)) for s, e in timeline.kept],
             source_duration=end_s,
@@ -319,6 +340,10 @@ def build_style_plan(
             log.warning("A2 music bed missing (%s); run scripts/fetch_assets.py on the laptop", mp)
 
     fade = float(ss["loop_end"]["audio_fade_s"]) if flags["loop_end"] else float(rs["end_fade_s"])
+    if speech_out:
+        # The end sits in silence after the last word; never let the fade reach back into it.
+        room = total_s - max(float(w["end"]) for w in speech_out)
+        fade = round(min(fade, max(0.05, room)), 3)
 
     notes = list(analysis.notes)
     if flags["zoom_fill"]:
