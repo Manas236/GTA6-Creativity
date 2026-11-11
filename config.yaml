@@ -160,8 +160,11 @@ gemini:
   rate_limit_retries: 2 # per call: on HTTP 429, wait the server's retryDelay, then retry
   max_rate_limit_wait_s: 120 # a longer retryDelay = daily quota gone: fail fast, never sleep hours
   max_attempts: 3 # hook generation attempts per item before the hooks stage fails
-  grounding_fail_limit: 2 # grounding FAIL verdicts before the plain question-hook fallback
-  fallback_hook: "IS THIS REALLY GTA 6?"
+  # Segment-check FAILs (keyword overlap with the cut's transcript, then a Gemini PASS/FAIL that may
+  # only use the cut's transcript + frames) before the item goes to needs_review: 2 = the first hook
+  # plus one regeneration. needs_review items are not rendered; Telegram shows them for a decision.
+  grounding_fail_limit: 2
+  fallback_hook: "IS THIS REALLY GTA 6?" # no longer rendered silently (kept for old configs)
 
 render:
   width: 1080

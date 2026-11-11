@@ -58,6 +58,22 @@ Everything below is still yours to do, in this order. Nothing posts publicly unt
    whisper now falls back to `~/.cache/huggingface` (PLAN calls #136, #158), but you may want to
    remove or fix that variable.
 
+## 0a. Caption fix 2026-11-11 (wrong hook on a render)
+
+**Cause:** a re-cut moved an item's window (the sentence-aligned windows moved all three laptop
+items) but kept `hook_text` / `voiceover_script` / `voiceover_audio_path` / `keywords`, and render
+(and `scripts/render_previews.py`) reused any non-empty hook. The hook and VO then described another
+part of the source. Also, the grounding check accepted the *source title* as evidence.
+**Now** (`pipeline/binding.py`): every hook / VO is stamped with item id + cut_start/cut_end + cut
+file + transcript hash; the cut stage clears them when the window moves; render regenerates a stale
+hook and **refuses** (`caption_mismatch`, item failed) anything not bound to the exact item +
+segment. Gemini gets only the cut segment's transcript, the channel's official/unverified tag and
+the title marked "context only". Each hook is checked (keyword overlap with the segment, then a
+segment-only Gemini PASS/FAIL); a FAIL is regenerated once, a second FAIL puts the item in the new
+stage **`needs_review`**: not rendered, shown on Telegram as a text card ("Hook is right: render it"
+/ "Reject"); in auto mode it is rejected. Old rows have no record, so their hooks are regenerated
+on the next render (costs Gemini calls). New columns are added by `init_db` automatically.
+
 ## 0b. Fix pass 2026-11-10: results
 
 > **Superseded by the captions pass (later on 2026-11-10):** captions now use small.en + the GTA glossary,

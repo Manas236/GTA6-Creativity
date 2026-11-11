@@ -157,10 +157,16 @@ def test_run_render_item_transcribes_the_vo_with_the_glossary(tmp_db, tmp_path, 
     db.insert_discovered_item({"id": "item_r", "source": "youtube", "source_id": "vid_r",
                                "source_url": "https://example.invalid/r", "author_name": "Creator",
                                "raw_velocity": 1.0}, db_path=tmp_db)
+    from pipeline import binding
+
+    seg = {"id": "item_r", "cut_path": str(cut_file), "cut_start": 10.0, "cut_end": 30.0}
     db.transition_stage("item_r", "cut", extra_fields={
         "cut_path": str(cut_file), "cut_start": 10.0, "cut_end": 30.0, "cut_duration": 20.0,
         "hook_text": "IS THIS VICE CITY?", "voiceover_script": "Is this Vice City?",
         "voiceover_audio_path": str(vo), "keywords": '["VICE"]',
+        "hook_binding": binding.hook_record(seg, "IS THIS VICE CITY?", "Is this Vice City?", "VICE",
+                                            "segment_check"),
+        "voiceover_binding": binding.voiceover_record(seg, "Is this Vice City?", vo),
     }, db_path=tmp_db)
     render.store_cut_words("item_r", db.get_item("item_r", db_path=tmp_db),
                            [{"word": "VICE", "start": 0.5, "end": 0.9}], transcribe.cache_key(CFG), db_path=tmp_db)

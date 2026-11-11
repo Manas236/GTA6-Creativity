@@ -48,3 +48,6 @@ logs/
 # is committed (the renders themselves are mp4s and must not be in a public repo).
 samples/synthetic/presets/
 samples/synthetic/style_report.json
+
+# Local dated backups (hold copies of .env, pipeline.db, configs)
+backups/

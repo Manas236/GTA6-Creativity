@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import config, db, dedupe, endings, sentence_windows, transcribe
+from . import binding, config, db, dedupe, endings, sentence_windows, transcribe
 from .download import verify_video_file
 
 log = logging.getLogger(__name__)
@@ -693,10 +693,18 @@ def run_cut_item(
         db.delete_fingerprints(item_id, "cut", db_path=db_path)
         db.save_fingerprints(item_id, "cut", cut_hashes, db_path=db_path)
         selection.update(info, start=choice.start, end=choice.end)
+        # A moved window invalidates everything written for the old one: the hook, voiceover,
+        # keywords and renders described a different part of the source (the wrong-caption bug).
+        stale = binding.reset_for_new_segment(item, choice.start, choice.end)
+        if stale:
+            log.info("Cut window for %s moved to %.2f-%.2f s: clearing the hook/voiceover/renders of "
+                     "the old window (%s-%s s)", item_id, choice.start, choice.end,
+                     item.get("cut_start"), item.get("cut_end"))
         db.transition_stage(
             item_id,
             "cut",
             extra_fields={
+                **stale,
                 "cut_start": choice.start,
                 "cut_end": choice.end,
                 "cut_duration": actual_dur,

@@ -27,7 +27,8 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import audio_mix, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, voiceover
+from . import audio_mix, binding, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, voiceover
+from .binding import CaptionMismatchError
 from .cut import audio_envelope, extract_audio_loudness_profile, snap_end_to_pause
 from . import endings, transcribe
 from .download import verify_video_file
@@ -63,6 +64,7 @@ __all__ = [
     "build_variant_b_words", "estimate_words_from_script", "has_audio_stream", "probe_streams",
     "verify_render", "media_duration", "freeze_duration", "render_variant_a", "render_variant_b",
     "snap_render_end", "render_item_variants", "run_render_item", "get_whisper_model",
+    "CaptionMismatchError", "assert_item_caption_binding",
 ]
 
 
@@ -777,6 +779,26 @@ def snap_render_end(
     )
 
 
+def assert_item_caption_binding(
+    item: dict[str, Any],
+    hook_text: str,
+    cut_path: Path | str,
+    vo_path: Path | str,
+    cfg: dict[str, Any] | None = None,
+) -> None:
+    """The hard render-time check (pipeline.binding): the hook and voiceover about to be burned in
+    were made for this item's id and exact segment, from this cut file, from the segment transcript
+    cached for this window, and the wav was spoken from the item's current script.
+    Raises CaptionMismatchError (and logs it) otherwise."""
+    cached = cached_cut_words(item, transcribe.cache_key(cfg))
+    try:
+        binding.assert_caption_binding(item, hook_text, cut_path=cut_path, vo_path=vo_path,
+                                       transcript_words=cached)
+    except CaptionMismatchError as e:
+        log.error("REFUSING TO RENDER: %s", e)
+        raise
+
+
 def render_item_variants(
     cut_path: Path | str,
     vo_path: Path | str,
@@ -793,16 +815,22 @@ def render_item_variants(
     channel_name: str = "",
     keyword_list: Sequence[str] | None = None,
     clean_cut_end: bool = False,
+    item: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Analyze the cut, plan the style for both variants, render A and B, verify both.
 
     speech_words are on the cut timeline (0 = cut start); vo_words on the VO timeline.
     `preset` defaults to `style.preset` in config (P0). `clean_cut_end`: the cut stage
     verified the cut's own end (see cut_end_verified).
-    Raises RenderVerificationError if either output fails verification, and
-    endings.NoCleanEnding if no speech-safe end exists.
+    `item`: the pipeline row this render is for. When given (the pipeline and the preview script
+    always give it), the hook and voiceover must be bound to its id and segment before anything is
+    rendered (assert_item_caption_binding). Only synthetic checks without a row omit it.
+    Raises CaptionMismatchError when they are not, RenderVerificationError if either output fails
+    verification, and endings.NoCleanEnding if no speech-safe end exists.
     """
     cfg = cfg if cfg is not None else config.get_config()
+    if item is not None:
+        assert_item_caption_binding(item, hook_text, cut_path, vo_path, cfg)
     rs = render_settings(cfg)
     fps = int(rs["fps"])
     target_lufs = float(rs["target_lufs"])
@@ -891,6 +919,9 @@ def run_render_item(
         # A preview_only item can never enter 'rendered' (SQLite trigger). Skip it up front
         # instead of rendering for minutes and then being refused; its state is left untouched.
         return False, "preview_only item: not rendered by the pipeline", {}
+    if item.get("stage") == "needs_review":
+        # Its hook failed the segment check twice; a human decides on Telegram first.
+        return False, "needs_review: the hook is waiting for a manual review", {}
 
     cut_path_str = item.get("cut_path")
     if not cut_path_str or not Path(cut_path_str).exists():
@@ -903,21 +934,27 @@ def run_render_item(
         db.mark_failed(item_id, "render", "Cut file invalid via ffprobe", db_path=db_path)
         return False, "Cut file invalid", {}
 
-    # Ensure hooks generated
+    # Ensure a hook made for THIS segment. A stored hook is reused only when its record names this
+    # item and this exact window; one written for an older window (a re-cut) is regenerated.
     hook_text = item.get("hook_text")
-    if not hook_text:
-        log.info("Generating hook for item %s...", item_id)
+    stale = binding.hook_binding_problem(item)
+    if stale:
+        log.info("Generating hook for item %s (%s)...", item_id, stale)
         ok, msg = hooks.run_hooks_for_item(item_id, cfg=cfg, db_path=db_path)
         if not ok:
+            refreshed = db.get_item(item_id, db_path=db_path) or {}
+            if refreshed.get("stage") == "needs_review":
+                return False, msg, {}          # not a failure: it waits for a human on Telegram
             db.mark_failed(item_id, "render", f"Hook generation failed: {msg}", db_path=db_path)
             return False, f"Hook generation failed: {msg}", {}
         item = db.get_item(item_id, db_path=db_path)
-        hook_text = item.get("hook_text") or "IS THIS REALLY GTA 6?"
+        hook_text = item.get("hook_text")
 
-    # Ensure voiceover generated
+    # Ensure a voiceover spoken from the current script for this segment
     vo_path_str = item.get("voiceover_audio_path")
-    if not vo_path_str or not Path(vo_path_str).exists():
-        log.info("Generating voiceover for item %s...", item_id)
+    vo_stale = binding.voiceover_binding_problem(item)
+    if not vo_path_str or not Path(vo_path_str).exists() or vo_stale:
+        log.info("Generating voiceover for item %s%s...", item_id, f" ({vo_stale})" if vo_stale else "")
         ok, msg = voiceover.run_voiceover_for_item(item_id, cfg=cfg, db_path=db_path)
         if not ok:
             db.mark_failed(item_id, "render", f"Voiceover synthesis failed: {msg}", db_path=db_path)
@@ -964,9 +1001,11 @@ def run_render_item(
             channel_name=item.get("author_name") or "",
             keyword_list=keyword_list,
             clean_cut_end=cut_end_verified(item, tkey),
+            item=item,
         )
-    except (RenderVerificationError, endings.NoCleanEnding) as e:
+    except (RenderVerificationError, endings.NoCleanEnding, CaptionMismatchError) as e:
         db.mark_failed(item_id, "render", str(e), db_path=db_path)
+        db.log_stage(item_id, "render", "failure", message=str(e), db_path=db_path)
         return False, str(e), {}
 
     elapsed_a, elapsed_b = result["elapsed_a_s"], result["elapsed_b_s"]

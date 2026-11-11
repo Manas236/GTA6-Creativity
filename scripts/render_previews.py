@@ -9,7 +9,10 @@ For each of the three CP2 items it:
      was made by the current cut stage (its end checked against a completed sentence);
      an item whose cut fails with no_clean_ending is replaced by the next real item in
      pipeline.db (highest discovery score first) so there are still three,
-  2. reuses the hook, voiceover script and authenticity already stored in pipeline.db,
+  2. reuses the hook, voiceover and authenticity stored in pipeline.db ONLY when they were made
+     for this item's current cut segment (pipeline.binding); otherwise (a re-cut moved the
+     window, or the hook predates the segment record) it runs the hooks stage for the new
+     segment first. A hook that fails the segment check twice is not rendered (needs_review),
   3. generates the C1 keywords with Gemini when GEMINI_API_KEY is set, else the rules,
   4. renders P0, P1, P2 and P3, variants A and B, into
      media/previews/<item_id>/P{n}_{A,B}.mp4,
@@ -40,7 +43,7 @@ from typing import Any, Sequence
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline import config, cut as cutmod, db, download, endings, hooks, keywords as kwmod, render, style, transcribe  # noqa: E402
+from pipeline import binding, config, cut as cutmod, db, download, endings, hooks, keywords as kwmod, render, style, transcribe  # noqa: E402
 
 log = logging.getLogger("render_previews")
 
@@ -67,6 +70,8 @@ class ItemResult:
     selection: dict[str, Any] = field(default_factory=dict)   # how the cut stage chose the window
     ending_words: str = ""
     replaces: str = ""                 # the item this one was swapped in for
+    hook_note: str = ""                # reused / regenerated for this segment, and the check result
+    needs_review: bool = False         # the hook failed the segment check twice: not rendered
 
 
 # --------------------------------------------------------------------------------------
@@ -254,7 +259,25 @@ def render_item(
         result.ending_words = " ".join(str(w.get("word", "")) for w in (payload.get("words") or [])[-8:])
     except Exception:  # noqa: BLE001
         pass
-    hook = item.get("hook_text") or "IS THIS REALLY GTA 6?"
+    # The hook must have been made for THIS segment (a re-cut above may have moved the window).
+    stale = binding.hook_binding_problem(item)
+    if stale:
+        log.info("  hook not usable for this segment (%s); running the hooks stage ...", stale)
+        ok, msg = hooks.run_hooks_for_item(item_id, cfg=cfg, db_path=db_path)
+        item = db.get_item(item_id, db_path=db_path) or item
+        if not ok:
+            result.needs_review = item.get("stage") == "needs_review"
+            result.hook = item.get("hook_text") or ""
+            result.message = f"hook {'sent to manual review' if result.needs_review else 'failed'}: {msg}"
+            return result
+        result.hook_note = "regenerated for this segment"
+    else:
+        result.hook_note = "reused (made for this segment)"
+    try:
+        result.hook_note += f"; check: {json.loads(item.get('hook_binding') or '{}').get('reason', '')}"
+    except ValueError:
+        pass
+    hook = item["hook_text"]
     channel = item.get("author_name") or "Creator"
     result.hook, result.channel = hook, channel
 
@@ -265,7 +288,7 @@ def render_item(
     clean_cut_end = render.cut_end_verified(item, tkey)
 
     vo_path = item.get("voiceover_audio_path")
-    if not vo_path or not Path(vo_path).exists():
+    if not vo_path or not Path(vo_path).exists() or binding.voiceover_binding_problem(item):
         from pipeline import voiceover
         ok, msg = voiceover.run_voiceover_for_item(item_id, cfg=cfg, db_path=db_path)
         item = db.get_item(item_id, db_path=db_path) or item
@@ -293,8 +316,9 @@ def render_item(
                 cut_path, vo_path, hook, words, vo_words, a, b, item_dir / ".subs",
                 cfg=cfg, name=f"{item_id}_{preset}", preset=preset,
                 channel_name=channel, keyword_list=result.keywords, clean_cut_end=clean_cut_end,
+                item=item,
             )
-        except (render.RenderVerificationError, endings.NoCleanEnding) as e:
+        except (render.RenderVerificationError, endings.NoCleanEnding, render.CaptionMismatchError) as e:
             log.error("  %s FAILED: %s", preset, e)
             result.renders[preset] = {"ok": False, "error": str(e)}
             continue
@@ -420,7 +444,9 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
     for r in results:
         lines.append(f"{r.item_id}" + (f"  (swapped in for {r.replaces}: no_clean_ending)" if r.replaces else ""))
         lines.append(f"  channel  : {r.channel}")
-        lines.append(f"  hook     : {r.hook}")
+        lines.append(f"  hook     : {r.hook}" + (f"  ({r.hook_note})" if r.hook_note else ""))
+        if r.needs_review:
+            lines.append("  HOOK     : failed the segment check twice -> needs_review (not rendered)")
         sel = r.selection
         if sel.get("start") is not None:
             lines.append(

@@ -308,17 +308,22 @@ def test_hooks_stage_grounding_errors_never_pass_and_never_fall_back(tmp_db, tmp
     assert item["hook_text"] is None
 
 
-def test_hooks_stage_two_grounding_fails_use_the_fixed_question_hook(tmp_db, tmp_path):
+def test_hooks_stage_two_check_fails_go_to_manual_review_not_a_silent_fallback(tmp_db, tmp_path):
+    """The old policy rendered the fixed 'IS THIS REALLY GTA 6?' hook after 2 FAILs. Now: the hook is
+    regenerated once, and a second FAIL sends the item to needs_review - nothing is rendered."""
     iid = _cut_item(tmp_db, tmp_path)
     with patch.object(render, "transcribe_words", return_value=WORDS), \
+         patch("pipeline.hooks.extract_sample_frames", return_value=[b"f"]), \
          patch("pipeline.hooks.generate_hook_and_voiceover", return_value=dict(GOOD)) as gen, \
          patch("pipeline.hooks.verify_hook_grounding", return_value=(False, "FAIL: Lucia is not in the clip")):
         ok, msg = hooks.run_hooks_for_item(iid, cfg=config.get_config(), db_path=tmp_db)
     item = db.get_item(iid, db_path=tmp_db)
-    assert ok is True and gen.call_count == 2
-    assert item["stage"] == "cut"
-    assert item["hook_text"] == "IS THIS REALLY GTA 6?" and item["hook_grounded"] == 0
-    assert item["authenticity"] == "unverified"
+    assert ok is False and msg.startswith("needs_review") and gen.call_count == 2
+    assert "Lucia is not in the clip" in gen.call_args_list[1].kwargs["previous_failure"]   # regenerated once, with the reason
+    assert item["stage"] == "needs_review"
+    assert item["hook_text"] == GOOD["hook_text"] and item["hook_grounded"] == 0      # kept for the reviewer, never rendered
+    assert json.loads(item["hook_binding"])["check"] == "needs_review"
+    assert "Lucia is not in the clip" in json.loads(item["hook_review"])["reason"]
 
 
 def test_hooks_stage_passes_the_cut_transcript_into_the_prompt_and_caches_it(tmp_db, tmp_path):
@@ -340,11 +345,14 @@ def test_hooks_stage_passes_the_cut_transcript_into_the_prompt_and_caches_it(tmp
     assert ok is True and "source=gemini" in msg
     tw.assert_called_once()
     gen_prompt, check_prompt = prompts
-    assert 'AUDIO TRANSCRIPT: "Lucia drives through Vice City."' in gen_prompt
-    assert 'SOURCE TITLE: "GTA 6 Lucia Leak"' in gen_prompt
-    assert "Lucia drives through Vice City." in check_prompt
+    assert 'CLIP TRANSCRIPT (this segment only): "Lucia drives through Vice City."' in gen_prompt
+    assert 'SOURCE VIDEO TITLE (context only' in gen_prompt and '"GTA 6 Lucia Leak"' in gen_prompt
+    assert 'AUTHENTICITY TAG: "unverified"' in gen_prompt and "10.0-30.0 s of the source" in gen_prompt
+    assert "Lucia drives through Vice City." in check_prompt and "NOT evidence" in check_prompt
     item = db.get_item(iid, db_path=tmp_db)
     assert item["hook_text"] == GOOD["hook_text"] and item["hook_grounded"] == 1
+    rec = json.loads(item["hook_binding"])
+    assert (rec["item_id"], rec["cut_start"], rec["cut_end"], rec["check"]) == (iid, 10.0, 30.0, "segment_check")
     assert json.loads(item["keywords"]) == ["LUCIA", "VICE", "CITY"]
     cached = json.loads(item["transcript_words"])
     assert cached["words"] == WORDS and (cached["cut_start"], cached["cut_end"]) == (10.0, 30.0)

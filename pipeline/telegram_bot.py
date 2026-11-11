@@ -41,7 +41,7 @@ from typing import Any, Callable, Protocol
 
 import requests
 
-from . import clock, config, db
+from . import binding, clock, config, db
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +55,11 @@ STALE = "This card is out of date - it was already decided. The current card is 
 ALERT_REPEAT_GAP_S = 3600.0       # the same failure is not re-alerted more often than this
 MAX_VIDEO_BYTES = 50 * 1024 * 1024  # Bot API upload limit for a bot-sent video
 
-ACTIONS = {"ok": "approved", "no": "rejected", "aonly": "approved_a_only"}
+ACTIONS = {"ok": "approved", "no": "rejected", "aonly": "approved_a_only", "hookok": "hook_approved"}
+#: Stages an open card can still be decided in (a review card is for an item in needs_review).
+DECIDABLE_STAGES = ("awaiting_approval", "rendered", "needs_review")
+#: decide() outcome for a button that does not fit the item's card: nothing changes, the card stays open.
+NOT_APPLICABLE = "not_applicable"
 
 
 class TelegramError(RuntimeError):
@@ -272,7 +276,46 @@ DECIDED_TEXT = {
     "approved": "✅ Approved. It is in the posting queue; the scheduler assigns A or B.",
     "rejected": "❌ Rejected. It will not be posted.",
     "approved_a_only": "🅰 Approved, Variant A only. Excluded from the A/B comparison.",
+    "hook_approved": "✅ Hook approved. The clip is rendered with it and comes back here for the normal review.",
 }
+
+
+def review_card_text(item: dict[str, Any], decided: str = "") -> str:
+    """Card for an item whose hook failed the segment check twice: nothing was rendered. Shows the
+    hook, why it failed, and what is actually said in the clip, so a human can judge it."""
+    try:
+        review = json.loads(item.get("hook_review") or "{}") or {}
+    except ValueError:
+        review = {}
+    seg = review.get("segment") or [item.get("cut_start"), item.get("cut_end")]
+    lines = [
+        "🔎 HOOK REVIEW · not rendered: the hook failed the clip check twice.",
+        "",
+        f"🪝 Hook: {item.get('hook_text') or '(none)'}",
+        f"🎙 Voiceover: {item.get('voiceover_script') or '(none)'}",
+        f"⚠️ Why: {str(review.get('reason') or '?')[:300]}",
+    ]
+    for r in (review.get("rejected") or [])[:-1]:
+        lines.append(f"   earlier hook: {r.get('hook_text')} - {str(r.get('reason'))[:160]}")
+    lines += [
+        f"🏷 {authenticity_tag(item.get('authenticity'))}",
+        f"✂️ Clip: {seg[0]}-{seg[1]} s of the source · {item.get('source_url') or ''}",
+        f"💬 Said in the clip: \"{str(review.get('transcript_excerpt') or '[no speech]')[:600]}\"",
+    ]
+    if item.get("original_title"):
+        lines.append(f"🎞 Source title (not in the clip): {str(item['original_title'])[:120]}")
+    lines.append("")
+    lines.append(decided or "Approve only if the hook matches what happens in this clip.")
+    return "\n".join(lines)
+
+
+def review_markup(item_id: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ Hook is right: render it", "callback_data": f"a:hookok:{item_id}"}],
+            [{"text": "❌ Reject", "callback_data": f"a:no:{item_id}"}],
+        ]
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +346,11 @@ def next_item_for_review(db_path: Any = None) -> dict[str, Any] | None:
     if pending:
         return pending[0]
     ready = db.get_items_by_stage("rendered", limit=1, db_path=db_path, releasable_only=True)
-    return ready[0] if ready else None
+    if ready:
+        return ready[0]
+    # Hooks that failed the segment check twice: a text card, nothing rendered yet.
+    review = db.get_items_by_stage("needs_review", limit=1, db_path=db_path, releasable_only=True)
+    return review[0] if review else None
 
 
 def refuse_item(item_id: str, stage: str, exc: BaseException, db_path: Any = None) -> str:
@@ -334,8 +381,11 @@ def decide(item_id: str, action: str, db_path: Any = None) -> tuple[str, str]:
     item = db.get_item(item_id, db_path=db_path)
     if not item:
         return "", "That item is gone."
-    if item.get("stage") not in ("awaiting_approval", "rendered"):
+    if item.get("stage") not in DECIDABLE_STAGES:
         return "", f"Already decided ({item.get('stage')})."
+    # A review card (needs_review) only takes hookok / no; a render card never takes hookok.
+    if (item.get("stage") == "needs_review") != (action == "hookok") and action != "no":
+        return NOT_APPLICABLE, f"That button does not apply to this item ({item.get('stage')})."
     if action in ("ok", "aonly") and int(item.get("preview_only") or 0):
         refuse_item(item_id, "approval", RuntimeError("preview_only item cannot be approved"), db_path)
         return "", "This item is preview-only and cannot be approved."
@@ -377,6 +427,30 @@ def _apply_decision(item_id: str, action: str, db_path: Any = None) -> tuple[str
             message="approved A only via telegram; excluded from the A/B comparison", db_path=db_path,
         )
         return "approved_a_only", DECIDED_TEXT["approved_a_only"]
+
+    if action == "hookok":
+        # A human vouched for the hook against the clip: mark it renderable for this same segment
+        # (the binding still names the item + window) and send the item back to the render stage.
+        item = db.get_item(item_id, db_path=db_path) or {}
+        try:
+            review = json.loads(item.get("hook_review") or "{}") or {}
+        except ValueError:
+            review = {}
+        review.update(decision="hook_approved", decided_at=db.now())
+        db.transition_stage(
+            item_id,
+            "cut",
+            extra_fields={
+                "hook_grounded": 1,
+                "hook_binding": binding.with_check(item.get("hook_binding"), "human_approved",
+                                                   "approved on Telegram after failing the segment check"),
+                "hook_review": json.dumps(review),
+            },
+            db_path=db_path,
+        )
+        db.log_stage(item_id, "approval", "success", message="hook approved via telegram; back to render",
+                     db_path=db_path)
+        return "hook_approved", DECIDED_TEXT["hook_approved"]
 
     return "", STALE
 
@@ -456,6 +530,16 @@ class ApprovalBot:
         if int(item.get("preview_only") or 0):
             log.warning("telegram: %s is preview_only; no card is sent for it", item_id)
             return None
+        if item.get("stage") == "needs_review":
+            # Nothing is rendered: a text card with the hook, why it failed and what the clip says.
+            main = self.send_message(review_card_text(item), reply_markup=review_markup(item_id))
+            mid = int(main["message_id"])
+            self.editor.touch(mid)
+            set_card_state({"mid": mid, "item_id": item_id, "extra_mids": [], "kind": "review"}, self.db_path)
+            db.log_stage(item_id, "approval", "start", message=f"hook review card sent as message {mid}",
+                         db_path=self.db_path)
+            log.info("telegram: hook review card for %s sent as message %s", item_id, mid)
+            return item_id
         # The stage moves BEFORE anything is sent: if the database refuses the item, no card for it
         # ever reaches the chat, and a crash after this line re-offers the item (awaiting_approval
         # is picked up first by next_item_for_review).
@@ -492,14 +576,12 @@ class ApprovalBot:
 
     def close_card(self, state: dict[str, Any], item: dict[str, Any], outcome: str) -> None:
         """Edit the open card into its decided form, drop the buttons and free the slot."""
-        kind = "video" if item.get("render_b_path") else "text"
-        self.editor.edit(
-            int(state["mid"]),
-            kind,
-            card_text(item, decided=DECIDED_TEXT.get(outcome, outcome)),
-            {"inline_keyboard": []},
-            now=True,
-        )
+        decided = DECIDED_TEXT.get(outcome, outcome)
+        if state.get("kind") == "review":
+            kind, text = "text", review_card_text(item, decided=decided)
+        else:
+            kind, text = ("video" if item.get("render_b_path") else "text"), card_text(item, decided=decided)
+        self.editor.edit(int(state["mid"]), kind, text, {"inline_keyboard": []}, now=True)
         set_card_state(None, self.db_path)
 
     def release_stuck_card(self, poll_timeout: int | None = None) -> bool:
@@ -514,7 +596,7 @@ class ApprovalBot:
         if not state:
             return False
         item = db.get_item(state.get("item_id") or "", db_path=self.db_path)
-        stuck = (not item) or item.get("stage") not in ("awaiting_approval", "rendered") or db.is_synthetic(item)
+        stuck = (not item) or item.get("stage") not in DECIDABLE_STAGES or db.is_synthetic(item)
         if not stuck:
             return False
         if item and db.is_synthetic(item):
@@ -573,6 +655,8 @@ class ApprovalBot:
             return STALE
 
         outcome, answer = decide(item_id, action, db_path=self.db_path)
+        if outcome == NOT_APPLICABLE:
+            return answer                       # the card stays open for a button that fits it
         item = db.get_item(item_id, db_path=self.db_path) or {"id": item_id}
         if outcome:
             self.close_card(state, item, outcome)
@@ -761,6 +845,13 @@ def run_auto_approval(
                 db.mark_rejected(item["id"], f"auto_quality_gate: {reason}", db_path=db_path)
                 db.log_stage(item["id"], "approval", "failure", message=f"auto rejected: {reason}", db_path=db_path)
                 rejected.append(item["id"])
+    # Hooks that failed the segment check twice need a human; in auto mode there is none, so they are
+    # rejected the same way the gate rejects an ungrounded hook (require_grounded_hook).
+    for item in db.get_items_by_stage("needs_review", db_path=db_path, releasable_only=True):
+        db.mark_rejected(item["id"], "auto_quality_gate: hook failed the segment check twice (no manual review in auto mode)",
+                         db_path=db_path)
+        db.log_stage(item["id"], "approval", "failure", message="auto rejected: needs_review hook", db_path=db_path)
+        rejected.append(item["id"])
     log.info("auto approval: %d approved, %d rejected", len(approved), len(rejected))
     return {"approved": approved, "rejected": rejected}
 

@@ -223,6 +223,19 @@ def _verified_payload(cut_start=5.0, cut_end=25.0, words=None, ending="sentence"
                        "words": words or [], "ending": ending, "ending_rule": render_previews.endings.RULE_VERSION, "source": "cut"})
 
 
+def _bound(item: dict, words=None) -> dict:
+    """The hook / voiceover records the hooks and voiceover stages write for the item's segment
+    (without them the preview script regenerates the hook instead of reusing it)."""
+    from pipeline import binding
+    item.setdefault("cut_start", 5.0)
+    item.setdefault("cut_end", 25.0)
+    script = item.get("voiceover_script") or ""
+    item["hook_binding"] = binding.hook_record(item, item["hook_text"], script,
+                                               binding.transcript_text(words), "segment_check")
+    item["voiceover_binding"] = binding.voiceover_record(item, script, item["voiceover_audio_path"])
+    return item
+
+
 def test_render_previews_reuses_an_existing_download_and_a_current_cut(tmp_path):
     src, cut = tmp_path / "src.mp4", tmp_path / "cut.mp4"
     src.write_bytes(b"0")
@@ -287,9 +300,9 @@ def test_render_previews_renders_every_preset_and_writes_the_readme(tmp_path):
     cut, vo = tmp_path / "cut.mp4", tmp_path / "vo.wav"
     cut.write_bytes(b"0")
     vo.write_bytes(b"0")
-    item = {"id": "item_a35aead652d3", "download_path": str(cut), "cut_path": str(cut),
-            "voiceover_audio_path": str(vo), "hook_text": "IS THIS REAL?",
-            "author_name": "GamingBolt", "keywords": '["VICE","MAP"]', "voiceover_script": "hi"}
+    item = _bound({"id": "item_a35aead652d3", "download_path": str(cut), "cut_path": str(cut),
+                   "voiceover_audio_path": str(vo), "hook_text": "IS THIS REAL?",
+                   "author_name": "GamingBolt", "keywords": '["VICE","MAP"]', "voiceover_script": "hi"})
 
     def fake_variants(*a, **k):
         name = k["name"]
@@ -338,8 +351,8 @@ def test_render_previews_renders_every_preset_and_writes_the_readme(tmp_path):
 def test_render_previews_a_failed_preset_does_not_stop_the_others(tmp_path):
     cut = tmp_path / "cut.mp4"
     cut.write_bytes(b"0")
-    item = {"id": "i", "download_path": str(cut), "cut_path": str(cut),
-            "voiceover_audio_path": str(cut), "hook_text": "H", "author_name": "C"}
+    item = _bound({"id": "i", "download_path": str(cut), "cut_path": str(cut),
+                   "voiceover_audio_path": str(cut), "hook_text": "H", "author_name": "C"})
     calls = {"n": 0}
 
     def flaky(*a, **k):
@@ -373,9 +386,9 @@ def test_render_previews_reuses_the_hooks_stage_cut_words(tmp_path):
     cut.write_bytes(b"0")
     vo.write_bytes(b"0")
     words = [{"word": "VICE", "start": 0.1, "end": 0.5}]
-    item = {"id": "i", "download_path": str(cut), "cut_path": str(cut), "voiceover_audio_path": str(vo),
-            "hook_text": "H", "author_name": "C", "keywords": '["VICE","CITY","MAP"]',
-            "cut_start": 5.0, "cut_end": 25.0, "transcript_words": _verified_payload(words=words)}
+    item = _bound({"id": "i", "download_path": str(cut), "cut_path": str(cut), "voiceover_audio_path": str(vo),
+                   "hook_text": "H", "author_name": "C", "keywords": '["VICE","CITY","MAP"]',
+                   "cut_start": 5.0, "cut_end": 25.0, "transcript_words": _verified_payload(words=words)}, words)
 
     def ok_variants(*a, **k):
         subs = Path(a[7])

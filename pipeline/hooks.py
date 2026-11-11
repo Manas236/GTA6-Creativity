@@ -1,14 +1,25 @@
 """Stage 5: Gemini multimodal hook generation, authenticity classification, and grounding verification.
 
+Grounding (the hook describes THIS clip, not the source video):
+  * Gemini gets the transcript of the CUT segment only, 4 frames from the cut, the item's
+    authenticity tag (from the source channel) and the source title marked as context only, and
+    is told to reference nothing that is not said in the segment or visible in the frames.
+  * Every hook then gets two checks against the segment: a free keyword overlap with the segment
+    transcript (`segment_overlap_check`) and a short Gemini PASS/FAIL that may use only the
+    segment transcript and frames as evidence (`verify_hook_grounding`; the title is not evidence).
+  * A hook that FAILs is regenerated once, with the reason. If that one FAILs too the item goes to
+    `needs_review`: it is not rendered, and the Telegram approval flow shows the hook, the reason
+    and the segment transcript for a human to approve or reject. There is no silent fallback hook.
+  * The saved hook is stamped with the item + segment it was made for (pipeline.binding), so render
+    can refuse a hook that belongs to another item or an older window.
+
 Failure policy (no silent placeholders):
   * Gemini answers that are truncated (finishReason MAX_TOKENS), not valid JSON, or missing
     hook_text / voiceover_script raise GeminiError: that attempt failed, nothing is defaulted.
   * Calls are spaced to the free-tier limit (gemini.requests_per_minute) and an HTTP 429 is
     retried after the server's retryDelay.
   * A grounding check that errors (429, network, odd reply) means NOT grounded.
-  * Only when Gemini answered but the hook got `grounding_fail_limit` FAIL verdicts is the
-    fixed question hook used (saved with hook_grounded = 0).
-  * No valid Gemini hook after `max_attempts` -> the hooks stage is marked failed, and any
+  * No checked Gemini hook after `max_attempts` -> the hooks stage is marked failed, and any
     previously stored hook fields are cleared.
 """
 from __future__ import annotations
@@ -24,7 +35,7 @@ from typing import Any
 
 import requests
 
-from . import config, db, keywords
+from . import binding, config, db, keywords
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +49,8 @@ GEMINI_DEFAULTS: dict[str, Any] = {
     "rate_limit_retries": 2,
     "max_rate_limit_wait_s": 120,
     "max_attempts": 3,
-    "grounding_fail_limit": 2,
-    "fallback_hook": "IS THIS REALLY GTA 6?",
+    "grounding_fail_limit": 2,       # segment-check FAILs (first hook + one regeneration) before manual review
+    "fallback_hook": "IS THIS REALLY GTA 6?",   # no longer rendered silently; kept for old configs
 }
 FALLBACK_VOICEOVER = "Check out this crazy GTA 6 moment right now!"
 
@@ -260,6 +271,15 @@ def _call_gemini(
 # Hook generation + grounding
 # --------------------------------------------------------------------------------------
 
+def source_authenticity(item: dict[str, Any] | None, cfg: dict[str, Any] | None = None) -> str:
+    """The tag the SOURCE supports before any model looks at it: "official" only for a channel
+    listed in sources.official_channels (Rockstar, PlayStation, Xbox, ...), else "unverified"."""
+    cfg = cfg or config.get_config()
+    ids = set((((cfg.get("sources") or {}).get("official_channels") or {}).get("channel_ids")) or [])
+    channel = str((item or {}).get("channel_id") or "")
+    return "official" if channel and channel in ids else "unverified"
+
+
 def generate_hook_and_voiceover(
     video_path: Path | str,
     source_title: str,
@@ -267,32 +287,69 @@ def generate_hook_and_voiceover(
     model: str = "gemini-2.5-flash",
     api_key: str | None = None,
     cfg: dict[str, Any] | None = None,
+    *,
+    authenticity: str | None = None,
+    frames: list[bytes] | None = None,
+    segment: tuple[float, float] | None = None,
+    previous_failure: str = "",
 ) -> dict[str, Any]:
     """Generate hook, authenticity tag, voiceover line and keywords with one multimodal call.
 
+    `transcript_text` must be the transcript of the CUT segment (what viewers hear), not of the
+    whole source. `authenticity` is the tag the source supports (see `source_authenticity`): when
+    given, Gemini may only downgrade "official" to "unverified", never the other way round.
+    `frames` are the cut's sample frames (extracted here when None). `previous_failure` tells
+    Gemini why its last hook for this segment was rejected.
+
     Raises GeminiError when the answer is unusable; never substitutes defaults.
     """
-    sample_frames = extract_sample_frames(video_path, count=4)
+    sample_frames = extract_sample_frames(video_path, count=4) if frames is None else frames
 
-    prompt = f"""You are a content strategist for high-performing, authentic GTA 6 short-form vertical videos (Reels).
-Analyze these 4 sampled video frames, the source title, and audio transcript below.
+    clip_line = ""
+    if segment is not None:
+        a, b = float(segment[0]), float(segment[1])
+        clip_line = f"\nCLIP: {b - a:.1f} s cut from {a:.1f}-{b:.1f} s of the source video."
+    if authenticity in ("official", "unverified"):
+        auth_block = f"""AUTHENTICITY TAG: "{authenticity}" (set from the source channel: "official" = Rockstar Games or a platform holder's own channel; "unverified" = everyone else)
 
-SOURCE TITLE: "{source_title}"
-AUDIO TRANSCRIPT: "{transcript_text if transcript_text else '[No speech detected]'}"
-
-TASK 1: CLASSIFY AUTHENTICITY
+TASK 1: CONFIRM AUTHENTICITY
+- Return the tag above. You may change "official" to "unverified" if the frames clearly show a mod,
+  fan concept or anything that is not official footage. Never change "unverified" to "official"."""
+    else:
+        auth_block = """TASK 1: CLASSIFY AUTHENTICITY
 - "official": Footage is verified official Rockstar Games trailer, teaser, or platform upload (PlayStation/Xbox/Netflix).
 - "unverified": Footage is a leak, rumor, fan concept, GTA 5 mod, VR mod, or unconfirmed gameplay.
-(Rule: When in doubt or if creator-made, classify as "unverified".)
+(Rule: When in doubt or if creator-made, classify as "unverified".)"""
+    retry_block = ""
+    if previous_failure:
+        retry_block = f"""
+PREVIOUS ATTEMPT REJECTED: {previous_failure}
+Write a NEW hook and voiceover that only use what is said in the CLIP TRANSCRIPT or clearly visible in the frames.
+"""
+
+    prompt = f"""You are a content strategist for high-performing, authentic GTA 6 short-form vertical videos (Reels).
+You are writing for ONE short clip cut out of a longer source video. Viewers see ONLY this clip:
+the 4 frames are sampled from it and the CLIP TRANSCRIPT is every word spoken in it.{clip_line}
+
+CLIP TRANSCRIPT (this segment only): "{transcript_text if transcript_text else '[No speech detected]'}"
+SOURCE VIDEO TITLE (context only - it describes the WHOLE source video, most of which is NOT in this clip): "{source_title}"
+
+GROUNDING RULE (most important): the hook, the voiceover and the keywords may only refer to things
+that are said in the CLIP TRANSCRIPT or clearly visible in the frames. Never use a topic, name,
+number, feature or claim that appears only in the source title. If the clip itself says or shows
+nothing specific, write an honest generic question hook instead.
+{retry_block}
+{auth_block}
 
 TASK 2: WRITE HOOK
 - Hook style: Choose one of "curiosity", "question", or "hype_analysis".
 - Hook text: 1-2 short lines, ALL-CAPS, maximum 6-8 words. High impact, readable in 2 seconds.
+- It must describe what happens in THIS clip (see the grounding rule).
 - CRITICAL HONESTY RULE: If authenticity is "unverified", the hook MUST NOT claim this is confirmed real GTA 6! Frame it honestly as a question or speculation (e.g., "IS THIS REALLY GTA 6?", "COULD THIS LEAK BE REAL?"). Never deceive viewers.
 
 TASK 3: WRITE VOICEOVER LINE
 - Single punchy voiceover line of 3 to 6 seconds (around 10-18 spoken words).
-- Must play near the start of the video.
+- Must play near the start of the video and set up what THIS clip shows (grounding rule).
 - Conversational, high energy. If unverified, keep it speculative.
 
 TASK 4: PICK CAPTION KEYWORDS
@@ -335,6 +392,8 @@ Return ONLY a valid JSON object with EXACTLY this structure:
     auth = data.get("authenticity", "unverified")
     if auth not in ("official", "unverified"):
         auth = "unverified"
+    if authenticity == "unverified":
+        auth = "unverified"          # the source decides; a model can never upgrade it to official
 
     hook_style = data.get("hook_style", "question")
     if hook_style not in ("curiosity", "question", "hype_analysis"):
@@ -352,7 +411,8 @@ Return ONLY a valid JSON object with EXACTLY this structure:
     kw = keywords.clean_keywords(data.get("keywords"), cfg)
     kw_source = "gemini"
     if len(kw) < 3:
-        extra = keywords.rule_keywords(f"{transcript_text} {source_title} {hook_text}", cfg)
+        # Segment words only: a title word is not in the clip and must not be highlighted in it.
+        extra = keywords.rule_keywords(f"{transcript_text} {hook_text}", cfg)
         kw += [k for k in extra if k not in kw]
         kw = kw[:6]
         kw_source = "gemini+rules"
@@ -367,6 +427,56 @@ Return ONLY a valid JSON object with EXACTLY this structure:
     }
 
 
+#: Words a hook may use without the segment saying them: they claim nothing specific about the clip.
+_GENERIC_HOOK_WORDS = frozenset("""
+A AN THE AND OR BUT IF SO OF TO IN ON AT BY FOR FROM WITH WITHOUT INTO ONTO OUT UP DOWN OFF OVER
+IS ISN'T ARE AREN'T WAS WASN'T WERE BE BEEN BEING AM DO DOES DID DON'T DOESN'T DIDN'T CAN CAN'T
+COULD SHOULD WOULD WILL WON'T MIGHT MUST HAS HAVE HAD IT IT'S ITS THIS THAT THESE THOSE THERE HERE
+I YOU YOUR WE OUR THEY THEIR HE HIS SHE HER ME MY US THEM WHAT WHY HOW WHO WHERE WHEN WHICH
+GTA GTA6 GTAVI VI 6 GRAND THEFT AUTO GAME GAMES GAMEPLAY VIDEO CLIP FOOTAGE
+REALLY REAL ACTUALLY JUST EVEN EVER YET NOW STILL ALREADY FINALLY ONLY ALSO TOO VERY SO MUCH MORE
+MOST NEW BIG BIGGEST HUGE MASSIVE CRAZY CRAZIEST INSANE WILD BEST WORST GOOD BAD TRUE FAKE
+LEAK LEAKS LEAKED RUMOR RUMORS CONFIRMED OFFICIAL SECRET SECRETS HIDDEN DETAIL DETAILS THING THINGS
+MOMENT MOMENTS LOOK LOOKS SEE SEEN WATCH WAIT NOBODY EVERYONE ANYONE NOTICED MISSED KNOW KNEW
+CHANGE CHANGES CHANGED BACK COMING COME HAPPEN HAPPENED HAPPENING GOING GET GOT MAKE MADE ONE ALL
+""".split())
+
+
+def _stem(token: str) -> str:
+    t = token.lower().strip("'")
+    if t.endswith("ies") and len(t) > 4:
+        return t[:-3] + "y"
+    for suf in ("'s", "ing", "ed", "es", "s"):
+        if t.endswith(suf) and len(t) - len(suf) >= 3:
+            return t[: -len(suf)]
+    return t
+
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in re.findall(r"[A-Za-z0-9']+", str(text or "")) if t.strip("'")]
+
+
+def segment_overlap_check(hook_text: str, transcript_text: str) -> tuple[str, str]:
+    """Free, deterministic check of the hook against the SEGMENT transcript.
+
+    Returns ("PASS" | "FAIL" | "SKIP", reason). The hook's content words (not in the generic list)
+    must share at least one stem with the transcript. A hook with no content words claims nothing
+    specific and passes. Without speech there is nothing to compare: SKIP (the frames-based Gemini
+    check decides)."""
+    spoken = {_stem(t) for t in _tokens(transcript_text)}
+    if not spoken:
+        return "SKIP", "no speech in the segment"
+    content = [t.upper() for t in _tokens(hook_text)
+               if t.upper().strip("'") not in _GENERIC_HOOK_WORDS and (len(t) >= 3 or t.isdigit())]
+    if not content:
+        return "PASS", "generic hook: claims nothing specific"
+    hits = [t for t in content if _stem(t) in spoken]
+    if hits:
+        return "PASS", f"segment says {', '.join(dict.fromkeys(hits))}"
+    return "FAIL", (f"FAIL: none of the hook's words ({', '.join(dict.fromkeys(content))}) are said in "
+                    "this segment")
+
+
 def verify_hook_grounding(
     hook_text: str,
     authenticity: str,
@@ -375,26 +485,41 @@ def verify_hook_grounding(
     model: str = "gemini-2.5-flash",
     api_key: str | None = None,
     cfg: dict[str, Any] | None = None,
+    *,
+    frames: list[bytes] | None = None,
+    voiceover_script: str | None = None,
 ) -> tuple[bool, str]:
-    """Verification check call to Gemini ensuring hook is grounded and honest.
+    """Short Gemini PASS/FAIL: is the hook grounded in THIS segment, and honest?
 
-    Checks:
-    1. Does the clip/transcript actually show or discuss what the hook claims?
-    2. Does the hook falsely claim this is real GTA 6 when it is unverified?
+    Evidence is the segment transcript (and the cut's frames when given). The source title is
+    shown as context but is explicitly NOT evidence: it may describe another part of the video.
     Returns (passed, reason). reason starts with "FAIL" for a FAIL verdict and with
     "ERROR" when no verdict was obtained (429, network, unexpected reply) - both are
     NOT grounded.
     """
-    check_prompt = f"""You are a strict quality control auditor for short-form video hooks.
+    # The voiceover is not shown: with it, the checker judged hook-vs-voiceover wording instead of
+    # the clip (live run 2026-11-11). `voiceover_script` is accepted for call compatibility only.
+    frames_note = " and the attached frames from the clip" if frames else ""
+    check_prompt = f"""You are a strict fact checker for the hook of ONE short clip cut from a longer video.
+Judge ONLY against the CLIP TRANSCRIPT{frames_note}. The source title is NOT evidence: it describes
+the whole source video, and most of that is not in this clip. Text visible in the frames counts.
 
 HOOK CANDIDATE: "{hook_text}"
 AUTHENTICITY TAG: "{authenticity}" (official or unverified)
-SOURCE TITLE: "{source_title}"
-TRANSCRIPT: "{transcript_text if transcript_text else '[No speech]'}"
+CLIP TRANSCRIPT (this segment only): "{transcript_text if transcript_text else '[No speech]'}"
+SOURCE TITLE (context only, not evidence): "{source_title}"
 
 VERIFICATION RULES:
-1. Grounding: Does the clip/title/transcript actually show or discuss what the hook claims?
+1. Grounding: everything specific the hook claims - names, places, events, numbers,
+   features - is said in the CLIP TRANSCRIPT or clearly visible in the frames. A generic question
+   hook that claims nothing specific passes this rule. A question ABOUT a name, place or thing that
+   is said or shown in the clip passes too - the clip does not have to answer it. The transcript is
+   machine-made: a name that differs only in spelling, plural or possessive ("Camino's" / "CAMINOS")
+   is the same name. A hook about
+   something found only in the title, or not in this clip at all, FAILS. When the transcript is
+   [No speech], judge against the frames alone: a hook describing what the frames show passes.
 2. Honesty (STRICT): If AUTHENTICITY is "unverified", does the hook falsely claim or state as a confirmed fact that this is real GTA 6? (If it claims fake/modded/leak footage is confirmed GTA 6, that is a direct violation).
+Only these two rules decide. Style, tone, wording or punctuation are NOT reasons to FAIL.
 
 Respond with EXACTLY:
 PASS
@@ -402,7 +527,7 @@ or
 FAIL: <one-sentence specific reason>
 """
     try:
-        reply = _call_gemini(check_prompt, images=None, model=model, api_key=api_key, cfg=cfg)
+        reply = _call_gemini(check_prompt, images=frames or None, model=model, api_key=api_key, cfg=cfg)
     except Exception as e:
         log.warning("Hook verification call error (treated as NOT grounded): %s", _redact(e))
         return False, _redact(f"ERROR: grounding check failed: {e}")
@@ -421,6 +546,8 @@ def _clear_hook_fields(item_id: str, db_path: Any = None) -> None:
             """
             UPDATE items SET hook_style = NULL, hook_text = NULL, hook_grounded = 0,
                 authenticity = 'unverified', voiceover_script = NULL, keywords = NULL,
+                hook_binding = NULL, hook_review = NULL,
+                voiceover_audio_path = NULL, voiceover_binding = NULL,
                 updated_at = :now
             WHERE id = :id
             """,
@@ -476,22 +603,29 @@ def run_hooks_for_item(
         db.mark_failed(item_id, "hooks", reason, db_path=db_path)
         db.log_stage(item_id, "hooks", "failed", message=reason, db_path=db_path)
         return False, reason
-    transcript = " ".join(str(w.get("word", "")).strip() for w in words).strip()
+    transcript = binding.transcript_text(words)
     log.info("Cut transcript for %s: %d words", item_id, len(words))
 
+    # The tag the source channel supports; Gemini may only downgrade it.
+    source_tag = source_authenticity(item, cfg)
+    segment = (float(item.get("cut_start") or 0.0), float(item.get("cut_end") or 0.0))
+    frames = extract_sample_frames(cut_path, count=4)     # once: the generation and the check see the same frames
+
     max_attempts = max(1, int(gs["max_attempts"]))
-    fail_limit = max(1, int(gs["grounding_fail_limit"]))
+    fail_limit = max(1, int(gs["grounding_fail_limit"]))   # 2 = the first hook + one regeneration
     problems: list[str] = []
-    grounding_fails = 0
+    check_fails = 0
     final_data: dict[str, Any] | None = None
-    passed_grounding = False
-    used_fallback = False
+    final_reason = ""
+    rejected: list[dict[str, str]] = []                    # hooks that FAILed the segment check
+    previous_failure = ""
 
     for attempt in range(1, max_attempts + 1):
         log.info("Generating hook for item %s (attempt %d/%d)...", item_id, attempt, max_attempts)
         try:
             data = generate_hook_and_voiceover(
                 cut_path, source_title, transcript_text=transcript, model=model, cfg=cfg,
+                authenticity=source_tag, frames=frames, segment=segment, previous_failure=previous_failure,
             )
         except Exception as e:
             msg = _redact(f"attempt {attempt}: {type(e).__name__}: {e}")
@@ -499,34 +633,24 @@ def run_hooks_for_item(
             problems.append(msg)
             continue
 
-        is_grounded, reason = verify_hook_grounding(
-            data["hook_text"], data["authenticity"], source_title,
-            transcript_text=transcript, model=model, cfg=cfg,
+        ok, reason = check_hook_against_segment(
+            data, transcript, source_title, frames=frames, model=model, cfg=cfg,
         )
-        if is_grounded:
-            log.info("Hook passed verification: %s (%s)", data["hook_text"], data["authenticity"])
-            passed_grounding = True
-            final_data = data
+        if ok:
+            log.info("Hook passed the segment check: %s (%s) - %s", data["hook_text"], data["authenticity"], reason)
+            final_data, final_reason = data, reason
             break
 
         problems.append(f"attempt {attempt}: hook {data['hook_text']!r} not grounded: {reason}")
         if reason.startswith("FAIL"):
-            grounding_fails += 1
-            log.warning("Hook failed grounding (%d/%d): %s. Reason: %s",
-                        grounding_fails, fail_limit, data["hook_text"], reason)
-            if grounding_fails >= fail_limit:
-                # Gemini answered, but its hooks failed grounding: the designed fallback.
-                log.warning("Falling back to the plain question hook for item %s", item_id)
-                final_data = {
-                    "authenticity": "unverified",
-                    "hook_style": "question",
-                    "hook_text": str(gs["fallback_hook"]),
-                    "voiceover_script": FALLBACK_VOICEOVER,
-                    "keywords": keywords.rule_keywords(f"{transcript} {source_title}", cfg=cfg),
-                    "keywords_source": "rules",
-                }
-                used_fallback = True
-                break
+            check_fails += 1
+            rejected.append({"hook_text": data["hook_text"], "voiceover_script": data["voiceover_script"],
+                             "reason": reason})
+            log.warning("Hook failed the segment check (%d/%d): %s. Reason: %s",
+                        check_fails, fail_limit, data["hook_text"], reason)
+            if check_fails >= fail_limit:
+                return _send_to_review(item, data, rejected, transcript, words, db_path)
+            previous_failure = f'the hook "{data["hook_text"]}" was rejected: {reason}'
         else:
             log.warning("Hook not grounded (no verdict) on attempt %d: %s", attempt, reason)
 
@@ -537,17 +661,22 @@ def run_hooks_for_item(
         db.log_stage(item_id, "hooks", "failed", message=reason, db_path=db_path)
         return False, reason
 
-    # Save hook, authenticity and the C1 keyword cache to the database
+    # Save hook, authenticity, keywords and the segment record. The old voiceover wav was spoken
+    # from the previous script: drop it so the voiceover stage synthesizes this one.
     with db.db(db_path) as conn:
         conn.execute(
             """
             UPDATE items SET
                 hook_style = :hook_style,
                 hook_text = :hook_text,
-                hook_grounded = :hook_grounded,
+                hook_grounded = 1,
                 authenticity = :authenticity,
                 voiceover_script = :voiceover_script,
                 keywords = :keywords,
+                hook_binding = :hook_binding,
+                hook_review = NULL,
+                voiceover_audio_path = NULL,
+                voiceover_binding = NULL,
                 updated_at = :now
             WHERE id = :id
             """,
@@ -555,23 +684,96 @@ def run_hooks_for_item(
                 "id": item_id,
                 "hook_style": final_data["hook_style"],
                 "hook_text": final_data["hook_text"],
-                "hook_grounded": 1 if passed_grounding else 0,
                 "authenticity": final_data["authenticity"],
                 "voiceover_script": final_data["voiceover_script"],
                 "keywords": json.dumps(final_data.get("keywords") or []),
+                "hook_binding": binding.hook_record(item, final_data["hook_text"], final_data["voiceover_script"],
+                                                    transcript, "segment_check", final_reason),
                 "now": db.now(),
             },
         )
 
-    source = "fallback (grounding failed)" if used_fallback else "gemini"
     db.log_stage(
         item_id,
         "hooks",
-        "fallback" if used_fallback else "success",
+        "success",
         message=(
-            f"Hook: '{final_data['hook_text']}' [{final_data['authenticity']}, grounded={passed_grounding}, "
-            f"source={source}, keywords={final_data.get('keywords_source')}, transcript_words={len(words)}]"
+            f"Hook: '{final_data['hook_text']}' [{final_data['authenticity']} (source tag {source_tag}), "
+            f"segment {segment[0]:.2f}-{segment[1]:.2f}s, check: {final_reason}, source=gemini, "
+            f"regenerated={check_fails}, keywords={final_data.get('keywords_source')}, transcript_words={len(words)}]"
         ),
         db_path=db_path,
     )
-    return True, f"Hook generated [{final_data['authenticity']}, source={source}]"
+    return True, f"Hook generated [{final_data['authenticity']}, source=gemini]"
+
+
+def check_hook_against_segment(
+    data: dict[str, Any],
+    transcript: str,
+    source_title: str,
+    *,
+    frames: list[bytes] | None = None,
+    model: str = "gemini-2.5-flash",
+    cfg: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """The post-generation check: the free keyword overlap with the segment transcript first (a FAIL
+    there costs no Gemini call), then the short Gemini PASS/FAIL against the segment only.
+    Returns (passed, reason); reason starts with "FAIL" or "ERROR" when not passed."""
+    verdict, why = segment_overlap_check(data["hook_text"], transcript)
+    if verdict == "FAIL":
+        return False, why
+    ok, reason = verify_hook_grounding(
+        data["hook_text"], data["authenticity"], source_title, transcript_text=transcript, model=model,
+        cfg=cfg, frames=frames, voiceover_script=data.get("voiceover_script"),
+    )
+    return ok, (f"overlap {verdict.lower()} ({why}); gemini: {reason}" if ok else reason)
+
+
+def _send_to_review(
+    item: dict[str, Any],
+    data: dict[str, Any],
+    rejected: list[dict[str, str]],
+    transcript: str,
+    words: list[dict[str, Any]],
+    db_path: Any,
+) -> tuple[bool, str]:
+    """Two hooks failed the segment check: do NOT render. Keep the last candidate (bound to this
+    segment, check = needs_review, so render refuses it) and put the item in `needs_review`, where
+    the Telegram approval flow shows it to a human."""
+    item_id = item["id"]
+    reason = rejected[-1]["reason"] if rejected else "segment check failed"
+    review = {
+        "reason": reason,
+        "rejected": rejected,
+        "transcript_excerpt": transcript[:700],
+        "transcript_words": len(words),
+        "segment": [item.get("cut_start"), item.get("cut_end")],
+        "at": db.now(),
+    }
+    with db.db(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE items SET hook_style = :hook_style, hook_text = :hook_text, hook_grounded = 0,
+                authenticity = :authenticity, voiceover_script = :voiceover_script, keywords = :keywords,
+                hook_binding = :hook_binding, hook_review = :hook_review,
+                voiceover_audio_path = NULL, voiceover_binding = NULL, updated_at = :now
+            WHERE id = :id
+            """,
+            {
+                "id": item_id,
+                "hook_style": data["hook_style"],
+                "hook_text": data["hook_text"],
+                "authenticity": data["authenticity"],
+                "voiceover_script": data["voiceover_script"],
+                "keywords": json.dumps(data.get("keywords") or []),
+                "hook_binding": binding.hook_record(item, data["hook_text"], data["voiceover_script"],
+                                                    transcript, "needs_review", reason),
+                "hook_review": json.dumps(review),
+                "now": db.now(),
+            },
+        )
+    db.transition_stage(item_id, "needs_review", db_path=db_path)
+    msg = f"needs_review: {len(rejected)} hooks failed the segment check (last: {data['hook_text']!r}: {reason})"
+    db.log_stage(item_id, "hooks", "needs_review", message=msg, db_path=db_path)
+    log.warning("Item %s sent to manual review: %s", item_id, msg)
+    return False, msg

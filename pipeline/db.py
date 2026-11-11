@@ -17,6 +17,7 @@ STAGES = [
     "discovered",
     "downloaded",
     "cut",
+    "needs_review",   # the hook failed its segment check twice: a human decides on Telegram, nothing is rendered
     "rendered",
     "awaiting_approval",
     "approved",
@@ -68,6 +69,9 @@ CREATE TABLE IF NOT EXISTS items (
     transcript_words TEXT,                      -- JSON {cut_start, cut_end, model, words}: cut transcript cached by the hooks stage
     source_transcript TEXT,                     -- JSON {key, words, regions, wall_s}: the whole-source transcript (cut stage)
     preview_only INTEGER DEFAULT 0,             -- 1 = style-preview data only: triggers block approval/posting
+    hook_binding TEXT,                          -- JSON: the item + segment (+ transcript hash) the hook was made for (pipeline.binding)
+    voiceover_binding TEXT,                     -- JSON: the item + segment + script the VO wav was synthesized from
+    hook_review TEXT,                           -- JSON: why the hook went to manual review, and the decision
     voiceover_script TEXT,
     voiceover_audio_path TEXT,
     caption_text TEXT,
@@ -269,6 +273,11 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE items ADD COLUMN source_transcript TEXT")
         if "preview_only" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN preview_only INTEGER DEFAULT 0")
+        # Caption binding (pipeline.binding): rows from before it have none, so their hooks are
+        # regenerated for the item's current segment before they can be rendered.
+        for col in ("hook_binding", "voiceover_binding", "hook_review"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT")
         # Created after the migration: the trigger bodies reference items.preview_only.
         conn.executescript(PREVIEW_ONLY_TRIGGERS)
         if "ab_excluded" not in cols:

@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-from . import config, db
+from . import binding, config, db
 
 # kokoro_onnx and soundfile are imported lazily so the pipeline (and its tests) can be
 # imported on machines without the TTS stack installed.
@@ -119,8 +119,12 @@ def run_voiceover_for_item(
 
     with db.db(db_path) as conn:
         conn.execute(
-            "UPDATE items SET voiceover_audio_path = :path, updated_at = :now WHERE id = :id",
-            {"id": item_id, "path": str(out_path), "now": db.now()},
+            "UPDATE items SET voiceover_audio_path = :path, voiceover_binding = :vb, updated_at = :now "
+            "WHERE id = :id",
+            # Bound to the item, its segment and the script spoken: render refuses a wav made from
+            # another script (a hook regenerated after the VO, or the generic fallback line).
+            {"id": item_id, "path": str(out_path), "vb": binding.voiceover_record(item, script, out_path),
+             "now": db.now()},
         )
 
     db.log_stage(
