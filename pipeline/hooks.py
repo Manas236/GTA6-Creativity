@@ -4,9 +4,10 @@ Grounding (the hook describes THIS clip, not the source video):
   * Gemini gets the transcript of the CUT segment only, 4 frames from the cut, the item's
     authenticity tag (from the source channel) and the source title marked as context only, and
     is told to reference nothing that is not said in the segment or visible in the frames.
-  * Every hook then gets two checks against the segment: a free keyword overlap with the segment
-    transcript (`segment_overlap_check`) and a short Gemini PASS/FAIL that may use only the
-    segment transcript and frames as evidence (`verify_hook_grounding`; the title is not evidence).
+  * Every hook and voiceover line then gets checked against the segment: free claim-word and
+    content-word checks (`claim_check`, `segment_overlap_check`; lists and threshold in
+    config.yaml -> hook_check), then a short Gemini PASS/FAIL that may use only the segment
+    transcript and frames as evidence (`verify_hook_grounding`; the title is not evidence).
   * A hook that FAILs is regenerated once, with the reason. If that one FAILs too the item goes to
     `needs_review`: it is not rendered, and the Telegram approval flow shows the hook, the reason
     and the segment transcript for a human to approve or reject. There is no silent fallback hook.
@@ -320,6 +321,14 @@ TASK 1: CONFIRM AUTHENTICITY
 - "official": Footage is verified official Rockstar Games trailer, teaser, or platform upload (PlayStation/Xbox/Netflix).
 - "unverified": Footage is a leak, rumor, fan concept, GTA 5 mod, VR mod, or unconfirmed gameplay.
 (Rule: When in doubt or if creator-made, classify as "unverified".)"""
+    claim_list = ", ".join(w.upper() for w in hook_check_settings(cfg)["claim_words"])
+    if authenticity == "official":
+        claim_rule = (f"- CLAIM WORDS ({claim_list}): use one in the hook or the voiceover ONLY if the CLIP "
+                      "TRANSCRIPT itself says it. Never because the source title says it.")
+    else:
+        claim_rule = (f"- CLAIM WORDS ({claim_list}): if the authenticity tag is \"unverified\", never use any of "
+                      "them in the hook or the voiceover, even if the clip says them. If it is \"official\", use "
+                      "one only when the CLIP TRANSCRIPT itself says it.")
     retry_block = ""
     if previous_failure:
         retry_block = f"""
@@ -344,13 +353,17 @@ nothing specific, write an honest generic question hook instead.
 TASK 2: WRITE HOOK
 - Hook style: Choose one of "curiosity", "question", or "hype_analysis".
 - Hook text: 1-2 short lines, ALL-CAPS, maximum 6-8 words. High impact, readable in 2 seconds.
-- It must describe what happens in THIS clip (see the grounding rule).
-- CRITICAL HONESTY RULE: If authenticity is "unverified", the hook MUST NOT claim this is confirmed real GTA 6! Frame it honestly as a question or speculation (e.g., "IS THIS REALLY GTA 6?", "COULD THIS LEAK BE REAL?"). Never deceive viewers.
+- It must describe what happens in THIS clip (see the grounding rule): unless it is a generic question,
+  it uses at least 2 specific words (names, places, things) that are said in the CLIP TRANSCRIPT.
+- CRITICAL HONESTY RULE: If authenticity is "unverified", the hook MUST NOT claim this is confirmed real GTA 6! Frame it honestly as a question or speculation (e.g., "IS THIS REALLY GTA 6?", "WHAT IS LUCIA DOING IN VICE CITY?"). Never deceive viewers.
+{claim_rule}
 
 TASK 3: WRITE VOICEOVER LINE
 - Single punchy voiceover line of 3 to 6 seconds (around 10-18 spoken words).
 - Must play near the start of the video and set up what THIS clip shows (grounding rule).
-- Conversational, high energy. If unverified, keep it speculative.
+- Conversational, high energy. If unverified, keep it speculative. The claim-word rule above applies
+  to the voiceover too: never say someone "posted a leak" or that something was "confirmed" unless the
+  rule allows it.
 
 TASK 4: PICK CAPTION KEYWORDS
 - 3 to 6 single words that are the most important things said or shown in this clip
@@ -427,19 +440,24 @@ Return ONLY a valid JSON object with EXACTLY this structure:
     }
 
 
-#: Words a hook may use without the segment saying them: they claim nothing specific about the clip.
-_GENERIC_HOOK_WORDS = frozenset("""
-A AN THE AND OR BUT IF SO OF TO IN ON AT BY FOR FROM WITH WITHOUT INTO ONTO OUT UP DOWN OFF OVER
-IS ISN'T ARE AREN'T WAS WASN'T WERE BE BEEN BEING AM DO DOES DID DON'T DOESN'T DIDN'T CAN CAN'T
-COULD SHOULD WOULD WILL WON'T MIGHT MUST HAS HAVE HAD IT IT'S ITS THIS THAT THESE THOSE THERE HERE
-I YOU YOUR WE OUR THEY THEIR HE HIS SHE HER ME MY US THEM WHAT WHY HOW WHO WHERE WHEN WHICH
-GTA GTA6 GTAVI VI 6 GRAND THEFT AUTO GAME GAMES GAMEPLAY VIDEO CLIP FOOTAGE
-REALLY REAL ACTUALLY JUST EVEN EVER YET NOW STILL ALREADY FINALLY ONLY ALSO TOO VERY SO MUCH MORE
-MOST NEW BIG BIGGEST HUGE MASSIVE CRAZY CRAZIEST INSANE WILD BEST WORST GOOD BAD TRUE FAKE
-LEAK LEAKS LEAKED RUMOR RUMORS CONFIRMED OFFICIAL SECRET SECRETS HIDDEN DETAIL DETAILS THING THINGS
-MOMENT MOMENTS LOOK LOOKS SEE SEEN WATCH WAIT NOBODY EVERYONE ANYONE NOTICED MISSED KNOW KNEW
-CHANGE CHANGES CHANGED BACK COMING COME HAPPEN HAPPENED HAPPENING GOING GET GOT MAKE MADE ONE ALL
-""".split())
+#: config.yaml -> hook_check (the free checks every hook AND voiceover line gets against the segment).
+#: Defaults for an older config; the lists themselves live in config.yaml.
+HOOK_CHECK_DEFAULTS: dict[str, Any] = {
+    "min_shared_content_words": 2,
+    "single_word_lines_ok": True,
+    "generic_topic_words": ["gta", "vi", "6", "six", "game", "rockstar", "version", "trailer", "new", "video"],
+    "claim_words": ["leak", "leaked", "confirmed", "official", "real", "revealed", "insider", "exclusive", "proof"],
+    "stopwords": [],
+}
+
+
+def hook_check_settings(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = cfg if cfg is not None else config.get_config()
+    out = dict(HOOK_CHECK_DEFAULTS)
+    out.update({k: v for k, v in ((cfg.get("hook_check") or {}).items()) if v is not None})
+    for key in ("generic_topic_words", "claim_words", "stopwords"):
+        out[key] = [str(w).strip().lower().strip("'") for w in out.get(key) or [] if str(w).strip()]
+    return out
 
 
 def _stem(token: str) -> str:
@@ -456,25 +474,94 @@ def _tokens(text: str) -> list[str]:
     return [t for t in re.findall(r"[A-Za-z0-9']+", str(text or "")) if t.strip("'")]
 
 
-def segment_overlap_check(hook_text: str, transcript_text: str) -> tuple[str, str]:
-    """Free, deterministic check of the hook against the SEGMENT transcript.
+def _claim_match(token: str, claim: str) -> bool:
+    """Same stem ("leaked" ~ "leak"), or a longer form of a claim of 5+ letters ("officially" ~
+    "official"). Short claims match by stem only, so "really" is not "real"."""
+    ts, cs = _stem(token), _stem(claim)
+    return ts == cs or (len(cs) >= 5 and ts.startswith(cs))
 
-    Returns ("PASS" | "FAIL" | "SKIP", reason). The hook's content words (not in the generic list)
-    must share at least one stem with the transcript. A hook with no content words claims nothing
-    specific and passes. Without speech there is nothing to compare: SKIP (the frames-based Gemini
-    check decides)."""
+
+def claim_words_in(text: str, cfg: dict[str, Any] | None = None) -> list[str]:
+    """The claim words (config hook_check.claim_words) used in `text`, as written there, in order."""
+    claims = hook_check_settings(cfg)["claim_words"]
+    found: list[str] = []
+    for t in _tokens(text):
+        if any(_claim_match(t, c) for c in claims) and t.upper() not in found:
+            found.append(t.upper())
+    return found
+
+
+def content_words(text: str, cfg: dict[str, Any] | None = None) -> list[str]:
+    """The words of a hook / voiceover line that say something specific about the clip: what is left
+    after the stopwords, the generic topic words (GTA, 6, TRAILER, VERSION...) and the claim words
+    (judged separately by `claim_check`). One entry per stem, upper-case, in order."""
+    hc = hook_check_settings(cfg)
+    stop = set(hc["stopwords"])
+    topic = set(hc["generic_topic_words"])
+    topic_stems = {_stem(w) for w in topic}
+    claims = hc["claim_words"]
+    out: dict[str, str] = {}
+    for t in _tokens(text):
+        low = t.lower().strip("'")
+        if low in stop or low in topic or _stem(low) in topic_stems:
+            continue
+        if any(_claim_match(low, c) for c in claims):
+            continue
+        if len(low) < 3 and not low.isdigit():
+            continue
+        out.setdefault(_stem(low), t.upper())
+    return list(out.values())
+
+
+def segment_overlap_check(hook_text: str, transcript_text: str, cfg: dict[str, Any] | None = None,
+                          *, label: str = "hook") -> tuple[str, str]:
+    """Free, deterministic check of a hook (or voiceover line) against the SEGMENT transcript.
+
+    Returns ("PASS" | "FAIL" | "SKIP", reason). The line's content words (`content_words`) must share
+    at least `hook_check.min_shared_content_words` (2) stems with the transcript; a line with only one
+    content word needs that one (unless `single_word_lines_ok` is false). A line with no content words
+    claims nothing specific and passes. Without speech there is nothing to compare: SKIP (the
+    frames-based Gemini check decides)."""
+    hc = hook_check_settings(cfg)
     spoken = {_stem(t) for t in _tokens(transcript_text)}
     if not spoken:
         return "SKIP", "no speech in the segment"
-    content = [t.upper() for t in _tokens(hook_text)
-               if t.upper().strip("'") not in _GENERIC_HOOK_WORDS and (len(t) >= 3 or t.isdigit())]
+    content = content_words(hook_text, cfg)
     if not content:
-        return "PASS", "generic hook: claims nothing specific"
+        return "PASS", f"generic {label}: claims nothing specific"
+    need = max(1, int(hc["min_shared_content_words"]))
+    if hc.get("single_word_lines_ok", True):
+        need = min(need, len(content))
     hits = [t for t in content if _stem(t) in spoken]
-    if hits:
-        return "PASS", f"segment says {', '.join(dict.fromkeys(hits))}"
-    return "FAIL", (f"FAIL: none of the hook's words ({', '.join(dict.fromkeys(content))}) are said in "
-                    "this segment")
+    if len(hits) >= need:
+        return "PASS", f"segment says {', '.join(hits)}"
+    missing = [t for t in content if t not in hits]
+    return "FAIL", (f"FAIL: the {label} shares {len(hits)} of the {need} content words it needs with this segment "
+                    f"(said: {', '.join(hits) or 'none'}; not said: {', '.join(missing)})")
+
+
+def claim_check(text: str, transcript_text: str, authenticity: str, cfg: dict[str, Any] | None = None,
+                *, label: str = "hook") -> tuple[str, str]:
+    """Claim words (leak, confirmed, official, real, ...) in a hook or voiceover line.
+
+    Returns ("PASS" | "FAIL", reason). An UNVERIFIED item never gets one, even when the segment says
+    it (its hook stays a question). An OFFICIAL item may use one only when the segment transcript
+    itself makes that claim (the same word or stem is said in it)."""
+    claims = hook_check_settings(cfg)["claim_words"]
+    used = claim_words_in(text, cfg)
+    if not used:
+        return "PASS", "no claim words"
+    if authenticity != "official":
+        return "FAIL", (f"FAIL: the {label} uses the claim word(s) {', '.join(used)}, and this clip is unverified: "
+                        "an unverified clip never states a leak, confirmation or reveal as fact - write a question "
+                        f"without these words: {', '.join(claims)}")
+    seg = _tokens(transcript_text)
+    unsupported = [u for u in used
+                   if not any(_claim_match(s, c) for s in seg for c in claims if _claim_match(u, c))]
+    if unsupported:
+        return "FAIL", (f"FAIL: the {label} claims {', '.join(unsupported)}, but the segment itself never says so "
+                        "(the source title is not evidence)")
+    return "PASS", f"claim(s) {', '.join(used)} made in the segment itself"
 
 
 def verify_hook_grounding(
@@ -716,17 +803,27 @@ def check_hook_against_segment(
     model: str = "gemini-2.5-flash",
     cfg: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """The post-generation check: the free keyword overlap with the segment transcript first (a FAIL
-    there costs no Gemini call), then the short Gemini PASS/FAIL against the segment only.
-    Returns (passed, reason); reason starts with "FAIL" or "ERROR" when not passed."""
-    verdict, why = segment_overlap_check(data["hook_text"], transcript)
-    if verdict == "FAIL":
-        return False, why
+    """The post-generation check. First the free ones (a FAIL there costs no Gemini call), on the hook
+    AND the voiceover line: claim words (`claim_check`), then the content-word overlap with the
+    segment transcript (`segment_overlap_check`). Then the short Gemini PASS/FAIL against the segment
+    only. Returns (passed, reason); reason starts with "FAIL" or "ERROR" when not passed.
+    A Gemini outage (GeminiTransientError) propagates: it is not a verdict."""
+    lines = (("hook", data["hook_text"]), ("voiceover", data.get("voiceover_script") or ""))
+    for label, text in lines:
+        verdict, why = claim_check(text, transcript, data.get("authenticity") or "unverified", cfg, label=label)
+        if verdict == "FAIL":
+            return False, why
+    notes: list[str] = []
+    for label, text in lines:
+        verdict, why = segment_overlap_check(text, transcript, cfg, label=label)
+        if verdict == "FAIL":
+            return False, why
+        notes.append(f"{label} {verdict.lower()} ({why})")
     ok, reason = verify_hook_grounding(
         data["hook_text"], data["authenticity"], source_title, transcript_text=transcript, model=model,
         cfg=cfg, frames=frames, voiceover_script=data.get("voiceover_script"),
     )
-    return ok, (f"overlap {verdict.lower()} ({why}); gemini: {reason}" if ok else reason)
+    return ok, (f"overlap {'; '.join(notes)}; gemini: {reason}" if ok else reason)
 
 
 def _send_to_review(

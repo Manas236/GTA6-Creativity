@@ -312,7 +312,9 @@ def test_off_segment_hook_fails_the_overlap_check_and_is_regenerated_once_with_t
 
 @pytest.mark.parametrize("hook,transcript,verdict", [
     ("IS LUCIA BACK IN VICE CITY?", "Lucia drives through Vice City.", "PASS"),
-    ("BANK HEISTS ARE BACK?", "you can rob banks again", "PASS"),           # stems: BANK ~ banks
+    ("BANK HEISTS ARE BACK?", "you can rob banks again", "FAIL"),           # 1 of 2 content words said (was PASS: 1 was enough)
+    ("BANK HEISTS ARE BACK?", "you can rob banks and do heists again", "PASS"),  # stems: BANK ~ banks, HEISTS ~ heists
+    ("WHO IS LUCIA?", "Lucia drives through Vice City.", "PASS"),           # one content word, and it is said
     ("ONLINE MULTIPLAYER LEAKED?", "Lucia drives through Vice City.", "FAIL"),
     ("IS THIS REALLY GTA 6?", "Lucia drives through Vice City.", "PASS"),   # generic: claims nothing
     ("IS LUCIA BACK?", "", "SKIP"),                                          # no speech: Gemini + frames decide

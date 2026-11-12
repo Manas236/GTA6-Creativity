@@ -166,6 +166,36 @@ gemini:
   grounding_fail_limit: 2
   fallback_hook: "IS THIS REALLY GTA 6?" # no longer rendered silently (kept for old configs)
 
+# Free checks every hook AND voiceover line gets against the CUT SEGMENT's transcript before the
+# Gemini PASS/FAIL (pipeline/hooks.py). A FAIL is regenerated once with the reason, then the item
+# goes to needs_review. Lists are lower-case; a word matches with simple stemming (plural, -ed, -ing).
+# PLAN.md calls #173-#176.
+hook_check:
+  # Overlap: the line's content words (what is left after stopwords, generic_topic_words and
+  # claim_words) must share at least this many with the segment transcript. The Tridzo hook
+  # "LEAKED ..." passed on ONE shared word ("VERSION"); that is now generic and the bar is 2.
+  min_shared_content_words: 2
+  single_word_lines_ok: true # a line with only ONE content word passes if the segment says it ("WHO IS LUCIA?"); false = 2 always
+  generic_topic_words: [gta, vi, "6", six, game, rockstar, version, trailer, new, video,
+                        gta6, gtavi, grand, theft, auto, games, gameplay, clip, footage]
+  # Claim words in the hook or the voiceover pass only for an OFFICIAL item whose segment transcript
+  # itself makes that claim (same word or stem). An UNVERIFIED item never gets one, even if the
+  # segment says it: its hook stays a question.
+  claim_words: [leak, leaked, confirmed, official, real, revealed, insider, exclusive, proof]
+  stopwords: [a, an, the, and, or, but, if, so, of, to, in, on, at, by, for, from, with, without, into,
+              onto, out, up, down, off, over, is, "isn't", are, "aren't", was, "wasn't", were, be, been,
+              being, am, do, does, did, "don't", "doesn't", "didn't", can, "can't", could, should, would,
+              will, "won't", might, must, has, have, had, it, "it's", its, this, that, these, those, there,
+              here, i, you, your, we, our, they, their, he, his, she, her, me, my, us, them, what, why, how,
+              who, where, when, which, "i'm", "you're", "he's", "she's", "we're", "they're", "that's",
+              "what's", "there's", "here's", "let's", "who's", "i'll", "you'll", "we'll", "they'll", "i've",
+              "you've", "we've", "they've", gonna, wanna, really, actually, just, even, ever, yet, now,
+              still, already, finally, only, also, too, very, much, more, most, big, biggest, huge, massive,
+              crazy, craziest, insane, wild, best, worst, good, bad, true, fake, rumor, rumors, secret,
+              secrets, hidden, detail, details, thing, things, moment, moments, look, looks, see, seen,
+              watch, wait, nobody, everyone, anyone, noticed, missed, know, knew, change, changes, changed,
+              back, coming, come, happen, happened, happening, going, get, got, make, made, one, all]
+
 render:
   width: 1080
   height: 1920
