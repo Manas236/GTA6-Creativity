@@ -20,7 +20,8 @@ from typing import Any, Sequence
 from . import audio_mix, config, edits, keywords as kwmod, overlay, style
 from .cut import audio_envelope, extract_audio_loudness_profile, extract_scene_cuts, snap_end_to_pause
 from . import endings
-from .rendercore import ascent_px, cap_height_px, descent_px, layout_hook, media_duration, render_settings
+from .rendercore import (ascent_px, cap_height_px, descent_px, layout_hook, media_duration, render_settings,
+                         text_width_px)
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +104,7 @@ class StylePlan:
                 "hook_ink": self.layout.hook_ink,
                 "credit": (self.layout.credit_x, self.layout.credit_y),
                 "credit_ink": self.layout.credit_ink,
+                "progress_y": self.layout.progress_y,
                 "video_edges": self.layout.video_edges,
             },
             "notes": self.notes + self.layout.notes,
@@ -308,8 +310,12 @@ def build_style_plan(
     keyword_list: Sequence[str] | None = None,
     cfg: dict[str, Any] | None = None,
     preset: str | None = None,
+    occupancy: Any = None,
 ) -> StylePlan:
-    """Resolve one variant's plan on the OUTPUT timeline (freeze offset included)."""
+    """Resolve one variant's plan on the OUTPUT timeline (freeze offset included).
+
+    `occupancy`: text burned into the source (pipeline.textdetect), so the layout keeps our captions,
+    credit and progress bar off it. Raises style.SourceTextCollision when there is no clear place."""
     cfg = cfg if cfg is not None else config.get_config()
     rs = render_settings(cfg)
     ss = style.style_settings(cfg)
@@ -364,10 +370,17 @@ def build_style_plan(
     # --- text placement after F1 -----------------------------------------------------
     hook_lines, hook_size = layout_hook(hook_text, rs)
     caption_scale = (float(ss["caption_pop"]["peak_scale"]) / 100.0) if flags["caption_pop"] else 1.0
+    credit_w = None
+    if occupancy is not None and flags["credit_tag"]:
+        ct = ss["credit_tag"]
+        credit_w = (text_width_px(overlay.credit_text(channel_name, ss), float(ct["font_size"]), rs["font_path"])
+                    + 2.0 * float(ct["outline"]) + float(ct["shadow"]))
     layout = style.plan_layout(
         edits.segment_modes(segments) if flags["zoom_fill"] else ["fit"],
         hook_size, max(1, len(hook_lines)), rs, ss, cap_height_px,
         caption_scale=caption_scale, text_box_px=_text_box_px,
+        occupancy=occupancy, captions=bool(words_out), credit=flags["credit_tag"],
+        progress=flags["progress_bar"], credit_width_px=credit_w,
     )
 
     # --- C1 / C2 ---------------------------------------------------------------------
@@ -458,6 +471,7 @@ def plan_from_words(
     channel_name: str = "",
     keyword_list: Sequence[str] | None = None,
     speech_peak_db: float = -6.0,
+    occupancy: Any = None,
 ) -> StylePlan:
     """Build a StylePlan without touching media - for tests, previews and contact sheets.
 
@@ -483,7 +497,7 @@ def plan_from_words(
     )
     sp = build_style_plan(
         analysis, hook_text, freeze_s=freeze_s, vo_words=vo_words, cfg=cfg, preset=preset,
-        channel_name=channel_name, keyword_list=keyword_list,
+        channel_name=channel_name, keyword_list=keyword_list, occupancy=occupancy,
     )
     if punches is not None:
         sp.punches = list(punches)

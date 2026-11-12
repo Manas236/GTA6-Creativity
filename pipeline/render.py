@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import audio_mix, binding, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, voiceover
+from . import audio_mix, binding, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, textdetect, voiceover
 from .binding import CaptionMismatchError
 from .cut import audio_envelope, extract_audio_loudness_profile, snap_end_to_pause
 from . import endings, transcribe
@@ -318,7 +318,8 @@ def build_ass_subtitles(
     if _flag(sp, "credit_tag"):
         events.append(overlay.credit_event(sp.channel_name, video_duration, sp.layout, ss, format_ass_timestamp))
     if _flag(sp, "progress_bar"):
-        events.append(overlay.progress_bar_event(video_duration, rs, ss, format_ass_timestamp))
+        events.append(overlay.progress_bar_event(video_duration, rs, ss, format_ass_timestamp,
+                                                 y=int(getattr(sp.layout, "progress_y", 0) or 0)))
 
     return header + "\n".join(events) + "\n"
 
@@ -779,6 +780,30 @@ def snap_render_end(
     )
 
 
+def source_text_override(item: dict[str, Any] | None) -> bool:
+    """True when a human looked at this item's source_text_collision on Telegram and chose to render
+    it anyway: then the layout ignores the source's text (today's layout)."""
+    try:
+        review = json.loads((item or {}).get("hook_review") or "{}") or {}
+    except (TypeError, ValueError):
+        return False
+    return review.get("kind") == "source_text_collision" and review.get("decision") == "render_anyway"
+
+
+def send_collision_to_review(item: dict[str, Any], err: Exception, db_path: Any = None) -> str:
+    """No clear place for our captions/credit: the item goes to needs_review (reason
+    source_text_collision) instead of rendering text over the source's own text."""
+    reason = str(err) if str(err).startswith("source_text_collision") else f"source_text_collision: {err}"
+    review = {"kind": "source_text_collision", "reason": reason, "details": getattr(err, "details", {}),
+              "segment": [item.get("cut_start"), item.get("cut_end")], "at": db.now()}
+    db.transition_stage(item["id"], "needs_review", extra_fields={"hook_review": json.dumps(review, default=str)},
+                        db_path=db_path)
+    msg = f"needs_review: {reason}"
+    db.log_stage(item["id"], "render", "needs_review", message=msg[:1000], db_path=db_path)
+    log.warning("Item %s sent to manual review: %s", item["id"], msg)
+    return msg
+
+
 def assert_item_caption_binding(
     item: dict[str, Any],
     hook_text: str,
@@ -845,13 +870,21 @@ def render_item_variants(
     vo_dur = media_duration(vo_path)
     freeze_s = freeze_duration(vo_dur, cfg)
 
+    # Text burned into the source where our captions / credit / progress bar go (calls #184-#187).
+    # A human who saw the collision on Telegram and chose "render anyway" gets today's layout.
+    occupancy = None
+    if Path(str(cut_path)).exists() and not source_text_override(item):
+        flags = style.resolve_preset(preset_name, cfg)
+        occupancy = textdetect.detect_source_text(cut_path, analysis.end_s, analysis.segments, cfg,
+                                                  zoom_fill=flags["zoom_fill"])
+
     plan_a = planning.build_style_plan(
         analysis, hook_text, variant="A", freeze_s=0.0, cfg=cfg, preset=preset_name,
-        channel_name=channel_name, keyword_list=keyword_list,
+        channel_name=channel_name, keyword_list=keyword_list, occupancy=occupancy,
     )
     plan_b = planning.build_style_plan(
         analysis, hook_text, variant="B", freeze_s=freeze_s, vo_words=vo_words, cfg=cfg,
-        preset=preset_name, channel_name=channel_name, keyword_list=keyword_list,
+        preset=preset_name, channel_name=channel_name, keyword_list=keyword_list, occupancy=occupancy,
     )
     content_s = plan_a.content_s
 
@@ -898,7 +931,10 @@ def render_item_variants(
         # The exact words burned in as captions (B: the VO words during the freeze, then speech).
         "caption_words_a": [str(w["word"]) for w in plan_a.words],
         "caption_words_b": [str(w["word"]) for w in plan_b.words],
+        "caption_times_a": [(str(w["word"]), round(float(w["start"]), 3), round(float(w["end"]), 3))
+                            for w in plan_a.words],
         "style_b": plan_b.summary(),
+        "source_text": occupancy.summary() if occupancy is not None else None,
     }
 
 
@@ -1008,6 +1044,8 @@ def run_render_item(
             clean_cut_end=cut_end_verified(item, tkey),
             item=item,
         )
+    except style.SourceTextCollision as e:
+        return False, send_collision_to_review(item, e, db_path), {}
     except (RenderVerificationError, endings.NoCleanEnding, CaptionMismatchError) as e:
         db.mark_failed(item_id, "render", str(e), db_path=db_path)
         db.log_stage(item_id, "render", "failure", message=str(e), db_path=db_path)

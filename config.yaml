@@ -260,6 +260,25 @@ render:
     # (transcribe.speech_check region settings), at render time:
     min_speech_ratio: 0.25 # speech share of the cut below this -> NO word captions (hook only; VO captions in B stay), logged
     max_outside_speech_s: 1.0 # a caption line with any word further than this from a speech region is dropped
+  # Text burned into the source (pipeline/textdetect.py, PLAN.md calls #184-#187): ~8 frames of the cut,
+  # framed exactly as the render frames them (zoom-to-fill), are searched for text lines with free
+  # OpenCV heuristics. Where text sits in our caption band / credit / progress bar, ours moves to the
+  # nearest clear place in the safe area (not over the hook); no clear place -> needs_review
+  # (reason source_text_collision). A clip with no source text keeps today's layout exactly.
+  source_text:
+    enabled: true
+    samples: 8 # frames across the content; the first at the very start (Variant B freezes it)
+    min_frames: 2 # a pixel is source text when a text line covered it in >= this many samples (GamingBolt's chapter title: 2 of 8)
+    min_area_px: 2500 # source-text pixels inside one of our boxes before it counts as occupied (~a 25 px line, 100 px wide)
+    margin_px: 10 # our boxes are grown by this much for the test
+    edge_min: 48 # gradient threshold floor (0-255) for letter edges
+    close_w_px: 21 # horizontal closing that joins the letters and words of a line
+    line_min_h: 16 # a text line is this tall (output px)...
+    line_max_h: 140
+    line_min_aspect: 2.2 # ...at least this many times as wide as tall...
+    min_chars: 3 # ...with at least this many letter-like parts...
+    char_height_spread: 0.35 # ...of similar height (fraction of the median)...
+    baseline_spread: 0.25 # ...on one baseline (fraction of the median height)
   hook:
     font_size: 150
     min_font_size: 96 # only used if a hook cannot fit 2 lines inside the safe width

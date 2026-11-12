@@ -71,7 +71,8 @@ class ItemResult:
     ending_words: str = ""
     replaces: str = ""                 # the item this one was swapped in for
     hook_note: str = ""                # reused / regenerated for this segment, and the check result
-    needs_review: bool = False         # the hook failed the segment check twice: not rendered
+    needs_review: bool = False         # the hook failed the segment check twice, or source text: not rendered
+    review_reason: str = ""            # set when needs_review came from the layout (source_text_collision)
 
 
 # --------------------------------------------------------------------------------------
@@ -320,6 +321,12 @@ def render_item(
                 channel_name=channel, keyword_list=result.keywords, clean_cut_end=clean_cut_end,
                 item=item,
             )
+        except style.SourceTextCollision as e:
+            # The pipeline would send it to needs_review (reason source_text_collision); not rendered.
+            log.error("  %s NOT RENDERED (needs_review): %s", preset, e)
+            result.renders[preset] = {"ok": False, "error": f"needs_review: {e}"}
+            result.needs_review, result.review_reason = True, str(e)
+            continue
         except (render.RenderVerificationError, endings.NoCleanEnding, render.CaptionMismatchError) as e:
             log.error("  %s FAILED: %s", preset, e)
             result.renders[preset] = {"ok": False, "error": str(e)}
@@ -345,6 +352,11 @@ def render_item(
             "freeze_s": res.get("freeze_s"),
             "sfx": {"A": (res.get("style_a") or {}).get("sfx", []),
                     "B": (res.get("style_b") or {}).get("sfx", [])},
+            # Where our text went and what it avoided (Fix 3/4 checks in verify_previews / by eye).
+            "layout": {"A": (res.get("style_a") or {}).get("layout"), "B": (res.get("style_b") or {}).get("layout")},
+            "notes": {"A": (res.get("style_a") or {}).get("notes"), "B": (res.get("style_b") or {}).get("notes")},
+            "source_text": res.get("source_text"),
+            "caption_times_a": res.get("caption_times_a") or [],
         }, indent=1, default=str), encoding="utf-8")
         print(f"    {preset}_A.mp4  {res['probe_a']['video_duration']:6.2f} s  "
               f"rendered in {res['elapsed_a_s']:6.1f} s")
@@ -447,7 +459,9 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
         lines.append(f"{r.item_id}" + (f"  (swapped in for {r.replaces}: no_clean_ending)" if r.replaces else ""))
         lines.append(f"  channel  : {r.channel}")
         lines.append(f"  hook     : {r.hook}" + (f"  ({r.hook_note})" if r.hook_note else ""))
-        if r.needs_review:
+        if r.needs_review and r.review_reason:
+            lines.append(f"  LAYOUT   : needs_review (not rendered): {r.review_reason[:200]}")
+        elif r.needs_review:
             lines.append("  HOOK     : failed the segment check twice -> needs_review (not rendered)")
         sel = r.selection
         if sel.get("start") is not None:
@@ -472,6 +486,10 @@ def write_readme(out_root: Path, results: Sequence[ItemResult], presets: Sequenc
                     f"  {preset}: A {info['a_s']:.2f}s ({info['elapsed_a_s']:.1f}s to render), "
                     f"B {info['b_s']:.2f}s ({info['elapsed_b_s']:.1f}s)"
                 )
+                # Captions gated under music / text moved off the source's own text (Fix 3/4).
+                for note in ((info.get("style_a") or {}).get("notes") or []):
+                    if any(k in note for k in ("captions off", "caption lines dropped", "moved", "source text")):
+                        lines.append(f"      {note[:180]}")
             else:
                 lines.append(f"  {preset}: FAILED - {info.get('error')}")
         for v, g in r.grids.items():

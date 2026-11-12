@@ -90,13 +90,14 @@ def progress_bar_style(rs: dict[str, Any], ss: dict[str, Any]) -> str:
     )
 
 
-def progress_bar_event(duration: float, rs: dict[str, Any], ss: dict[str, Any], timestamp: Any) -> str:
-    """One event: a W x height_px rectangle anchored top-left, \\fscx 0 -> 100 over the clip."""
+def progress_bar_event(duration: float, rs: dict[str, Any], ss: dict[str, Any], timestamp: Any, y: int = 0) -> str:
+    """One event: a W x height_px rectangle anchored top-left at (0, y), \\fscx 0 -> 100 over the clip.
+    `y` is 0 (the canvas top edge) unless source text sits there (style.Layout.progress_y)."""
     pb = ss["progress_bar"]
     w, h = int(rs["width"]), int(pb["height_px"])
     ms = max(1, int(round(float(duration) * 1000)))
     tags = (
-        f"{{\\an7\\pos(0,0)\\bord0\\shad0\\1c{pb['color'].replace('&H00', '&H')}"
+        f"{{\\an7\\pos(0,{int(y)})\\bord0\\shad0\\1c{pb['color'].replace('&H00', '&H')}"
         f"\\fscx0\\fscy100\\t(0,{ms},\\fscx100)\\p1}}"
     )
     return (

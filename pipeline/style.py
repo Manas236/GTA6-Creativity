@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -287,6 +288,15 @@ def fill_geometry(rs: dict[str, Any], ss: dict[str, Any]) -> FillGeometry:
 # Safe-area placement after F1
 # --------------------------------------------------------------------------------------
 
+class SourceTextCollision(RuntimeError):
+    """No clear place inside the safe area for our captions or credit: text burned into the source is
+    there (pipeline.textdetect). The item goes to needs_review with reason source_text_collision."""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
 @dataclass
 class Layout:
     """Where the text sits once F1 has changed the video band."""
@@ -300,6 +310,7 @@ class Layout:
     credit_ink: tuple[int, int] = (0, 0)
     video_edges: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    progress_y: int = 0                # top of the C3 progress bar (0 = the canvas top edge)
 
 
 def _clear_of_edges(y0: float, y1: float, edges: list[int], clearance: float) -> bool:
@@ -324,6 +335,12 @@ def plan_layout(
     cap_height_px: Any,
     caption_scale: float = 1.0,
     text_box_px: Any = None,
+    *,
+    occupancy: Any = None,
+    captions: bool = True,
+    credit: bool = True,
+    progress: bool = True,
+    credit_width_px: float | None = None,
 ) -> Layout:
     """Place captions, the hook band and the credit tag so that, for every framing mode
     the clip uses, the ink stays inside the safe area and never sits on a video edge.
@@ -333,6 +350,13 @@ def plan_layout(
     pipeline.rendercore to avoid an import cycle. `caption_scale` is the largest
     transient caption scale - M1's pop peaks at 115%, and that peak must respect the
     safe area too, not just the settled 100%.
+
+    `occupancy` (pipeline.textdetect.Occupancy): text burned into the source, on the output canvas.
+    When it covers the caption box, the captions move to the nearest clear centre inside the safe
+    area that clears the video edges and the hook; the credit tag (left-aligned, `credit_width_px`
+    wide) and the progress bar move the same way. `captions` / `credit` / `progress` say which of
+    them this render draws. No clear place for the captions or the credit -> SourceTextCollision.
+    Without occupancy (or with none of our boxes covered) the layout is exactly what it was.
     """
     sa = rs["safe_area"]
     cap, hk = rs["caption"], rs["hook"]
@@ -378,6 +402,29 @@ def plan_layout(
         notes.append(f"hook block ({2 * block_half:.0f}px) does not fit above y={bottom_limit:.0f}; kept band centre")
     hook_ink = (int(round(hook_y - block_half)), int(round(hook_y + block_half)))
 
+    # --- source text (pipeline.textdetect): move the captions off it ------------------
+    occ = occupancy if occupancy is not None and not getattr(occupancy, "empty", True) else None
+    text_gap = float(ss["credit_tag"]["gap_from_caption_px"])
+    x0_sa, x1_sa = float(sa["x_min"]), float(sa["x_max"])
+    if occ is not None:
+        hits = [b for b in getattr(occ, "boxes", [])][:6]
+        if hook_lines and occ.occupied(x0_sa, hook_ink[0], x1_sa, hook_ink[1]):
+            notes.append(f"source text under the hook band {hook_ink} (hook kept: no rule moves it) {hits}")
+        if captions and occ.occupied(x0_sa, cap_ink[0], x1_sa, cap_ink[1]):
+            def caption_ok(c: int) -> bool:
+                y0, y1 = c - cap_half, c + cap_half
+                return (_clear_of_edges(y0, y1, edges, clearance)
+                        and (y1 + text_gap <= hook_ink[0] or y0 - text_gap >= hook_ink[1])
+                        and not occ.occupied(x0_sa, y0, x1_sa, y1))
+            new_y = next((c for c in sorted(range(lo, hi + 1), key=lambda c: (abs(c - cap_y), c)) if caption_ok(c)), None)
+            if new_y is None:
+                raise SourceTextCollision(
+                    f"source_text_collision: no clear caption band in the safe area (source text at {hits})",
+                    {"element": "captions", "boxes": hits, "caption_ink": cap_ink})
+            notes.append(f"captions moved {cap_y} -> {new_y}: source text in the caption band {hits}")
+            cap_y = new_y
+            cap_ink = (int(round(cap_y - cap_half)), int(round(cap_y + cap_half)))
+
     # --- credit tag: bottom-left of the video band, never on the captions ----------
     ct = ss["credit_tag"]
     # "via <channel>" is mixed case: lower-case ascenders reach above the cap height and
@@ -408,18 +455,55 @@ def plan_layout(
             credit_y = y_max_allowed
             notes.append(f"credit tag clamped to the safe area (y={credit_y:.0f})")
     credit_y_i = int(round(min(credit_y, y_max_allowed)))
+    # \an1 anchors the glyph origin, but the outline and shadow stick out to the left,
+    # so inset by them or the ink crosses the safe-area edge.
+    credit_x = int(round(sa["x_min"] + int(ct["inset_x_px"]) + float(ct["outline"]) + float(ct["shadow"])))
+    credit_w = float(credit_width_px) if credit_width_px else (x1_sa - x0_sa) / 2.0
+    credit_x1 = credit_x + credit_w
+
+    # --- source text: move the credit tag off it (same rules as the captions) --------
+    if occ is not None and credit and occ.occupied(credit_x, credit_y_i - credit_h, credit_x1, credit_y_i):
+        def apart(y0: float, y1: float, ink: tuple[int, int], on: bool) -> bool:
+            return not on or y1 + gap <= ink[0] or y0 - gap >= ink[1]
+
+        def credit_ok(b: int) -> bool:
+            y0 = b - credit_h
+            return (y0 >= sa["y_min"] and _clear_of_edges(y0, b, edges, clearance)
+                    and apart(y0, b, cap_ink, captions) and apart(y0, b, hook_ink, bool(hook_lines))
+                    and not occ.occupied(credit_x, y0, credit_x1, b))
+        lo_b, hi_b = int(math.ceil(sa["y_min"] + credit_h)), int(y_max_allowed)
+        new_b = next((b for b in sorted(range(lo_b, hi_b + 1), key=lambda b: (abs(b - credit_y_i), b)) if credit_ok(b)), None)
+        if new_b is None:
+            raise SourceTextCollision(
+                f"source_text_collision: no clear place for the credit tag (source text at {occ.boxes[:6]})",
+                {"element": "credit", "boxes": occ.boxes[:6], "credit_ink": (credit_y_i - credit_h, credit_y_i)})
+        notes.append(f"credit tag moved {credit_y_i} -> {new_b}: source text under it {occ.boxes[:6]}")
+        credit_y_i = new_b
+
+    # --- source text: the progress bar (top edge) moves down to the first clear row ---------
+    progress_y = 0
+    if occ is not None and progress:
+        bar_h = float(ss["progress_bar"]["height_px"])
+        W = float(rs["width"])
+        if occ.occupied(0, 0, W, bar_h):
+            new_p = next((y for y in range(0, int(sa["y_min"])) if not occ.occupied(0, y, W, y + bar_h)), None)
+            if new_p is None:
+                new_p = 0
+                notes.append("progress bar kept at the top: source text in every row above the safe area")
+            else:
+                notes.append(f"progress bar moved 0 -> {new_p}: source text at the top edge")
+            progress_y = int(new_p)
 
     return Layout(
         caption_center_y=cap_y,
         hook_center_y=hook_y,
         hook_line_pitch=round(pitch, 2),
-        # \an1 anchors the glyph origin, but the outline and shadow stick out to the left,
-        # so inset by them or the ink crosses the safe-area edge.
-        credit_x=int(round(sa["x_min"] + int(ct["inset_x_px"]) + float(ct["outline"]) + float(ct["shadow"]))),
+        credit_x=credit_x,
         credit_y=credit_y_i,
         caption_ink=cap_ink,
         hook_ink=hook_ink,
         credit_ink=(int(round(credit_y_i - credit_h)), credit_y_i),
         video_edges=edges,
         notes=notes,
+        progress_y=progress_y,
     )

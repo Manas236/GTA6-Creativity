@@ -288,6 +288,19 @@ def review_card_text(item: dict[str, Any], decided: str = "") -> str:
     except ValueError:
         review = {}
     seg = review.get("segment") or [item.get("cut_start"), item.get("cut_end")]
+    if review.get("kind") == "source_text_collision":
+        details = review.get("details") or {}
+        lines = [
+            "🔎 LAYOUT REVIEW · not rendered: text burned into the source covers every place our "
+            f"{details.get('element') or 'captions'} could go.",
+            "",
+            f"⚠️ Why: {str(review.get('reason') or '?')[:300]}",
+            f"🪝 Hook: {item.get('hook_text') or '(none)'}",
+            f"✂️ Clip: {seg[0]}-{seg[1]} s of the source · {item.get('source_url') or ''}",
+            "",
+            decided or "Render anyway puts our text where it normally goes, over the source's text.",
+        ]
+        return "\n".join(lines)
     lines = [
         "🔎 HOOK REVIEW · not rendered: the hook failed the clip check twice.",
         "",
@@ -309,13 +322,21 @@ def review_card_text(item: dict[str, Any], decided: str = "") -> str:
     return "\n".join(lines)
 
 
-def review_markup(item_id: str) -> dict[str, Any]:
+def review_markup(item_id: str, kind: str = "") -> dict[str, Any]:
+    ok = "✅ Render anyway" if kind == "source_text_collision" else "✅ Hook is right: render it"
     return {
         "inline_keyboard": [
-            [{"text": "✅ Hook is right: render it", "callback_data": f"a:hookok:{item_id}"}],
+            [{"text": ok, "callback_data": f"a:hookok:{item_id}"}],
             [{"text": "❌ Reject", "callback_data": f"a:no:{item_id}"}],
         ]
     }
+
+
+def review_kind(item: dict[str, Any]) -> str:
+    try:
+        return str((json.loads(item.get("hook_review") or "{}") or {}).get("kind") or "")
+    except ValueError:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +457,13 @@ def _apply_decision(item_id: str, action: str, db_path: Any = None) -> tuple[str
             review = json.loads(item.get("hook_review") or "{}") or {}
         except ValueError:
             review = {}
+        if review.get("kind") == "source_text_collision":
+            # The hook was fine; the layout was the problem. Render with today's layout.
+            review.update(decision="render_anyway", decided_at=db.now())
+            db.transition_stage(item_id, "cut", extra_fields={"hook_review": json.dumps(review)}, db_path=db_path)
+            db.log_stage(item_id, "approval", "success",
+                         message="source text collision: render anyway via telegram", db_path=db_path)
+            return "hook_approved", DECIDED_TEXT["hook_approved"]
         review.update(decision="hook_approved", decided_at=db.now())
         db.transition_stage(
             item_id,
@@ -532,7 +560,7 @@ class ApprovalBot:
             return None
         if item.get("stage") == "needs_review":
             # Nothing is rendered: a text card with the hook, why it failed and what the clip says.
-            main = self.send_message(review_card_text(item), reply_markup=review_markup(item_id))
+            main = self.send_message(review_card_text(item), reply_markup=review_markup(item_id, review_kind(item)))
             mid = int(main["message_id"])
             self.editor.touch(mid)
             set_card_state({"mid": mid, "item_id": item_id, "extra_mids": [], "kind": "review"}, self.db_path)
