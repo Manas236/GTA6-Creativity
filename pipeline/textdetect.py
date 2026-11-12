@@ -66,10 +66,19 @@ class Occupancy:
     margin_px: int
     boxes: list[tuple[int, int, int, int]] = field(default_factory=list)   # (x0, y0, x1, y1) of each blob
     times: list[float] = field(default_factory=list)
+    freeze_mask: np.ndarray | None = None                # text on Variant B's frozen first frame (fit framing)
 
     @property
     def empty(self) -> bool:
         return not bool(self.mask.any())
+
+    def with_freeze(self) -> "Occupancy":
+        """Variant B holds the cut's first frame, in fit framing, for the whole voiceover (seconds): any
+        text on it is persistent for B by definition, even though it is a single sample for A."""
+        if self.freeze_mask is None or not self.freeze_mask.any():
+            return self
+        mask = self.mask | self.freeze_mask
+        return Occupancy(mask, self.frames, self.min_area_px, self.margin_px, _persistent_boxes(mask), self.times)
 
     def area(self, x0: float, y0: float, x1: float, y1: float) -> int:
         """Source-text pixels inside the box (grown by margin_px)."""
@@ -238,8 +247,16 @@ def detect_source_text(
         return None
     mask = count >= max(1, int(ts["min_frames"]))
     occ = Occupancy(mask, len(used), int(ts["min_area_px"]), int(ts["margin_px"]), _persistent_boxes(mask), used)
-    if not occ.empty:
-        log.info("Source text in %s: %s", Path(str(cut_path)).name, occ.summary())
+    # Variant B's freeze: the first frame, framed "fit" (plan.build_style_plan makes the freeze a fit segment).
+    first = frame_reader(0.0, "fit") if frame_reader else output_frame(cut_path, 0.0, "fit", rs, ss, zoom_fill)
+    if first is not None:
+        fm = np.zeros((H, W), dtype=bool)
+        for x0, y0, x1, y1 in text_line_boxes(first, ts):
+            fm[y0:y1, x0:x1] = True
+        occ.freeze_mask = fm
+    if not occ.empty or (occ.freeze_mask is not None and occ.freeze_mask.any()):
+        log.info("Source text in %s: %s (B freeze frame: %d px)", Path(str(cut_path)).name, occ.summary(),
+                 int(occ.freeze_mask.sum()) if occ.freeze_mask is not None else 0)
     return occ
 
 

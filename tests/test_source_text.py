@@ -26,13 +26,15 @@ FILL = [edits.Segment(0.0, 4.0, "fill")]
 W, H = 1080, 1920
 
 
-def _clip(path: Path, lines: list[tuple[float, str]], seconds: float = 4.0) -> Path:
-    """1280x720 moving gradient (no text) with `lines` [(y as a fraction of h, text)] burned in, centred."""
+def _clip(path: Path, lines: list[tuple[float, str]], seconds: float = 4.0, until: float | None = None) -> Path:
+    """1280x720 moving gradient (no text) with `lines` [(y as a fraction of h, text)] burned in, centred
+    (only for the first `until` seconds when given)."""
     bg = (f"nullsrc=s=1280x720:r=25:d={seconds},format=rgb24,"
           "geq=r='128+90*sin(2*PI*(X/420+T/3))':g='120+90*sin(2*PI*(Y/310+T/4))':b='128+60*sin(2*PI*((X+Y)/600+T/5))'")
     font = escape_filter_path(FONT)
+    enable = f":enable='lt(t\\,{until})'" if until else ""
     draws = [f"drawtext=fontfile='{font}':text='{t}':x=(w-text_w)/2:y=h*{y}:fontsize=40:fontcolor=white:"
-             "borderw=3:bordercolor=black" for y, t in lines]
+             f"borderw=3:bordercolor=black{enable}" for y, t in lines]
     vf = ",".join([bg, *draws, "format=yuv420p"])
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", vf,
                     "-c:v", "libx264", "-preset", "ultrafast", str(path)], check=True, capture_output=True,
@@ -48,6 +50,7 @@ def clips(tmp_path_factory) -> dict[str, Path]:
         "clean": _clip(d / "clean.mp4", []),
         "bottom": _clip(d / "bottom.mp4", [(0.87, "THE BEAUTY IN THE MUNDANE")]),
         "every": _clip(d / "every.mp4", every),
+        "first": _clip(d / "first.mp4", [(0.85, "NOW 5 DOLLARS OR LESS")], until=0.5),
     }
 
 
@@ -121,6 +124,20 @@ def test_a_clean_clip_keeps_todays_layout_byte_identical(clips):
     for preset in ("P0", "P1", "P2", "P3"):
         for b in (False, True):
             assert _ass(_plan(preset, occ, variant_b=b)) == _ass(_plan(preset, None, variant_b=b)), (preset, b)
+
+
+def test_text_on_the_first_frame_moves_variant_b_only(clips):
+    """Hazard's store page: on screen for half a second in A, but B freezes that frame for the whole
+    voiceover, so for B it is persistent (and framed 'fit', like the freeze)."""
+    occ = _detect(clips["first"])
+    assert occ.empty                                                        # one sample: not persistent for A
+    occ_b = occ.with_freeze()
+    assert not occ_b.empty
+    assert _ass(_plan("P2", occ)) == _ass(_plan("P2"))                      # A unchanged
+    b_default, b_moved = _plan("P2", variant_b=True), _plan("P2", occ_b, variant_b=True)
+    assert (b_moved.layout.caption_center_y, b_moved.layout.credit_y) != \
+           (b_default.layout.caption_center_y, b_default.layout.credit_y)
+    assert not occ_b.occupied(90, b_moved.layout.caption_ink[0], 990, b_moved.layout.caption_ink[1])
 
 
 def _occ(rows: list[tuple[int, int, int, int]]) -> textdetect.Occupancy:

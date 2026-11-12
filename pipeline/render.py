@@ -884,7 +884,8 @@ def render_item_variants(
     )
     plan_b = planning.build_style_plan(
         analysis, hook_text, variant="B", freeze_s=freeze_s, vo_words=vo_words, cfg=cfg,
-        preset=preset_name, channel_name=channel_name, keyword_list=keyword_list, occupancy=occupancy,
+        preset=preset_name, channel_name=channel_name, keyword_list=keyword_list,
+        occupancy=occupancy.with_freeze() if occupancy is not None and freeze_s > 0 else occupancy,
     )
     content_s = plan_a.content_s
 
