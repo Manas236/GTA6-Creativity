@@ -268,7 +268,9 @@ def render_item(
         if not ok:
             result.needs_review = item.get("stage") == "needs_review"
             result.hook = item.get("hook_text") or ""
-            result.message = f"hook {'sent to manual review' if result.needs_review else 'failed'}: {msg}"
+            what = ("sent to manual review" if result.needs_review else
+                    "waiting: Gemini unavailable" if hooks.is_transient_result(msg) else "failed")
+            result.message = f"hook {what}: {msg}"
             return result
         result.hook_note = "regenerated for this segment"
     else:

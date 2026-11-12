@@ -19,7 +19,11 @@ Failure policy (no silent placeholders):
     hook_text / voiceover_script raise GeminiError: that attempt failed, nothing is defaulted.
   * Calls are spaced to the free-tier limit (gemini.requests_per_minute) and an HTTP 429 is
     retried after the server's retryDelay.
-  * A grounding check that errors (429, network, odd reply) means NOT grounded.
+  * An outage (HTTP 5xx, timeout, connection error) is retried after gemini.transient_backoff_s
+    (10/30/90 s) and is never a hook attempt. Still down -> GeminiTransientError: the item keeps its
+    stage for the next cycle (items.transient_errors), with one alert after
+    gemini.transient_alert_after_cycles cycles in a row. It is never failed for an outage.
+  * A grounding check that errors (429, odd reply) means NOT grounded.
   * No checked Gemini hook after `max_attempts` -> the hooks stage is marked failed, and any
     previously stored hook fields are cleared.
 """
@@ -52,7 +56,12 @@ GEMINI_DEFAULTS: dict[str, Any] = {
     "max_attempts": 3,
     "grounding_fail_limit": 2,       # segment-check FAILs (first hook + one regeneration) before manual review
     "fallback_hook": "IS THIS REALLY GTA 6?",   # no longer rendered silently; kept for old configs
+    "transient_backoff_s": [10, 30, 90],        # 5xx / timeout / connection error: wait, retry (not an attempt)
+    "transient_alert_after_cycles": 6,          # one alert when an item has waited this many cycles in a row
 }
+
+#: run_hooks_for_item's message prefix when Gemini was unavailable: the item stays where it is.
+TRANSIENT_PREFIX = "gemini_unavailable:"
 FALLBACK_VOICEOVER = "Check out this crazy GTA 6 moment right now!"
 
 # Free-tier pacing state (per process). _sleep/_now are module attributes so tests can fake them.
@@ -72,6 +81,11 @@ class GeminiRateLimitError(GeminiError):
 
 class GeminiQuotaExhaustedError(GeminiRateLimitError):
     """HTTP 429 whose retryDelay is longer than max_rate_limit_wait_s (the daily quota)."""
+
+
+class GeminiTransientError(GeminiError):
+    """HTTP 5xx, a timeout or a connection error that persisted through the backoff retries
+    (gemini.transient_backoff_s): an outage, not an answer. It never uses up a hook attempt."""
 
 
 class GeminiTruncatedError(GeminiError):
@@ -220,13 +234,30 @@ def _call_gemini(
 
     min_interval = 60.0 / max(1e-6, float(gs["requests_per_minute"]))
     retries = max(0, int(gs["rate_limit_retries"]))
-    res = None
-    for i in range(retries + 1):
+    backoff = [max(0.0, float(s)) for s in (gs.get("transient_backoff_s") or [])]
+    rate_tries = 0          # 429s: the server's retryDelay (unchanged)
+    outage_tries = 0        # 5xx / timeout / connection error: gemini.transient_backoff_s
+    while True:
         _throttle(min_interval)
+        outage = ""
+        res = None
         try:
             res = requests.post(url, json=payload, timeout=60)
+        except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+            outage = _redact(f"Gemini request failed: {type(e).__name__}: {e}")
         except requests.RequestException as e:
             raise GeminiError(_redact(f"Gemini request failed: {e}")) from None
+        if res is not None and res.status_code >= 500:
+            outage = _redact(f"Gemini API HTTP {res.status_code}: {res.text[:300]}")
+        if outage:
+            # An outage is not an answer: wait and retry; never a hook attempt (call #177).
+            if outage_tries >= len(backoff):
+                raise GeminiTransientError(f"{outage} (still failing after {len(backoff)} retries)")
+            wait = backoff[outage_tries]
+            outage_tries += 1
+            log.warning("Gemini unavailable (%s); retry %d/%d in %.0fs", outage[:160], outage_tries, len(backoff), wait)
+            _sleep(wait)
+            continue
         if res.status_code != 429:
             break
         delay = _retry_delay_s(res)
@@ -238,10 +269,11 @@ def _call_gemini(
             raise GeminiQuotaExhaustedError(
                 f"Gemini daily quota exhausted (HTTP 429, retryDelay {delay:.0f}s > {max_wait:.0f}s cap)"
             )
-        if i >= retries:
-            raise GeminiRateLimitError(f"Gemini HTTP 429 after {i + 1} tries (retryDelay {delay}s)")
+        if rate_tries >= retries:
+            raise GeminiRateLimitError(f"Gemini HTTP 429 after {rate_tries + 1} tries (retryDelay {delay}s)")
+        rate_tries += 1
         wait = (delay if delay is not None else min_interval) + 1.0
-        log.warning("Gemini HTTP 429: waiting %.0fs as requested, then retrying (%d/%d)", wait, i + 1, retries)
+        log.warning("Gemini HTTP 429: waiting %.0fs as requested, then retrying (%d/%d)", wait, rate_tries, retries)
         _sleep(wait)
 
     if res.status_code != 200:
@@ -581,8 +613,9 @@ def verify_hook_grounding(
     Evidence is the segment transcript (and the cut's frames when given). The source title is
     shown as context but is explicitly NOT evidence: it may describe another part of the video.
     Returns (passed, reason). reason starts with "FAIL" for a FAIL verdict and with
-    "ERROR" when no verdict was obtained (429, network, unexpected reply) - both are
-    NOT grounded.
+    "ERROR" when no verdict was obtained (429, unexpected reply) - both are NOT grounded.
+    A Gemini outage (5xx / timeout / connection error after the backoff retries) raises
+    GeminiTransientError instead: it is not a verdict and must not cost a hook attempt.
     """
     # The voiceover is not shown: with it, the checker judged hook-vs-voiceover wording instead of
     # the clip (live run 2026-11-11). `voiceover_script` is accepted for call compatibility only.
@@ -615,6 +648,8 @@ FAIL: <one-sentence specific reason>
 """
     try:
         reply = _call_gemini(check_prompt, images=frames or None, model=model, api_key=api_key, cfg=cfg)
+    except GeminiTransientError:
+        raise                       # an outage is not a verdict: the hooks stage waits for the next cycle
     except Exception as e:
         log.warning("Hook verification call error (treated as NOT grounded): %s", _redact(e))
         return False, _redact(f"ERROR: grounding check failed: {e}")
@@ -640,6 +675,39 @@ def _clear_hook_fields(item_id: str, db_path: Any = None) -> None:
             """,
             {"id": item_id, "now": db.now()},
         )
+
+
+def _set_transient_errors(item_id: str, count: int, db_path: Any = None) -> None:
+    with db.db(db_path) as conn:
+        conn.execute("UPDATE items SET transient_errors = :n, updated_at = :now WHERE id = :id",
+                     {"id": item_id, "n": int(count), "now": db.now()})
+
+
+def _wait_for_gemini(item: dict[str, Any], err: Exception, cfg: dict[str, Any], db_path: Any) -> tuple[bool, str]:
+    """Gemini was unavailable for this item in this cycle (call #177). The item is NOT failed or
+    rejected and keeps its stage; `items.transient_errors` counts the consecutive cycles, and the
+    `transient_alert_after_cycles`-th one sends ONE failure alert through the existing alert path."""
+    item_id = item["id"]
+    count = int(item.get("transient_errors") or 0) + 1
+    _set_transient_errors(item_id, count, db_path)
+    msg = f"{TRANSIENT_PREFIX} Gemini unavailable (cycle {count} in a row); stays in '{item.get('stage')}': {_redact(err)}"
+    db.log_stage(item_id, "hooks", "transient", message=msg[:1000], db_path=db_path)
+    log.warning("Item %s: %s", item_id, msg[:300])
+    limit = int(gemini_settings(cfg).get("transient_alert_after_cycles") or 0)
+    if limit and count == limit:
+        from . import telegram_bot   # lazy: the bot is not needed to run the hooks stage
+
+        telegram_bot.send_alert(
+            f"Gemini has been unavailable for {item_id} for {count} pipeline cycles in a row "
+            f"(last: {_redact(err)[:200]}). The item keeps waiting in '{item.get('stage')}'; nothing failed.",
+            key=f"gemini_unavailable:{item_id}", cfg=cfg, db_path=db_path,
+        )
+    return False, msg
+
+
+def is_transient_result(message: str | None) -> bool:
+    """True for a run_hooks_for_item message that means "Gemini was unavailable, try next cycle"."""
+    return str(message or "").startswith(TRANSIENT_PREFIX)
 
 
 def _cut_transcript(item: dict[str, Any], cut_path: Path, cfg: dict[str, Any], db_path: Any) -> list[dict[str, Any]]:
@@ -714,15 +782,20 @@ def run_hooks_for_item(
                 cut_path, source_title, transcript_text=transcript, model=model, cfg=cfg,
                 authenticity=source_tag, frames=frames, segment=segment, previous_failure=previous_failure,
             )
+        except GeminiTransientError as e:
+            return _wait_for_gemini(item, e, cfg, db_path)       # not an attempt: next cycle
         except Exception as e:
             msg = _redact(f"attempt {attempt}: {type(e).__name__}: {e}")
             log.warning("Gemini generation failed: %s", msg)
             problems.append(msg)
             continue
 
-        ok, reason = check_hook_against_segment(
-            data, transcript, source_title, frames=frames, model=model, cfg=cfg,
-        )
+        try:
+            ok, reason = check_hook_against_segment(
+                data, transcript, source_title, frames=frames, model=model, cfg=cfg,
+            )
+        except GeminiTransientError as e:
+            return _wait_for_gemini(item, e, cfg, db_path)       # the check had no verdict: next cycle
         if ok:
             log.info("Hook passed the segment check: %s (%s) - %s", data["hook_text"], data["authenticity"], reason)
             final_data, final_reason = data, reason
@@ -741,6 +814,7 @@ def run_hooks_for_item(
         else:
             log.warning("Hook not grounded (no verdict) on attempt %d: %s", attempt, reason)
 
+    _set_transient_errors(item_id, 0, db_path)       # Gemini answered: the outage count starts over
     if final_data is None:
         reason = f"No valid Gemini hook after {max_attempts} attempts: " + " | ".join(problems)
         _clear_hook_fields(item_id, db_path=db_path)
@@ -853,7 +927,7 @@ def _send_to_review(
             UPDATE items SET hook_style = :hook_style, hook_text = :hook_text, hook_grounded = 0,
                 authenticity = :authenticity, voiceover_script = :voiceover_script, keywords = :keywords,
                 hook_binding = :hook_binding, hook_review = :hook_review,
-                voiceover_audio_path = NULL, voiceover_binding = NULL, updated_at = :now
+                voiceover_audio_path = NULL, voiceover_binding = NULL, transient_errors = 0, updated_at = :now
             WHERE id = :id
             """,
             {

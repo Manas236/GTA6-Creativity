@@ -165,6 +165,13 @@ gemini:
   # plus one regeneration. needs_review items are not rendered; Telegram shows them for a decision.
   grounding_fail_limit: 2
   fallback_hook: "IS THIS REALLY GTA 6?" # no longer rendered silently (kept for old configs)
+  # Outages (HTTP 5xx, timeouts, connection errors) are retried after these waits and never use up one
+  # of the max_attempts above. Still failing -> the item stays in its stage for the next cycle
+  # (items.transient_errors counts the cycles); never failed or rejected for an outage. 429s keep
+  # their own retryDelay handling above. Truncated/unparseable answers still count as attempts.
+  # PLAN.md calls #177-#179.
+  transient_backoff_s: [10, 30, 90] # 3 retries after the first try: wait 10 s, 30 s, 90 s (the 12 s pacing still applies)
+  transient_alert_after_cycles: 6 # one failure alert (Telegram) when an item has waited this many cycles in a row
 
 # Free checks every hook AND voiceover line gets against the CUT SEGMENT's transcript before the
 # Gemini PASS/FAIL (pipeline/hooks.py). A FAIL is regenerated once with the reason, then the item

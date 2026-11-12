@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS items (
     hook_binding TEXT,                          -- JSON: the item + segment (+ transcript hash) the hook was made for (pipeline.binding)
     voiceover_binding TEXT,                     -- JSON: the item + segment + script the VO wav was synthesized from
     hook_review TEXT,                           -- JSON: why the hook went to manual review, and the decision
+    transient_errors INTEGER DEFAULT 0,         -- consecutive cycles Gemini was unavailable (5xx/timeout); 0 once it answers
     voiceover_script TEXT,
     voiceover_audio_path TEXT,
     caption_text TEXT,
@@ -278,6 +279,9 @@ def init_db(db_path: Path | str | None = None) -> None:
         for col in ("hook_binding", "voiceover_binding", "hook_review"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT")
+        # Gemini outages: the hooks stage waits instead of failing the item (PLAN.md call #177).
+        if "transient_errors" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN transient_errors INTEGER DEFAULT 0")
         # Created after the migration: the trigger bodies reference items.preview_only.
         conn.executescript(PREVIEW_ONLY_TRIGGERS)
         if "ab_excluded" not in cols:

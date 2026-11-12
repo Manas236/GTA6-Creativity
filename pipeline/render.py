@@ -945,6 +945,8 @@ def run_render_item(
             refreshed = db.get_item(item_id, db_path=db_path) or {}
             if refreshed.get("stage") == "needs_review":
                 return False, msg, {}          # not a failure: it waits for a human on Telegram
+            if hooks.is_transient_result(msg):
+                return False, msg, {}          # Gemini outage: stays in 'cut' for the next cycle
             db.mark_failed(item_id, "render", f"Hook generation failed: {msg}", db_path=db_path)
             return False, f"Hook generation failed: {msg}", {}
         item = db.get_item(item_id, db_path=db_path)
