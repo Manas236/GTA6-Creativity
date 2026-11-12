@@ -20,8 +20,8 @@ from typing import Any, Sequence
 from . import audio_mix, config, edits, keywords as kwmod, overlay, style
 from .cut import audio_envelope, extract_audio_loudness_profile, extract_scene_cuts, snap_end_to_pause
 from . import endings
-from .rendercore import (ascent_px, cap_height_px, descent_px, layout_hook, media_duration, render_settings,
-                         text_width_px)
+from .rendercore import (ascent_px, cap_height_px, descent_px, layout_hook, media_duration, normalize_caption_words,
+                         render_settings, text_width_px)
 
 log = logging.getLogger(__name__)
 
@@ -336,6 +336,7 @@ def build_style_plan(
         if float(w["start"]) < freeze_s:
             words_out.append({**w, "end": min(float(w["end"]), freeze_s)})
     words_out += [w for w in speech_out if w["start"] < total_s - 0.02]
+    words_out = normalize_caption_words(words_out)     # caption text only; analysis.words stay as whisper wrote them
 
     # --- F1 segments (plus the B freeze as a static segment) ------------------------
     segments = edits.shift_segments(analysis.segments, analysis.timeline, offset=freeze_s)

@@ -48,6 +48,7 @@ from .rendercore import (  # re-exported for callers and tests
     hook_line_pitch,
     layout_hook,
     media_duration,
+    normalize_caption_words,
     probe_streams,
     render_settings,
     text_width_px,
@@ -288,6 +289,8 @@ def build_ass_subtitles(
 
     # --- captions -------------------------------------------------------------------
     if words:
+        # Caption text only: "PRE -DOWNLOAD" -> "PRE-DOWNLOAD", "1 001 / 004" -> "1,001/004".
+        words = normalize_caption_words(words)
         timeline = [w for w in words if float(w["start"]) < video_duration - 0.05]
         chunks = chunk_caption_words(timeline, rs)
         hl = cap["highlight_color"]

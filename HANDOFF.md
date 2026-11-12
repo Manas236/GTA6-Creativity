@@ -2,6 +2,33 @@
 
 ## 0. Laptop: what to run next
 
+### After pulling the 2026-11-12 pre-launch fix pass (office PC; PLAN.md calls #173-#192)
+Four fixes + polish landed: hook/VO claim checks, Gemini outages wait instead of failing, captions
+checked against measured speech, our text moved off text burned into the source. Run, in order:
+```powershell
+git pull
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt          # NEW dependency: opencv-python-headless (Fix 4)
+python scripts/fetch_assets.py --check
+python -m pytest                         # office PC: 525 passed, 1 deselected (was 472)
+python scripts/render_previews.py        # then:
+python scripts/verify_previews.py
+```
+- **Every cached transcript is re-made once.** The transcript cache key now also covers the VAD
+  settings, the new speech check and the two new glossary terms, so each item's source is transcribed
+  again on its next cut (the 3 laptop sources took 222-267 s each with small.en) and items re-cut;
+  where a window moves, the hook is regenerated (Gemini calls, 12 s apart).
+- `pipeline.db` gets a new column (`items.transient_errors`) automatically from `init_db`.
+- New behaviour you will see: a hook or VO with "leak / confirmed / official / real / ..." is refused
+  for unverified creators; a music-heavy cut (speech under 25 % of it) gets the hook only, no word
+  captions (logged); captions/credit move off a source's own subtitles or lower third, and when no
+  clear place exists the item goes to `needs_review` with a **LAYOUT REVIEW** Telegram card
+  ("Render anyway" / "Reject"). A Gemini 5xx/timeout no longer fails an item: it waits (one alert
+  after 6 cycles in a row).
+- Office PC real-clip check of the four known cases: see 0c below.
+
+### Laptop to-do (unchanged)
+
 Everything below is still yours to do, in this order. Nothing posts publicly until step 8.
 **Account setup (Telegram, Meta, Twitch) is a step-by-step guide of its own: [SETUP.md](SETUP.md).**
 
@@ -57,6 +84,32 @@ Everything below is still yours to do, in this order. Nothing posts publicly unt
 10. *Optional*: this machine has `HF_HOME=D:\huggingface_cache` set system-wide but no D: drive;
    whisper now falls back to `~/.cache/huggingface` (PLAN calls #136, #158), but you may want to
    remove or fix that variable.
+
+## 0c. Pre-launch fix pass 2026-11-12 (office PC): real-clip results
+
+Known cases matched by creator: Tridzo item_763c2e191a1f, Trailer 2 item_9eb56ea0f951, GamingBolt
+item_a35aead652d3, Hazard item_4622278cd0fc. `render_previews.py --items <these> --presets P2` and
+`verify_previews.py` ran on a COPY of `pipeline.db` (`media/previews/_work`), Telegram/Meta blocked,
+dry run checked; the real `pipeline.db` is unchanged. Every source was re-transcribed (new cache key).
+The first run at 06:20 UTC found Gemini's daily quota still used up by the 11 Nov run (it resets at
+08:00 UTC), so no hook was made; the 08:02 UTC re-run regenerated all four.
+
+| item | new window | new hook (tag) | P2 result |
+|---|---|---|---|
+| Tridzo | 100.26-118.94 s | QUALITY OF LIFE IMPROVEMENTS COMING? (unverified; VO has no leak claim) | **needs_review: source_text_collision** - a full-frame tweet screenshot covers every band for ~5 s; "Render anyway" on Telegram decides |
+| Trailer 2 | 32.11-52.01 s | WHO IS LUCIA CAMINOS? (official) | speech ratio 0.21 < 0.25: **hook only, no word captions** (B keeps its VO captions) |
+| GamingBolt | 285.81-304.38 s | THE BEAUTY IN THE MUNDANE? (unverified) | captions 1300 -> 1217 and credit -> 1147, both clear of the source's chapter title (y 1267-1322) |
+| Hazard | 163.41-184.81 s | NO GTA 6 DISCOUNTS? (unverified) | A: captions 1300 / credit 1230 clear of the Strauss Zelnick lower third (y 1138-1199). B: off the lower third (was at 1178 on it), but see below |
+
+Endings/SFX (`verify_previews.py`): GamingBolt A/B and Hazard A/B OK (SFX boom 0.00 s + one whoosh,
+gaps 9.74-23.71 s). Trailer 2 A/B "FAIL ending" only because whisper writes the 3 s render tail
+"here for Lucia Caminos" without a full stop; its source check passes ("Caminos." then 0.48 s of quiet,
+-18 dB) - the same row failed the same way on 11 Nov. Hazard's row flipped once between two verifier
+runs (whisper's temperature fallback); the second run passed.
+**Not fully fixed - look at Hazard B before posting it:** the store page B freezes for 7 s, an article and
+a tweet still sit under our text; the detector does not see big price graphics, and the article/tweet
+each show up in one sample only (PLAN.md call #193). Hazard A also still has the store-page promo row
+under "via Hazard" for its first ~2 s.
 
 ## 0a. Caption fix 2026-11-11 (wrong hook on a render)
 

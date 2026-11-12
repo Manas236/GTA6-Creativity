@@ -12,9 +12,10 @@ import functools
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import config
 
@@ -231,6 +232,43 @@ def _clean_text(text: str) -> str:
 
 def _clean_caption_word(word: str) -> str:
     return _clean_text(word).strip(",.;:\"“”")
+
+
+_DASHES = "-‐‑‒–—"
+_THOUSANDS_HEAD = re.compile(r"^\d{1,3}(,\d{3})*$")
+_THOUSANDS_GROUP = re.compile(r"^\d{3}(?![\d,])")
+
+
+def _caption_join(prev: str, cur: str) -> str | None:
+    """How two whisper words join on screen, or None when they stay two words. Compares the cleaned
+    tokens ("PRE" + "-DOWNLOAD", "TO" + "-DO", "1" + "001", "001" + "/" + "004")."""
+    a, b = _clean_caption_word(prev), _clean_caption_word(cur)
+    if not a or not b:
+        return None
+    if b[0] in _DASHES and len(b) > 1 and b[1].isalnum() and a[-1].isalnum():
+        return a + b                                    # PRE -DOWNLOAD -> PRE-DOWNLOAD
+    if a[-1] in _DASHES and b[0].isalnum() and len(a) > 1:
+        return a + b                                    # PRE- DOWNLOAD -> PRE-DOWNLOAD
+    if (b[0] == "/" and a[-1].isalnum()) or (a[-1] == "/" and b[0].isalnum()):
+        return a + b                                    # 001 / 004 -> 001/004
+    if _THOUSANDS_HEAD.match(a) and _THOUSANDS_GROUP.match(b):
+        return f"{a},{b}"                               # 1 001 -> 1,001
+    return None
+
+
+def normalize_caption_words(words: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Caption text only (never the stored transcript): whisper writes some tokens as separate words,
+    so "pre -download" read "PRE -DOWNLOAD" and "1 001 / 004" kept its spaces on screen. Joined
+    tokens take the first word's start and the last word's end. Idempotent; returns new dicts."""
+    out: list[dict[str, Any]] = []
+    for w in words:
+        if out:
+            joined = _caption_join(str(out[-1]["word"]), str(w.get("word", "")))
+            if joined is not None:
+                out[-1] = {**out[-1], "word": joined, "end": max(float(out[-1]["end"]), float(w["end"]))}
+                continue
+        out.append(dict(w))
+    return out
 
 
 def layout_hook(hook_text: str, rs: dict[str, Any]) -> tuple[list[str], int]:
