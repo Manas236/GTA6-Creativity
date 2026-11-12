@@ -39,6 +39,9 @@ def fake_models(monkeypatch):
     def get_model(name):
         return models.setdefault(name, FakeModel(name))
     monkeypatch.setattr(transcribe, "get_model", get_model)
+    # The clips here are sine tones: no speech for Silero. These tests are about the glossary,
+    # so the speech check (tests/test_captions_music.py) is left out.
+    monkeypatch.setattr(transcribe, "speech_profile", lambda *a, **k: None)
     return models
 
 

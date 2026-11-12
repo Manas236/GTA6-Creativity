@@ -10,6 +10,7 @@ pipeline.render consumes a StylePlan; it never re-derives a time.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 from dataclasses import dataclass, field
@@ -246,6 +247,54 @@ def analyze_clip(
         words=[w for w in words if float(w["start"]) < end_s],
         notes=notes,
     )
+
+
+def caption_lines(words: Sequence[dict[str, Any]], cfg: dict[str, Any] | None = None) -> list[list[dict[str, Any]]]:
+    """The caption lines (1-3 word chunks) these words would be burned in as."""
+    from .rendercore import chunk_caption_words
+
+    return chunk_caption_words(list(words), render_settings(cfg))
+
+
+def gate_caption_words(
+    analysis: ClipAnalysis,
+    profile: Any,
+    cfg: dict[str, Any] | None = None,
+) -> ClipAnalysis:
+    """Captions under music (PLAN.md calls #181-#182). `profile` is transcribe.speech_profile of the
+    cut (cut timeline); None = not measurable, nothing is gated.
+
+    * Speech under `render.caption.min_speech_ratio` of the content: NO word captions (hook only),
+      with a note and a log line saying why: whisper's word times are not trustworthy there.
+    * Otherwise a caption line with any word further than `max_outside_speech_s` from a speech region
+      is dropped whole.
+    Only the caption words change; the ending was decided before this and is not touched."""
+    if profile is None or not analysis.words:
+        return analysis
+    cap = render_settings(cfg)["caption"]
+    min_ratio = float(cap.get("min_speech_ratio", 0.25))
+    max_out = float(cap.get("max_outside_speech_s", 1.0))
+    ratio = profile.ratio(0.0, analysis.end_s)
+    notes = list(analysis.notes)
+    if ratio < min_ratio:
+        note = (f"captions off: speech ratio {ratio:.2f} < {min_ratio:.2f} (Silero speech {profile.speech_s(0.0, analysis.end_s):.1f} s "
+                f"of {analysis.end_s:.1f} s; music-heavy, whisper word times unreliable): hook only")
+        log.info("%s: %s", analysis.cut_path, note)
+        notes.append(note)
+        return dataclasses.replace(analysis, words=[], notes=notes)
+    kept: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    for line in caption_lines(analysis.words, cfg):
+        far = max(profile.distance(float(w["start"]), float(w["end"])) for w in line)
+        if far > max_out:
+            dropped.append(" ".join(str(w["word"]) for w in line) + f" @{float(line[0]['start']):.2f}s")
+        else:
+            kept.extend(line)
+    if dropped:
+        note = f"caption lines dropped (> {max_out:.1f} s from speech): {'; '.join(dropped)[:300]}"
+        log.info("%s: %s", analysis.cut_path, note)
+        notes.append(note)
+    return dataclasses.replace(analysis, words=kept, notes=notes)
 
 
 def build_style_plan(

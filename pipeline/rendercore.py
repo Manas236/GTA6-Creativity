@@ -44,6 +44,8 @@ RENDER_DEFAULTS: dict[str, Any] = {
         "center_y": 1300,
         "color": "&H00FFFFFF",
         "highlight_color": "&H0000FFFF",
+        "min_speech_ratio": 0.25,       # Silero speech share of the cut below this: no word captions
+        "max_outside_speech_s": 1.0,    # a caption line with a word further than this from speech is dropped
     },
     "hook": {
         "font_size": 150,

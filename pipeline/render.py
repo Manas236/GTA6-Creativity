@@ -839,6 +839,9 @@ def render_item_variants(
     cut_dur = media_duration(cut_path)
     analysis = planning.analyze_clip(cut_path, speech_words, cfg=cfg, preset=preset_name, duration=cut_dur,
                                      clean_cut_end=clean_cut_end)
+    # Captions under music: gate the caption words on measured speech in the cut (calls #181-#182).
+    if analysis.words and Path(str(cut_path)).exists():
+        analysis = planning.gate_caption_words(analysis, transcribe.speech_profile(cut_path, cfg), cfg)
     vo_dur = media_duration(vo_path)
     freeze_s = freeze_duration(vo_dur, cfg)
 

@@ -149,6 +149,25 @@ transcribe:
     - "Michael"
     - "Franklin"
     - "wanted level"
+  # faster-whisper always runs with vad_filter=True; these are its vad_parameters (the values it used
+  # before they were configurable). Part of the cache key: changing one re-transcribes.
+  vad:
+    threshold: 0.5
+    min_silence_duration_ms: 500
+    speech_pad_ms: 400
+    min_speech_duration_ms: 0
+  # After whisper, every word is checked against Silero's speech probability (per 32 ms) of the same
+  # audio: under music whisper places words where nobody speaks (Trailer 2: "I'm" 9.5 s early).
+  # Part of the cache key. PLAN.md calls #180-#183.
+  speech_check:
+    enabled: true
+    word_min_prob: 0.35 # a word is dropped when no 32 ms frame in its span (+/- word_pad_s) reaches this
+    word_pad_s: 0.1
+    region_threshold: 0.5 # speech regions: probability >= this, held while >= threshold - 0.15...
+    region_onset_prob: 0.15 # ...started back where the ramp-up began (Silero lags a real onset by ~0.3 s)...
+    region_min_silence_s: 0.3 # ...split by at least this much non-speech...
+    region_pad_s: 0.1 # ...padded by this much each side
+    clamp_tolerance_s: 0.15 # a word starting this much before the speech region it runs into starts at the region
 
 gemini:
   model: "gemini-2.5-flash"
@@ -237,6 +256,10 @@ render:
     center_y: 1300
     color: "&H00FFFFFF" # white
     highlight_color: "&H0000FFFF" # yellow (ASS is &HAABBGGRR)
+    # Captions under music (PLAN.md calls #180-#183). Measured with Silero on the cut itself
+    # (transcribe.speech_check region settings), at render time:
+    min_speech_ratio: 0.25 # speech share of the cut below this -> NO word captions (hook only; VO captions in B stay), logged
+    max_outside_speech_s: 1.0 # a caption line with any word further than this from a speech region is dropped
   hook:
     font_size: 150
     min_font_size: 96 # only used if a hook cannot fit 2 lines inside the safe width
