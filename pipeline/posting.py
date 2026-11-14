@@ -73,7 +73,7 @@ log = logging.getLogger(__name__)
 GRAPH_BASE = "https://graph.facebook.com"
 RUPLOAD_BASE = "https://rupload.facebook.com"
 API_VERSION = "v25.0"
-META_SOURCE = "meta_graph"          # the key `rate_limits` pauses under
+META_SOURCE = rate_limit.META_SOURCE   # the key `rate_limits` pauses under
 K_NEXT_FREE = "meta_api:next_free"  # epoch seconds: the earliest moment the next request may be sent
 MAX_PACING_WAIT_S = 120.0
 

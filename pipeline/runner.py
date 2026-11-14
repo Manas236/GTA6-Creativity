@@ -265,12 +265,24 @@ def run_stages(
     t0 = time.time()
     results: dict[str, Any] = {}
     errors: dict[str, str] = {}
+    try:
+        from dashboard.commands import runner_boundary
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("dashboard", "dashboard.commands"):
+            log.exception("Dashboard could not load; skipping controls this cycle")
+        runner_boundary = None
+    except Exception:
+        log.exception("Dashboard could not load; skipping controls this cycle")
+        runner_boundary = None
+
     for name, fn in stages or STAGES:
         t_stage = time.time()
+        if runner_boundary is not None:
+            try:
+                runner_boundary(cfg, db_path, name)
+            except Exception:
+                log.exception("Dashboard boundary failed before %s; running the stage", name)
         try:
-            # Controls are applied only at a boundary, never over an in-flight render/publish.
-            from dashboard.commands import runner_boundary
-            runner_boundary(cfg, db_path, name)
             results[name] = fn(cfg, db_path)
             log.info("Stage %-9s ok in %.1fs: %s", name, time.time() - t_stage, str(results[name])[:300])
         except Exception as e:  # noqa: BLE001 - this is the isolation boundary

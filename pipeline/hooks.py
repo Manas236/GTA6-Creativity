@@ -788,7 +788,8 @@ def run_hooks_for_item(
                 # here in the runner, and only this function can stamp it segment_check.
                 data = {"hook_text": item["hook_text"], "voiceover_script": item.get("voiceover_script") or "",
                         "hook_style": item.get("hook_style") or "question", "authenticity": source_tag,
-                        "keywords": []}
+                        "keywords": keywords.rule_keywords(item["hook_text"], cfg),
+                        "keywords_source": "rules"}
             else:
                 data = generate_hook_and_voiceover(
                     cut_path, source_title, transcript_text=transcript, model=model, cfg=cfg,

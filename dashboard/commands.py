@@ -5,7 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from pipeline import (
@@ -19,6 +20,8 @@ from pipeline import (
     telegram_bot,
 )
 from .store import transaction
+
+log = logging.getLogger(__name__)
 
 ACTIONS = {
     "approve": "Approve both variants",
@@ -127,10 +130,12 @@ def unstarted(posts):
     )
 
 
-def validate(action, item, posts, payload):
+def validate(action, item, posts, payload, path):
     if action not in ACTIONS:
         raise ControlError("Unknown action.")
     if action in ("pause", "resume"):
+        if action == "resume" and not rate_limit.dashboard_meta_paused(path):
+            raise ControlError("No dashboard pause to resume. Meta cooldowns expire on their own.")
         return
     if not item:
         raise ControlError("Item no longer exists.")
@@ -232,7 +237,7 @@ def available_actions(item, posts):
 def prepare(action, item_id, payload, path, cfg):
     item = db.get_item(item_id, path) if item_id else None
     posts = posting.get_posts_for_item(item_id, path) if item_id else []
-    validate(action, item, posts, payload)
+    validate(action, item, posts, payload, path)
     detail = ACTIONS[action]
     if action == "reslot":
         bounded = copy.deepcopy(cfg)
@@ -263,7 +268,7 @@ def enqueue(plan, command_id, path):
         item_id = plan["item_id"]
         item = db.get_item(item_id, path) if item_id else None
         posts = posting.get_posts_for_item(item_id, path) if item_id else []
-        validate(plan["action"], item, posts, plan["payload"])
+        validate(plan["action"], item, posts, plan["payload"], path)
         if fingerprint(item, posts) != plan["expected"]:
             raise ControlError(
                 "The item changed while you were confirming. Refresh and try again."
@@ -299,26 +304,19 @@ def apply(command, cfg, path):
     payload = json.loads(command["payload"])
     item = db.get_item(item_id, path) if item_id else None
     posts = posting.get_posts_for_item(item_id, path) if item_id else []
-    validate(action, item, posts, payload)
+    validate(action, item, posts, payload, path)
     if fingerprint(item, posts) != command["expected"]:
         raise ControlError(
             "State changed before the runner reached this command. Refresh and confirm again."
         )
     if action == "pause":
-        # Existing Meta cooldown, held until explicit resume (maximum representable date).
-        hours = (
-            datetime(9999, 1, 1, tzinfo=timezone.utc) - clock.utcnow()
-        ).total_seconds() / 3600
-        rate_limit.record_error(
-            posting.META_SOURCE,
-            "Paused by dashboard; resume from the control panel",
-            hours,
-            path,
-        )
-        return "All Meta posting paused until resumed."
+        rate_limit.set_dashboard_meta_pause(True, path)
+        return "Posting paused by the dashboard until resumed."
     if action == "resume":
-        rate_limit.record_success(posting.META_SOURCE, path)
-        return "Meta pause cleared. The runner will use the normal posting slots."
+        rate_limit.set_dashboard_meta_pause(False, path)
+        if posting.meta_paused(path)[0]:
+            return "Dashboard pause lifted. Meta's cooldown is still active."
+        return "Dashboard pause lifted. The runner will use the normal posting slots."
     if action in DECISIONS:
         outcome, message = telegram_bot.decide(item_id, DECISIONS[action], path)
         if not outcome or outcome == telegram_bot.NOT_APPLICABLE:
@@ -430,10 +428,15 @@ def runner_boundary(cfg, path, stage):
                     )
                 status = "applied"
                 conn.execute("RELEASE control")
-            except (ValueError, binding.CaptionMismatchError, RuntimeError) as exc:
+            except Exception as exc:
                 conn.execute("ROLLBACK TO control")
                 conn.execute("RELEASE control")
-                status, message = "refused", str(exc)[:500]
+                if isinstance(exc, (ControlError, binding.CaptionMismatchError)):
+                    status, message = "refused", str(exc)[:500]
+                    log.info("Dashboard command %s refused: %s", command_id, message)
+                else:
+                    status, message = "failed", f"{type(exc).__name__}: {exc}"[:500]
+                    log.exception("Dashboard command %s failed", command_id)
             conn.execute(
                 "UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
                 (status, message, db.now(), command_id),

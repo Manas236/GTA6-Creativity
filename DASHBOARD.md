@@ -61,18 +61,22 @@ through a proxy or tunnel.
 Confirmation adds an immutable command to `dashboard_commands`. The runner
 consumes commands **between stages**, under its existing serialization. An
 active render or publish finishes before a new command is applied. A stopped
-runner leaves controls pending; the UI shows pending/applied/refused results.
+runner leaves controls pending; the UI shows pending/applied/refused/failed results.
 Do not interpret “queued” as “applied.” Commands and their effects commit in one
 short SQLite transaction, with no HTTP, rendering or model work inside it.
 Repeated confirmation and runner restarts do not apply a command twice.
-Changed item state invalidates the command; refresh and confirm again.
+Changed item state invalidates the command; refresh and confirm again. Unexpected
+application errors roll back that command's effects and record a terminal failure.
+The runner logs dashboard errors and runs the stage even if the mailbox or the
+dashboard import fails. If SQLite cannot open a write transaction at all, the
+runner cannot record an outcome, and the unprocessed command stays pending.
 
 | Control | Behavior |
 | --- | --- |
 | Approve both / A only / Reject | Calls `telegram_bot.decide()` in the runner. Revalidates stage, bindings, files and publishing history. Releases the matching Telegram card state in the same transaction. |
 | Hook is right | Calls `decide(..., "hookok")`, preserving the existing human-review semantics. Returns the item to rendering; this is not publication approval. |
-| Pause posting | Uses the existing `meta_graph` rate-limit pause, held until explicitly resumed. The runner's settlement stage also respects it. A request already in flight may finish. |
-| Resume posting | Clears that existing Meta cooldown, including an API-imposed pause; this consequence appears before confirmation. Normal slot rules still apply. |
+| Pause posting | Sets an indefinite dashboard hold. The runner's settlement stage also respects it. A request already in flight may finish. |
+| Resume posting | Lifts an active dashboard hold. Any remaining Meta cooldown stays in effect. Normal slot rules still apply. |
 | Edit hook | Invalidates approval, post plans, renders and bindings, and returns an unstarted item to `cut`. See below. |
 | Re-slot | Recomputes `scheduler.next_free_slot()` at application time, honors the configured gap and caps the local-day target at two. The preview is an estimate; another reservation can move the final slot. |
 | Retry | Only failed `download`, `cut`, `render` items with no post history. Required source/cut files must exist. Returns to the preceding runner stage. |
@@ -83,6 +87,18 @@ control resets publishing state or retries Meta. Preview-only/synthetic items
 are refused cleanly before approval; existing database triggers remain intact.
 The physical Telegram message is not edited by this app: its stored card is
 released, and a later button tap is stale. No dashboard code sends Telegram.
+
+### Posting pause ownership
+
+The dashboard hold lives in the `dashboard:meta_pause` key. Meta's own
+`meta_graph` rate-limit row keeps its original reason, error count and deadline,
+including cooldowns recorded while a dashboard hold is active. The pipeline
+checks both sources before making Meta calls. Resume releases the hold and the
+rate limiter continues to enforce any remaining Meta cooldown. An expired
+cooldown has no effect. Overview shows Meta's reason and remaining minutes,
+refreshed with the normal polling cycle. Only an active dashboard hold offers
+a resume control. Existing indefinite dashboard pauses are recognized by their
+original reason and far-future timestamp and converted when the hold is changed.
 
 ### Hook edits and binding safety
 
@@ -96,6 +112,7 @@ The runner's hooks stage recognizes the marker and keeps the user's candidate
 instead of generating a replacement. It uses the **same** transcript, source
 trust, claim-word and overlap rules, then Gemini segment/honesty verification.
 The existing voiceover script is retained and checked alongside the edited hook.
+The local keyword rules extract terms from the edited hook for styling.
 Only that runner path stamps `segment_check`; a failed verdict goes to the
 existing manual needs-review queue, and a transient outage keeps the candidate
 pending. Human “hook is right” remains an explicit existing override, visible in
@@ -113,7 +130,8 @@ remain enabled. Startup initializes schema and the dashboard mailbox.
 `pipeline/runner.py` drains the mailbox before each stage, records non-secret
 runtime settings/quota observations, and honors Meta pause during settlement.
 `pipeline/hooks.py` accepts a dashboard candidate through the normal validation
-path. No existing tests or other pipeline files are changed.
+path. `pipeline/rate_limit.py` tracks dashboard holds independently from Meta
+cooldowns, and `pipeline/posting.py` shares its Meta source key.
 
 ## Demo
 

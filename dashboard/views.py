@@ -106,6 +106,8 @@ def state(path, cfg):
                 row["source"], path
             )
             limits.append(record)
+        dashboard_paused = rate_limit.dashboard_meta_paused(path)
+        meta_until, meta_reason = rate_limit.active_cooldown(posting.META_SOURCE, path)
         return {
             "runtime_known": runtime_known,
             "config_changed": config_changed,
@@ -122,7 +124,10 @@ def state(path, cfg):
             "lock": lock,
             "runtime": runtime,
             "limits": limits,
-            "meta_paused": posting.meta_paused(path)[0],
+            "meta_paused": dashboard_paused or bool(meta_until),
+            "dashboard_paused": dashboard_paused,
+            "meta_cooldown_until": meta_until,
+            "meta_cooldown_reason": meta_reason,
             "variants": scheduler.variant_stats(path),
             "probabilities": probabilities,
             "variant_reason": reason,

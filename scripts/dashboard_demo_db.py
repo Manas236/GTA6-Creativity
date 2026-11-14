@@ -28,15 +28,15 @@ from pipeline import (
 )
 from dashboard.store import initialize
 
-TITLES = [
-    "Vice City after dark",
-    "Lucia and Jason on the road",
-    "A closer look at the waterfront",
-    "What makes Leonida feel alive?",
-    "Small details in the new city",
-    "The streets beyond Ocean Drive",
-    "Inside the latest trailer",
-    "A different side of Vice City",
+STORIES = [
+    ("Vice City after dark", "WHY DOES VICE CITY LOOK SO DIFFERENT AT NIGHT?", "question"),
+    ("Lucia and Jason on the road", "WATCH WHO TAKES THE WHEEL HERE", "curiosity"),
+    ("A closer look at the waterfront", "THE WATERFRONT SELLS VICE CITY'S SCALE", "hype_analysis"),
+    ("What makes Leonida feel alive?", "WHAT MAKES LEONIDA FEEL LIKE A REAL PLACE?", "question"),
+    ("Small details in the new city", "LOOK PAST THE CARS AT THE NEXT CROSSING", "curiosity"),
+    ("The streets beyond Ocean Drive", "GTA 6 FEELS BIGGER ONE BLOCK OFF OCEAN DRIVE", "hype_analysis"),
+    ("Inside the latest trailer", "DID YOU CATCH THE REFLECTION IN THIS SHOT?", "question"),
+    ("A different side of Vice City", "WATCH WHAT CHANGES WHEN THE ROAD OPENS UP", "curiosity"),
 ]
 
 
@@ -65,7 +65,7 @@ def create_media(root):
         small = ImageFont.truetype(str(font_path), 12)
         draw.text((26, 44), "DEMO FOOTAGE", font=small, fill="#f5b1c9")
         draw.text(
-            (25, 100), "VICE CITY\nAFTER DARK?", font=font, fill="#fff3f6", spacing=9
+            (25, 100), "GTA VI\nSAMPLE CLIP", font=font, fill="#fff3f6", spacing=9
         )
         draw.text(
             (25, 585), f"VARIANT {variant} / LOCAL PREVIEW", font=small, fill="#ffffff"
@@ -151,18 +151,17 @@ def build_demo(path, media=True):
         "failed": 5,
     }
     index = 0
-    words = [
-        {"word": w, "start": n * 0.6, "end": n * 0.6 + 0.5}
-        for n, w in enumerate(
-            "Lucia and Jason drive through Vice City after dark".split()
-        )
-    ]
     for stage in db.STAGES:
         for local in range(counts[stage]):
             index += 1
             item_id = f"demo-{index:03d}"
             source = "twitch" if index % 3 == 0 else "youtube"
-            title = TITLES[index % len(TITLES)]
+            title, hook, hook_style = STORIES[index % len(STORIES)]
+            script = title.rstrip("?") + ". Look closely at the details in this shot."
+            words = [
+                {"word": w, "start": n * 0.6, "end": n * 0.6 + 0.5}
+                for n, w in enumerate(script.split())
+            ]
             db.insert_discovered_item(
                 {
                     "id": item_id,
@@ -186,9 +185,9 @@ def build_demo(path, media=True):
                 "cut_duration": 20,
                 "cut_path": str(media_root / "A.mp4"),
                 "download_path": str(media_root / "A.mp4"),
-                "hook_text": "VICE CITY AFTER DARK?",
-                "voiceover_script": "Lucia and Jason drive through Vice City after dark.",
-                "hook_style": ["question", "curiosity", "contrast"][index % 3],
+                "hook_text": hook,
+                "voiceover_script": script,
+                "hook_style": hook_style,
                 "hook_grounded": 1,
                 "authenticity": "official" if index % 5 == 0 else "unverified",
                 "style_preset": "P0",

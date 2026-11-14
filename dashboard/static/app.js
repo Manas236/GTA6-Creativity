@@ -103,7 +103,7 @@ function commandsPanel() {
     .slice(0, 6)
     .map(
       (c) =>
-        `<div class="command-row">${pill(c.status, c.status === "applied" ? "green" : c.status === "refused" ? "red" : "amber")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${escape(c.result || "Waiting for the runner. Start or resume its loop to apply this command.")}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`,
+        `<div class="command-row">${pill(c.status, c.status === "applied" ? "green" : c.status === "pending" ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${escape(c.result || "Waiting for the runner. Start or resume its loop to apply this command.")}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`,
     )
     .join("")}</section>`;
 }
@@ -128,20 +128,32 @@ function overview() {
       ? "Cooldown"
       : "No cooldown reported"
     : "Unknown";
+  const cooldownMinutes = Math.max(1, Math.ceil(
+    (new Date(state.meta_cooldown_until) - new Date(state.at)) / 60000,
+  ));
+  const cooldown = state.meta_cooldown_until
+    ? `Meta cooldown · ${cooldownMinutes} min remaining · ${state.meta_cooldown_reason}`
+    : "";
+  const metaDetails = [
+    state.dashboard_paused ? "Paused by dashboard." : "",
+    cooldown,
+  ].filter(Boolean).join(" ");
   const health = (name, status, desc, tone = "") =>
     `<div class="health-row"><div><div class="health-name">${escape(name)}</div><div class="health-detail">${escape(desc)}</div></div><div class="health-state"><span class="light ${tone}"></span>${escape(status)}</div></div>`;
   content.innerHTML =
     heading(
       "Your pipeline, at a glance.",
       `${formatTime(state.at, { weekday: "long" })} · ${state.timezone}`,
-      button(state.meta_paused ? "resume" : "pause"),
+      state.dashboard_paused
+        ? button("resume", "", "Lift dashboard pause")
+        : state.meta_paused ? "" : button("pause"),
     ) +
     `<div class="metrics-grid">${metric("READY TO GO", `${state.ready} <em>/ ${state.target}</em>`, "Ready buffer · target from config", "pink")}${metric("LIVE PLATFORM POSTS", number(live), "Instagram + Facebook")}${metric("RECORDED VIEWS", compact(latest.reduce((n, m) => n + m.views, 0)), "Latest stored snapshot per post", "green")}${metric("AWAITING A DECISION", review, "Rendered, approval & review queues", "purple")}</div>
     <div class="grid-main"><section class="panel">${panelHead("Production funnel", "Every pipeline stage · current inventory", pill(`${state.items.length} items`))}
     ${state.stages.map((s) => `<a href="/queue?stage=${s.stage}" class="funnel-row"><span class="funnel-label">${escape(pretty(s.stage))}</span><div class="track"><div class="fill" style="width:${(s.count / max) * 100}%;background:${["failed", "rejected"].includes(s.stage) ? "var(--red)" : s.stage === "needs_review" ? "var(--amber)" : s.stage === "queued" ? "var(--pink)" : "var(--purple)"}"></div></div><b>${number(s.count)}</b></a>`).join("")}</section>
     <section class="panel">${panelHead("System health", "Observed state from the runner and SQLite")}
     ${health("Runner", pretty(lock.status), lock.age === null ? "No valid heartbeat" : `Heartbeat ${lock.age}s ago · ${lock.host || "unknown host"}${runtime.stage ? " · " + runtime.stage : ""}`, lock.status === "alive" ? "" : lock.status === "stale" ? "red" : "gray")}
-    ${health("Meta publishing", state.meta_paused ? "Paused" : "Enabled", state.meta_paused ? "Publishing waits for the existing Meta cooldown." : state.dry_run ? "Dry run is on; publish requests are suppressed." : "The runner publishes at scheduled slots.", state.meta_paused ? "amber" : "")}
+    ${health("Meta publishing", state.meta_paused ? "Paused" : "Enabled", state.meta_paused ? metaDetails : state.dry_run ? "Dry run is on; publish requests are suppressed." : "The runner publishes at scheduled slots.", state.meta_paused ? "amber" : "")}
     ${health("Gemini quota", quotaText, quotaBlocked ? `Runner reported a block until ${formatTime(runtime.gemini_blocked_until)}.` : "Remaining daily allowance is not exposed by the pipeline.", quotaBlocked ? "amber" : quotaKnown ? "" : "gray")}
     ${state.limits
       .filter((l) => l.source !== "meta_graph")
@@ -287,6 +299,12 @@ async function itemPage() {
   const id = decodeURIComponent(location.pathname.split("/")[2]);
   detail = await api("/api/items/" + encodeURIComponent(id));
   const i = detail.item;
+  let renderHelp = "Render previews will appear when available.";
+  if (i.stage === "needs_review") {
+    renderHelp = "Review the hook and cut segment before rendering.";
+  } else if (detail.media.a && detail.media.b && detail.actions.includes("approve")) {
+    renderHelp = "Play both variants before approving.";
+  }
   const video = (v, title) =>
     `<div class="video-card"><header><h3>${title}</h3>${pill(v.toUpperCase(), "pink")}</header>${detail.media[v] ? `<video controls preload="metadata" src="/media/${encodeURIComponent(i.id)}/${v}#t=0.1" aria-label="${title}"></video>` : empty("No render available for this variant.")}</div>`;
   content.innerHTML =
@@ -303,7 +321,7 @@ async function itemPage() {
     (i.preview_only
       ? '<div class="notice">Preview-only item. Approval and pipeline controls are blocked.</div>'
       : "") +
-    `<div class="grid-main"><section class="panel">${panelHead("Render comparison", "Play both variants before approving.")}
+    `<div class="grid-main"><section class="panel">${panelHead("Render comparison", renderHelp)}
  <div class="video-grid">${video("a", "Captions only")}${video("b", "Voiceover + clip")}</div>
  <div class="detail-actions">${detail.actions
    .filter((a) => ["approve", "aonly", "reject", "hookok"].includes(a))
@@ -408,10 +426,20 @@ function drawLines(id, labels, series) {
     left + (labels.length === 1 ? pw / 2 : (pw * i) / (labels.length - 1));
   const y = (v) => top + ph * (1 - v / max);
   const stride = Math.max(1, Math.ceil(labels.length / 5));
-  ctx.textAlign = "center";
-  labels.forEach((label, i) => {
-    if (i % stride === 0 || i === labels.length - 1)
-      ctx.fillText(label, x(i), h - 9);
+  const ticks = labels.map((label, i) => {
+    const width = Math.min(ctx.measureText(label).width, w - 8);
+    const start = Math.min(Math.max(4, x(i) - width / 2), w - 4 - width);
+    return { label, start, width };
+  });
+  const last = ticks.at(-1);
+  ctx.textAlign = "left";
+  let nextStart = 4;
+  ticks.forEach(({ label, start, width }, i) => {
+    if (i === ticks.length - 1 ||
+        (i % stride === 0 && start >= nextStart && start + width + 8 <= last.start)) {
+      ctx.fillText(label, start, h - 9, width);
+      nextStart = start + width + 8;
+    }
   });
   for (const s of series) {
     ctx.strokeStyle = s.color;
@@ -537,7 +565,7 @@ function openAction(action, id) {
   else if (action === "reslot")
     fields.innerHTML = `<label for="slot-after">Find a free slot after (UTC)</label><input id="slot-after" type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}"><p class="reason">The scheduler uses ${escape(state.timezone)}, the configured minimum gap and at most two items per local day. The next free slot is recalculated when applied.</p>`;
   else
-    fields.innerHTML = `<p class="reason">${action === "pause" ? "This uses the runner’s Meta cooldown and stays paused until resumed. A request already in flight may finish." : action === "resume" ? "This clears the current Meta cooldown, including an API-imposed pause. The runner resumes at eligible slots." : action === "hookok" ? "Confirm that the current hook fits the cut, or that the source-text layout is acceptable. The item returns to rendering before approval." : "This decision will be revalidated against the item’s current state before the runner applies it."}</p>`;
+    fields.innerHTML = `<p class="reason">${action === "pause" ? "This holds posting until you lift the dashboard pause. A request already in flight may finish." : action === "resume" ? "This lifts the dashboard pause. Any Meta cooldown stays in effect until it expires." : action === "hookok" ? "Confirm that the current hook fits the cut, or that the source-text layout is acceptable. The item returns to rendering before approval." : "This decision will be revalidated against the item’s current state before the runner applies it."}</p>`;
   document.querySelector("#submit-action").textContent = "Review change";
   dialog.showModal();
 }

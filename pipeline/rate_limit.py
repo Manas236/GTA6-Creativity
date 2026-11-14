@@ -10,19 +10,59 @@ from . import clock, db
 log = logging.getLogger(__name__)
 
 
-def is_source_paused(source: str, db_path: Any = None) -> tuple[bool, str]:
-    """Check if a source is currently under cooldown."""
+META_SOURCE = "meta_graph"
+_DASHBOARD_META_PAUSE = "dashboard:meta_pause"
+_DASHBOARD_PAUSE_REASON = "Paused by dashboard; resume from the control panel"
+# Older dashboards used a year-9999 API cooldown to signal an indefinite pause.
+_LEGACY_DASHBOARD_PAUSE = "paused_until >= '9998' AND last_error = ?"
+
+
+def dashboard_meta_paused(db_path: Any = None) -> bool:
+    if db.kv_get(_DASHBOARD_META_PAUSE, db_path=db_path) == "1":
+        return True
     with db.db(db_path) as conn:
-        row = conn.execute("SELECT paused_until, last_error FROM rate_limits WHERE source = ?", (source,)).fetchone()
-        if not row or not row["paused_until"]:
-            return False, ""
-        
-        paused_until = db.parse_ts(row["paused_until"])
-        now_dt = clock.utcnow()
-        if now_dt < paused_until:
-            rem_s = (paused_until - now_dt).total_seconds()
-            return True, f"Paused for {rem_s / 3600:.1f}h more due to: {row['last_error']}"
-        return False, ""
+        return conn.execute(
+            f"SELECT 1 FROM rate_limits WHERE source = ? AND {_LEGACY_DASHBOARD_PAUSE}",
+            (META_SOURCE, _DASHBOARD_PAUSE_REASON),
+        ).fetchone() is not None
+
+
+def set_dashboard_meta_pause(paused: bool, db_path: Any = None) -> None:
+    with db.db(db_path) as conn:
+        with db.connection_scope(conn, db_path):
+            db.kv_set(_DASHBOARD_META_PAUSE, "1" if paused else "0", db_path)
+            conn.execute(
+                f"UPDATE rate_limits SET paused_until = NULL, consecutive_errors = 0, "
+                f"updated_at = ? WHERE source = ? AND {_LEGACY_DASHBOARD_PAUSE}",
+                (db.now(), META_SOURCE, _DASHBOARD_PAUSE_REASON),
+            )
+
+
+def active_cooldown(source: str, db_path: Any = None) -> tuple[str | None, str]:
+    """Return an active provider deadline and reason, excluding the legacy dashboard sentinel."""
+    with db.db(db_path) as conn:
+        row = conn.execute(
+            "SELECT paused_until, last_error FROM rate_limits WHERE source = ?", (source,)
+        ).fetchone()
+    if not row or not row["paused_until"]:
+        return None, ""
+    deadline = row["paused_until"]
+    if source == META_SOURCE and deadline >= "9998" and row["last_error"] == _DASHBOARD_PAUSE_REASON:
+        return None, ""
+    if db.parse_ts(deadline) <= clock.utcnow():
+        return None, ""
+    return deadline, row["last_error"] or ""
+
+
+def is_source_paused(source: str, db_path: Any = None) -> tuple[bool, str]:
+    """Check the dashboard hold and provider cooldown for Meta, or just the source cooldown."""
+    if source == META_SOURCE and dashboard_meta_paused(db_path):
+        return True, _DASHBOARD_PAUSE_REASON
+    deadline, reason = active_cooldown(source, db_path)
+    if deadline:
+        rem_s = (db.parse_ts(deadline) - clock.utcnow()).total_seconds()
+        return True, f"Paused for {rem_s / 3600:.1f}h more due to: {reason}"
+    return False, ""
 
 
 def record_error(
