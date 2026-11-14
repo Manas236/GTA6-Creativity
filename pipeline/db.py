@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -238,9 +239,31 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+_SCOPED_CONNECTION = contextvars.ContextVar("pipeline_scoped_connection", default=None)
+
+
+@contextlib.contextmanager
+def connection_scope(connection: sqlite3.Connection, db_path: Path | str | None = None):
+    """Reuse a caller-owned connection in existing helpers, without nested commits.
+
+    The caller owns transaction/rollback and closing. Context-local, so other threads
+    (including the runner heartbeat) keep their own connections.
+    """
+    key = str(Path(db_path or DEFAULT_DB_PATH).resolve())
+    token = _SCOPED_CONNECTION.set((key, connection))
+    try:
+        yield connection
+    finally:
+        _SCOPED_CONNECTION.reset(token)
+
+
 @contextlib.contextmanager
 def db(db_path: Path | str | None = None) -> Generator[sqlite3.Connection, None, None]:
     """Context manager for SQLite connection with automatic commit/rollback."""
+    scoped = _SCOPED_CONNECTION.get()
+    if scoped and scoped[0] == str(Path(db_path or DEFAULT_DB_PATH).resolve()):
+        yield scoped[1]
+        return
     conn = get_connection(db_path)
     try:
         yield conn

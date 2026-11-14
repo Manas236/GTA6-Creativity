@@ -766,7 +766,12 @@ def run_hooks_for_item(
     segment = (float(item.get("cut_start") or 0.0), float(item.get("cut_end") or 0.0))
     frames = extract_sample_frames(cut_path, count=4)     # once: the generation and the check see the same frames
 
-    max_attempts = max(1, int(gs["max_attempts"]))
+    try:
+        review = json.loads(item.get("hook_review") or "{}")
+    except (ValueError, TypeError):
+        review = {}
+    requested = isinstance(review, dict) and review.get("kind") == "dashboard_edit"
+    max_attempts = 1 if requested else max(1, int(gs["max_attempts"]))
     fail_limit = max(1, int(gs["grounding_fail_limit"]))   # 2 = the first hook + one regeneration
     problems: list[str] = []
     check_fails = 0
@@ -778,10 +783,17 @@ def run_hooks_for_item(
     for attempt in range(1, max_attempts + 1):
         log.info("Generating hook for item %s (attempt %d/%d)...", item_id, attempt, max_attempts)
         try:
-            data = generate_hook_and_voiceover(
-                cut_path, source_title, transcript_text=transcript, model=model, cfg=cfg,
-                authenticity=source_tag, frames=frames, segment=segment, previous_failure=previous_failure,
-            )
+            if requested:
+                # The dashboard supplies a candidate only. All normal checks below still run
+                # here in the runner, and only this function can stamp it segment_check.
+                data = {"hook_text": item["hook_text"], "voiceover_script": item.get("voiceover_script") or "",
+                        "hook_style": item.get("hook_style") or "question", "authenticity": source_tag,
+                        "keywords": []}
+            else:
+                data = generate_hook_and_voiceover(
+                    cut_path, source_title, transcript_text=transcript, model=model, cfg=cfg,
+                    authenticity=source_tag, frames=frames, segment=segment, previous_failure=previous_failure,
+                )
         except GeminiTransientError as e:
             return _wait_for_gemini(item, e, cfg, db_path)       # not an attempt: next cycle
         except Exception as e:
@@ -808,7 +820,7 @@ def run_hooks_for_item(
                              "reason": reason})
             log.warning("Hook failed the segment check (%d/%d): %s. Reason: %s",
                         check_fails, fail_limit, data["hook_text"], reason)
-            if check_fails >= fail_limit:
+            if requested or check_fails >= fail_limit:
                 return _send_to_review(item, data, rejected, transcript, words, db_path)
             previous_failure = f'the hook "{data["hook_text"]}" was rejected: {reason}'
         else:

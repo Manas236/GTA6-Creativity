@@ -172,6 +172,8 @@ def print_status(db_path: Any = None) -> None:
 def _stage_settle(cfg: dict[str, Any], db_path: Any) -> Any:
     # CP3 crash recovery comes first: rows left in 'publishing' by a crash are resolved against
     # the remote before anything new is published, and never published a second time.
+    if posting.meta_paused(db_path)[0]:
+        return []
     return posting.settle_publishing_rows(cfg=cfg, db_path=db_path)
 
 
@@ -266,6 +268,9 @@ def run_stages(
     for name, fn in stages or STAGES:
         t_stage = time.time()
         try:
+            # Controls are applied only at a boundary, never over an in-flight render/publish.
+            from dashboard.commands import runner_boundary
+            runner_boundary(cfg, db_path, name)
             results[name] = fn(cfg, db_path)
             log.info("Stage %-9s ok in %.1fs: %s", name, time.time() - t_stage, str(results[name])[:300])
         except Exception as e:  # noqa: BLE001 - this is the isolation boundary
