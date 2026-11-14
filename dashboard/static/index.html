@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GTA VI · Pipeline Control</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="/"
+        ><span class="brand-mark">VI</span
+        ><span
+          >PIPELINE<span class="brand-sub">GTA 6 · CREATOR STUDIO</span></span
+        ></a
+      >
+      <div class="nav-label">WORKSPACE</div>
+      <nav aria-label="Main navigation">
+        <a href="/" data-page="overview"
+          ><span class="nav-icon">◈</span>Overview</a
+        >
+        <a href="/queue" data-page="queue"
+          ><span class="nav-icon">▤</span>Queue & calendar<span
+            id="nav-queued"
+            class="nav-count"
+          ></span
+        ></a>
+        <a href="/analytics" data-page="analytics"
+          ><span class="nav-icon">↗</span>Analytics</a
+        >
+        <a href="/failures" data-page="failures"
+          ><span class="nav-icon">◉</span>Failures & review<span
+            id="nav-failed"
+            class="nav-count"
+          ></span
+        ></a>
+      </nav>
+      <div class="sidebar-bottom">
+        <span class="signal-dot"></span>LOCAL WORKSPACE
+        <p id="sidebar-profile">Connecting to SQLite…</p>
+        <div class="small">127.0.0.1 · Private control panel</div>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <span id="breadcrumb">Workspace / Overview</span>
+        <div class="topbar-right">
+          <span id="refresh-status" aria-live="polite">Connecting…</span
+          ><button class="icon-button" id="refresh" aria-label="Refresh data">
+            ↻
+          </button>
+        </div>
+      </header>
+      <div id="mode-banner" class="mode-banner"></div>
+      <main id="content"><div class="empty">Loading pipeline state…</div></main>
+      <footer id="footer">Reading local pipeline state</footer>
+    </div>
+    <div id="toast" class="toast" role="status" hidden></div>
+    <dialog id="action-dialog" aria-labelledby="dialog-title">
+      <form id="action-form">
+        <div class="dialog-top">
+          <span class="eyebrow">PIPELINE CONTROL</span
+          ><button
+            type="button"
+            class="icon-button"
+            id="close-dialog"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <h2 id="dialog-title"></h2>
+        <p id="dialog-item" class="muted"></p>
+        <div id="action-fields"></div>
+        <p id="dialog-error" class="error" role="alert"></p>
+        <div id="confirm-content" hidden></div>
+        <div class="dialog-actions">
+          <button type="button" id="cancel-dialog" class="button secondary">
+            Cancel</button
+          ><button class="button primary" id="submit-action">
+            Review change
+          </button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

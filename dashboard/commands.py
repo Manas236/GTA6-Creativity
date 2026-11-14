@@ -170,6 +170,10 @@ def validate(action, item, posts, payload):
     elif action == "edit_hook":
         if stage not in EDITABLE:
             raise ControlError("Hook editing requires an unposted cut or render.")
+        if not item.get("hook_text") or not item.get("voiceover_script"):
+            raise ControlError(
+                "Wait for the runner to create the original hook and voiceover script before editing."
+            )
         raw_text = payload.get("hook_text")
         if not isinstance(raw_text, str):
             raise ControlError("Hook text must be a string.")
@@ -216,7 +220,7 @@ def available_actions(item, posts):
         actions += ["approve", "aonly", "reject"]
     if stage == "needs_review":
         actions += ["hookok", "reject"]
-    if stage in EDITABLE:
+    if stage in EDITABLE and item.get("hook_text") and item.get("voiceover_script"):
         actions.append("edit_hook")
     if stage == "queued" and posts:
         actions.append("reslot")
