@@ -18,8 +18,19 @@ assets/models/
 *.mp4
 *.mkv
 *.webm
+*.mov
 *.wav
 *.mp3
+*.m4a
+*.aac
+*.flac
+*.opus
+*.ogg
+# yt-dlp partial downloads
+*.part
+*.ytdl
+# fetched by scripts/fetch_assets.py (music bed + its generated LICENSES.md)
+assets/music/
 
 # ...but the committed style-layer SFX (A1, CC0, see assets/sfx/LICENSES.md) stay in.
 # The CC0 music bed (A2) is NOT committed: scripts/fetch_assets.py downloads it.
@@ -51,3 +62,7 @@ samples/synthetic/style_report.json
 
 # Local dated backups (hold copies of .env, pipeline.db, configs)
 backups/
+
+# Windows / OneDrive folder metadata
+desktop.ini
+Thumbs.db
