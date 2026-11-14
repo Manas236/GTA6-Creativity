@@ -106,3 +106,9 @@ so two machines with two databases would not see each other and could both post.
 
 Datacenter IP ranges are often throttled by YouTube (PLAN.md §12): the pipeline then pauses
 that source and alerts on Telegram; it does not use cookies or proxies to get around it.
+
+## Dashboard
+
+Run `python -m dashboard` and open http://127.0.0.1:8765 for the local queue,
+previews, analytics and confirmed controls. Keep the runner loop running to apply
+commands between stages. Setup, demo data and safety details: [DASHBOARD.md](DASHBOARD.md).
