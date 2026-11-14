@@ -12,6 +12,13 @@ Open **http://127.0.0.1:8765**. Start the normal runner in a second terminal wit
 out this branch so it loads the command consumer. The dashboard never starts it,
 takes its lock, changes `app.dry_run`, or publishes anything.
 
+On Windows, double-click **setup.bat** once to create `.venv` if necessary,
+upgrade pip and install `requirements.txt`. It is safe to rerun. Then double-click
+**dashboard.bat** to activate that environment, start the dashboard and open its
+loopback URL in your browser. The launcher runs setup if `.venv` is absent and
+pauses on errors so the message stays visible. Both scripts work from Explorer
+regardless of its current directory. Stop the dashboard with Ctrl-C in its window.
+
 ## Stack
 
 Flask provides small Python routes, signed sessions and confirmation tickets.
@@ -42,6 +49,22 @@ checks, scheduling and publishing.
   totals, not age-normalized causal comparisons.
 - **Failures & review:** failed/rejected items with stage/reason, needs-review
   items, and the existing 24h `cut_outcome_stats` no-clean-ending rate.
+- **Connections:** per-service Test buttons and a parallel Test all, using the
+  current local `.env` without sending its values to the browser. Loading,
+  refreshing and polling never run probes. Results show masked API errors,
+  status and last-check time; they remain in memory until the dashboard stops.
+  Green means OK, red failed, amber a Meta expiry/scope warning, grey unset or
+  not checked. Each check has a 10-second deadline. Empty credentials skip HTTP.
+  Gemini only lists models, Telegram only reads bot/chat details, Meta reads
+  identity/token metadata using the configured Graph version, and Twitch obtains
+  an in-memory app token and reads the games endpoint. Meta may require a separate
+  app/developer credential to inspect some token types; its actual error is shown
+  if the configured Page token cannot inspect itself. No validity is inferred.
+  **Healthchecks Test and Test all send a real success ping**, which can reset
+  its alert timer. Only HTTPS ping URLs ending at a check UUID are accepted;
+  status suffixes, queries and redirects are rejected. **Send test message** is
+  a separate, explicit Telegram action and is never part of Test all. Connection
+  checks and this send action are immediate and do not need a running runner.
 
 The UI polls every 15 seconds, pausing while a confirmation dialog is open.
 Item media is not reset by background polling; use Refresh to reload details.
@@ -85,8 +108,9 @@ Started, ambiguous or failed publishing is display-only. Even a dry-run row with
 an upload/container/attempt record is conservatively treated as started. No
 control resets publishing state or retries Meta. Preview-only/synthetic items
 are refused cleanly before approval; existing database triggers remain intact.
-The physical Telegram message is not edited by this app: its stored card is
-released, and a later button tap is stale. No dashboard code sends Telegram.
+The physical Telegram approval message is not edited by this app: its stored card
+is released, and a later button tap is stale. Only the separate Connections
+**Send test message** button sends a Telegram message.
 
 ### Posting pause ownership
 

@@ -109,6 +109,7 @@ that source and alerts on Telegram; it does not use cookies or proxies to get ar
 
 ## Dashboard
 
-Run `python -m dashboard` and open http://127.0.0.1:8765 for the local queue,
+On Windows, double-click `setup.bat` once, then `dashboard.bat` to open the local
+panel. Or run `python -m dashboard` and open http://127.0.0.1:8765 for the local queue,
 previews, analytics and confirmed controls. Keep the runner loop running to apply
 commands between stages. Setup, demo data and safety details: [DASHBOARD.md](DASHBOARD.md).
