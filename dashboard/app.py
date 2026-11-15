@@ -176,7 +176,7 @@ def create_app(db_path=None, cfg=None, media_root=None):
         if not secrets.compare_digest(plan["client"], session["csrf"]):
             abort(403)
         command_id = hashlib.sha256(ticket.encode()).hexdigest()[:32]
-        result = commands.enqueue(plan, command_id, path)
+        result = commands.submit(plan, command_id, path, settings())
         return jsonify(command=result), 202
 
     @app.get("/media/<item_id>/<variant>")

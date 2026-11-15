@@ -45,7 +45,8 @@ def forbid_dashboard_side_effects(monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         raise AssertionError("dashboard attempted an external API or runner lock")
 
-    monkeypatch.setattr(runner, "acquire_lock", forbidden)
+    # Existing mailbox tests exercise an active runner.
+    monkeypatch.setattr(runner, "active_lock", lambda *args: {"token": "test"})
     monkeypatch.setattr(posting.MetaClient, "request", forbidden)
     monkeypatch.setattr(telegram_bot.ApprovalBot, "send_message", forbidden)
     monkeypatch.setattr(telegram_bot.ApprovalBot, "send_video", forbidden)
@@ -470,16 +471,20 @@ def test_media_range_and_path_safety(control, clip, tmp_db, tmp_path):
     )
 
 
-def test_controls_leave_runner_lock_and_dry_run_unchanged(control, clip, tmp_db):
-    _, _, cfg, _ = control
-    original = config.ROOT_DIR.joinpath("config.yaml").read_bytes()
-    lock = json.dumps({"pid": 123, "host": "test", "heartbeat": 1})
-    db.kv_set("runner:lock", lock, tmp_db)
-    confirmed(control, "aonly", clip["id"])
-    commands.runner_boundary(cfg, tmp_db, "schedule")
-    assert db.kv_get("runner:lock", db_path=tmp_db) == lock
-    assert cfg["app"]["dry_run"] is True
-    assert config.ROOT_DIR.joinpath("config.yaml").read_bytes() == original
+@pytest.mark.parametrize("mode", ["stopped", "alive", "contention", "failure"])
+def test_control_lock_lifecycle(control, clip, tmp_db, monkeypatch, mode):
+    calls = []
+    monkeypatch.setattr(runner, "active_lock", lambda *args: mode == "alive")
+    monkeypatch.setattr(runner, "acquire_lock", lambda *args: calls.append("claim") or mode != "contention")
+    monkeypatch.setattr(runner, "release_lock", lambda *args: calls.append("release"))
+    if mode == "failure":
+        def fail(*args):
+            raise RuntimeError("simulated action failure")
+        monkeypatch.setattr(commands, "apply", fail)
+    _, cid = confirmed(control, "aonly", clip["id"])
+    assert calls == {"stopped": ["claim", "release"], "alive": [],
+                     "contention": ["claim"], "failure": ["claim", "release"]}[mode]
+    assert result(tmp_db, cid)["status"] == {"stopped": "applied", "failure": "failed"}.get(mode, "pending")
 
 
 def test_transaction_rollback_and_thread_context_isolation(tmp_db):

@@ -17,6 +17,7 @@ from pipeline import (
     posting,
     rate_limit,
     scheduler,
+    runner,
     telegram_bot,
 )
 from .store import transaction
@@ -299,7 +300,7 @@ def release_card(item_id, path):
 
 
 def apply(command, cfg, path):
-    """Called only by the runner under its existing stage serialization."""
+    """Apply a command while holding the runner lock."""
     action, item_id = command["action"], command["item_id"]
     payload = json.loads(command["payload"])
     item = db.get_item(item_id, path) if item_id else None
@@ -408,36 +409,57 @@ def runner_boundary(cfg, path, stage):
             )
         ]
     for command_id in ids:
-        with transaction(path) as conn:
-            row = conn.execute(
-                "SELECT * FROM dashboard_commands WHERE id=? AND status='pending'",
-                (command_id,),
-            ).fetchone()
-            if row is None:
-                continue
-            conn.execute("SAVEPOINT control")
-            try:
-                message = apply(dict(row), cfg, path)
-                if row["item_id"]:
-                    db.log_stage(
-                        row["item_id"],
-                        "dashboard",
-                        "success",
-                        f"{row['action']}: {message}",
-                        db_path=path,
-                    )
-                status = "applied"
-                conn.execute("RELEASE control")
-            except Exception as exc:
-                conn.execute("ROLLBACK TO control")
-                conn.execute("RELEASE control")
-                if isinstance(exc, (ControlError, binding.CaptionMismatchError)):
-                    status, message = "refused", str(exc)[:500]
-                    log.info("Dashboard command %s refused: %s", command_id, message)
-                else:
-                    status, message = "failed", f"{type(exc).__name__}: {exc}"[:500]
-                    log.exception("Dashboard command %s failed", command_id)
-            conn.execute(
-                "UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
-                (status, message, db.now(), command_id),
-            )
+        apply_pending(command_id, cfg, path)
+
+
+def apply_pending(command_id, cfg, path):
+    with transaction(path) as conn:
+        row = conn.execute(
+            "SELECT * FROM dashboard_commands WHERE id=? AND status='pending'",
+            (command_id,),
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute("SAVEPOINT control")
+        try:
+            message = apply(dict(row), cfg, path)
+            if row["item_id"]:
+                db.log_stage(
+                    row["item_id"],
+                    "dashboard",
+                    "success",
+                    f"{row['action']}: {message}",
+                    db_path=path,
+                )
+            status = "applied"
+            conn.execute("RELEASE control")
+        except Exception as exc:
+            conn.execute("ROLLBACK TO control")
+            conn.execute("RELEASE control")
+            if isinstance(exc, (ControlError, binding.CaptionMismatchError)):
+                status, message = "refused", str(exc)[:500]
+                log.info("Dashboard command %s refused: %s", command_id, message)
+            else:
+                status, message = "failed", f"{type(exc).__name__}: {exc}"[:500]
+                log.exception("Dashboard command %s failed", command_id)
+        conn.execute(
+            "UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
+            (status, message, db.now(), command_id),
+        )
+
+        return dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (command_id,)).fetchone())
+
+
+def submit(plan, command_id, path, cfg):
+    command = enqueue(plan, command_id, path)
+    if command["status"] != "pending":
+        return command
+    stale, heartbeat = runner._lock_settings(cfg)
+    if runner.active_lock(path, stale):
+        return command
+    if not runner.acquire_lock(path, stale, heartbeat):
+        return command
+    try:
+        return apply_pending(command_id, cfg, path) or command
+    finally:
+        runner.release_lock(path)
