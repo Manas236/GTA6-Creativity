@@ -85,6 +85,7 @@ def _produce(item_id, cfg, path, *, remake_cut=False):
     def progress(stage):
         if runner.stopping(path):
             raise StopRequested()
+        log.info("Make item %s stage %s", item_id, stage)
         runner.set_stage(stage, path)
         db.transition_stage(item_id, db.get_item(item_id, path)["stage"], {"creation_phase": stage}, path)
 

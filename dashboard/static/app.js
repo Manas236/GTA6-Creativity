@@ -646,8 +646,11 @@ function openAction(action, id) {
   pendingAction = { action, item_id: id || null };
   confirmation = null;
   document.querySelector("#dialog-title").textContent = labels[action];
-  document.querySelector("#dialog-item").textContent =
-    itemById(id)?.original_title || "Instagram + Facebook";
+  const subtitle = document.querySelector("#dialog-item");
+  const destination = ["make", "clip_url"].includes(action) ? state.posting_destination : null;
+  subtitle.textContent = destination?.text || itemById(id)?.original_title || "";
+  subtitle.classList.toggle("warning-text", Boolean(destination?.warning));
+  subtitle.hidden = !subtitle.textContent;
   document.querySelector("#dialog-error").textContent = "";
   document.querySelector("#confirm-content").hidden = true;
   const fields = document.querySelector("#action-fields");
@@ -714,7 +717,9 @@ document
         document.querySelector("#dialog-error").textContent = "";
         const node = document.querySelector("#confirm-content");
         node.hidden = false;
-        node.innerHTML = `<p><strong>${escape(confirmation.description)}</strong></p>${payload.hook_text ? `<p>“${escape(payload.hook_text)}”</p>` : ""}<p class="muted">${state.lock.status === "alive" ? `Queued changes typically apply within about ${state.interval}s. Active stages can take longer.` : "This starts as soon as you confirm."}</p><p class="muted">Confirm this change to ${escape(confirmation.title)}?</p>`;
+        const target = ["make", "clip_url"].includes(pendingAction.action)
+          ? "" : `<p class="muted">Confirm this change to ${escape(confirmation.title)}?</p>`;
+        node.innerHTML = `<p><strong>${escape(confirmation.description)}</strong></p>${payload.hook_text ? `<p>“${escape(payload.hook_text)}”</p>` : ""}<p class="muted">${state.lock.status === "alive" ? `Queued changes typically apply within about ${state.interval}s. Active stages can take longer.` : "This starts as soon as you confirm."}</p>${target}`;
         document.querySelector("#dialog-title").textContent =
           "Confirm your change";
         submit.textContent = pendingAction.action === "post_now" && state.lock.status !== "alive" ? "Start runner and post" : "Confirm";
@@ -829,14 +834,24 @@ function library() {
     <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Select</th><th scope="col">Clip</th><th scope="col">Source</th><th scope="col">Stage</th></tr></thead>
     <tbody>${items.map((i) => `<tr><td>${i.actions.some((a) => ["delete", "reject"].includes(a)) ?
       `<input type="checkbox" data-select-item value="${escape(i.id)}" aria-label="Select ${escape(i.original_title)}" ${selectedItems.has(i.id) ? "checked" : ""}>` : ""}
-    </td><td><a href="${itemLink(i.id)}">${escape(i.original_title)}</a></td><td>${escape(i.author_name)} · ${escape(i.source)}</td>
+    </td><td><a class="library-clip" href="${itemLink(i.id)}"><img class="library-thumb" src="/media/${encodeURIComponent(i.id)}/thumb" alt="" loading="lazy" width="64" height="36">${escape(i.original_title)}</a></td><td>${escape(i.author_name)} · ${escape(i.source)}</td>
     <td>${pill(pretty(i.stage))}</td></tr>`).join("")}</tbody></table></div></section>${commandsPanel()}`;
 }
 
 async function bulkAction(action) {
   const ids = [...selectedItems].filter((id) => itemById(id)?.actions.includes(action));
   if (!ids.length) { toast("Select items eligible for that action."); return; }
-  if (!window.confirm(`${labels[action]} for ${ids.length} selected item(s)?`)) return;
+  const count = `${ids.length} ${ids.length === 1 ? "clip" : "clips"}`;
+  const question = action === "delete"
+    ? `Deletes the video files for ${count} for good. The ${ids.length === 1 ? "item stays" : "items stay"} in history so discovery never picks ${ids.length === 1 ? "this clip" : "these clips"} again. This can't be undone.`
+    : `${labels[action]} for ${count}?`;
+  const bulkDialog = document.querySelector("#bulk-dialog");
+  document.querySelector("#bulk-title").textContent = action === "delete" ? "Delete selected clips" : "Reject selected clips";
+  document.querySelector("#bulk-description").textContent = question;
+  bulkDialog.returnValue = "";
+  bulkDialog.showModal();
+  await new Promise((resolve) => bulkDialog.addEventListener("close", resolve, { once: true }));
+  if (bulkDialog.returnValue !== "confirm") return;
   const counts = {};
   for (const item_id of ids) {
     try {
@@ -878,7 +893,8 @@ function settingsForm() {
     <div class="grid-half"><label>Ready buffer<input type="number" name="buffer" min="1" max="50" value="${preferences.buffer}" required></label>
     <label>Official-channel weight<input type="number" name="official_weight" min="0" max="5" step="any" value="${preferences.official_weight}" required></label>
     <label>Heatmap weight<input type="number" name="heatmap_weight" min="0" max="2" step="any" value="${preferences.heatmap_weight}" required></label></div>
-    <div class="detail-actions"><button class="button primary">Save settings</button><span>${state.dry_run ? "Dry run enabled" : "Live posting enabled"}</span></div>
+    <dl class="settings-status"><dt>Dry run</dt><dd>${pill(state.dry_run ? "Enabled" : "Disabled", state.dry_run ? "amber" : "gray")}</dd></dl>
+    <div class="detail-actions"><button class="button primary">Save settings</button></div>
     </form>`;
 }
 

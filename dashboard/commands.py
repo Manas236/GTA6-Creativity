@@ -25,6 +25,7 @@ from pipeline import (
     telegram_bot,
 )
 from .store import transaction
+from .presentation import slot_time
 from . import queue_controls
 
 log = logging.getLogger(__name__)
@@ -318,6 +319,9 @@ def prepare(action, item_id, payload, path, cfg):
     posts = posting.get_posts_for_item(item_id, path) if item_id else []
     validate(action, item, posts, payload, path)
     detail = ACTIONS[action]
+    if action == "delete":
+        detail = ("Deletes this clip's video files for good. The item stays in history so discovery "
+                  "never picks this clip again. This can't be undone.")
     if action == "post_now":
         if posting.meta_paused(path)[0] or not posting.enabled_platforms(cfg):
             raise ControlError("Posting is paused or no platforms are enabled.")
@@ -326,7 +330,7 @@ def prepare(action, item_id, payload, path, cfg):
         except ValueError as exc:
             raise ControlError(str(exc)) from None
         payload = {**payload, "slot": clock.iso(slot)}
-        detail = f"Earliest allowed slot: {slot.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}"
+        detail = f"Earliest allowed slot: {slot_time(slot, cfg)}"
         if posting.is_dry_run(cfg):
             detail += " (dry run)"
         if not runner.active_lock(path, runner._lock_settings(cfg)[0]):
@@ -339,7 +343,7 @@ def prepare(action, item_id, payload, path, cfg):
         slot = scheduler.next_free_slot(
             clock.parse(payload["after"]), bounded, path, item_id
         )
-        detail = f"Next available slot: {slot.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}"
+        detail = f"Next available slot: {slot_time(slot, cfg)}"
     return {
         "action": action,
         "item_id": item_id,
@@ -459,7 +463,7 @@ def apply(command, cfg, path):
         posting.ensure_post_rows(item, clock.iso(slot), cfg, path)
         queue_controls.set_slot(item_id, clock.iso(slot), path)
         db.transition_stage(item_id, "queued", db_path=path)
-        return f"Scheduled for {slot.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}."
+        return f"Scheduled for {slot_time(slot, cfg)}."
     if action == "edit_hook":
         with db.db(path) as conn:
             conn.execute("DELETE FROM posts WHERE item_id = ?", (item_id,))
@@ -500,7 +504,7 @@ def apply(command, cfg, path):
                 "WHERE item_id = ?",
                 (slot, db.now(), item_id),
             )
-        return f"Moved to {slot}."
+        return f"Moved to {slot_time(clock.parse(slot), cfg)}."
     fields = {"error_stage": None, "error_message": None}
     if item["error_stage"] in ("download", "cut"):
         fields.update(binding.SEGMENT_CONTENT_FIELDS)

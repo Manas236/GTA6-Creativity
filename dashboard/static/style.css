@@ -1054,3 +1054,17 @@ dialog label {
 .settings-switches input, [data-select-item] { width: auto; }
 #settings-form label:not(.settings-switches label) { display: grid; gap: 6px; }
 .runner-controls { margin: 0 0 8px; }
+
+#settings-form + .page-heading { margin-top: 22px; }
+.settings-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+.settings-status dd { margin: 0; }
+#dialog-item.warning-text { color: var(--amber); }
+#clip-url { width: 100%; }
+.library-clip { display: flex; align-items: center; gap: 10px; }
+.library-thumb { flex: none; object-fit: cover; border-radius: 5px; background: #242c3a; }

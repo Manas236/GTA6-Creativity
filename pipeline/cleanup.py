@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import clock, config, db, posting
+from . import clock, config, db, media_paths, posting
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +112,11 @@ class Cleaner:
             sets = ", ".join(f"{c} = NULL" for c in cleared)
             with db.db(self.db_path) as conn:
                 conn.execute(f"UPDATE items SET {sets}, updated_at = ? WHERE id = ?", (db.now(), item["id"]))
+
+        if columns == ALL_COLUMNS or any(col in cleared for col in ("render_a_path", "cut_path")):
+            thumbnail = media_paths.thumbnail_path(item["id"], self.media_root.resolve())
+            if thumbnail is not None:
+                self._delete(thumbnail)
 
     def _items(self, stages: tuple[str, ...]) -> list[dict[str, Any]]:
         marks = ", ".join("?" for _ in stages)

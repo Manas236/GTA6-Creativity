@@ -254,3 +254,8 @@ This is suitable for the initial local workload, but needs pagination/aggregatio
 for a large archive. Command history is retained; no new cleanup policy deletes
 it. Existing media retention remains with the pipeline. An edited item's old
 render files can remain until overwritten or existing retention removes them.
+
+Run `scripts\windows_smoke.bat [database.db] [--youtube "URL"] [--twitch "VOD_URL"]` after `setup.bat`; the default DB is the repo’s `pipeline.db`.
+The script opens the source read-only, then runs a private dry-run dashboard and workers on a temporary copy.
+Make N uses real discovery, so it needs an eligible new source; omit either replay URL to skip that check.
+See the console summary and `media/smoke/windows_smoke_<timestamp>.txt`.

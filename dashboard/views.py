@@ -10,6 +10,7 @@ from pathlib import Path
 from pipeline import binding, clock, db, posting, rate_limit, scheduler, telegram_bot
 from .commands import available_actions, display_settings
 from .store import snapshot
+from .presentation import posting_destination
 
 
 def decode(raw):
@@ -136,6 +137,7 @@ def state(path, cfg):
             "approval_mode": telegram_bot.effective_mode(cfg, path),
             "days_live": db.days_since_first_live(path),
             "dry_run": posting.is_dry_run(cfg),
+            "posting_destination": posting_destination(cfg),
             "profile": profile,
             "timezone": str(tz),
             "slots": [s.strftime("%H:%M") for s in slots],

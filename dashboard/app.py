@@ -11,10 +11,11 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from pipeline import binding, config, creation, db, runner
+from pipeline import binding, config, creation, db, media_paths, runner
 import connection_checks
 from . import commands, settings as preferences, views, workers
 from .store import initialize, snapshot
+from .thumbnails import Thumbnails
 
 
 def create_app(db_path=None, cfg=None, media_root=None):
@@ -30,6 +31,7 @@ def create_app(db_path=None, cfg=None, media_root=None):
     app.config["DASHBOARD_DB"] = path
     signer = URLSafeTimedSerializer(app.secret_key, salt="dashboard-confirmation")
     root = Path(media_root or config.media_root()).resolve()
+    thumbnails = Thumbnails(path, root)
     demo = bool(db.kv_get("dashboard:demo", db_path=path))
     connection_results = {}
     connection_lock = threading.Lock()
@@ -236,22 +238,18 @@ def create_app(db_path=None, cfg=None, media_root=None):
 
     @app.get("/media/<item_id>/<variant>")
     def media(item_id, variant):
-        column = {"a": "render_a_path", "b": "render_b_path", "cut": "cut_path"}.get(
-            variant
-        )
+        if variant == "thumb":
+            thumbnail = thumbnails.get(item_id)
+            if thumbnail is not None:
+                return send_file(thumbnail, mimetype="image/jpeg")
+            return app.send_static_file("thumbnail.svg")
+        column = {"a": "render_a_path", "b": "render_b_path", "cut": "cut_path"}.get(variant)
         if not column:
             abort(404)
         with snapshot(path):
             item = db.get_item(item_id, path)
-        value = (item or {}).get(column)
-        if not value:
-            abort(404)
-        video = Path(value).resolve()
-        if (
-            not video.is_relative_to(root)
-            or video.suffix.lower() not in (".mp4", ".mov", ".webm", ".mkv")
-            or not video.is_file()
-        ):
+        video = media_paths.video_path((item or {}).get(column), root)
+        if video is None:
             abort(404)
         return send_file(video, conditional=True, mimetype="video/mp4")
 

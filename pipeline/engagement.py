@@ -24,21 +24,32 @@ def mean(points, start, end):
                for a, b, value in points) / max(0.001, end - start)
 
 
+def chat_replay(url, duration, cfg):
+    """Return the number of timed chat messages and the delayed intensity spikes."""
+    from chat_downloader import ChatDownloader
+
+    client = ChatDownloader()
+    try:
+        messages = client.get_chat(url, timeout=90, inactivity_timeout=15, max_attempts=2)
+        duration = duration or messages.duration
+        if not duration or duration <= 0:
+            raise ValueError("Twitch VOD duration is unavailable.")
+        bins = Counter(int(float(m["time_in_seconds"]) // 10) for m in messages
+                       if m.get("time_in_seconds") is not None and 0 <= m["time_in_seconds"] < duration)
+    finally:
+        client.close()
+    count = sum(bins.values())
+    baseline = count / max(1, math.ceil(duration / 10))
+    offset = float(cfg.get("cut", {}).get("chat_offset_seconds", 5))
+    spikes = [(max(0, i * 10 - offset), (i + 1) * 10 - offset, min(1, n / (6 * baseline)))
+              for i, n in bins.items() if n >= max(3, 3 * baseline) and (i + 1) * 10 > offset]
+    return count, spikes
+
+
 def chat_heatmap(url, duration, cfg):
     """Replay only. Fail open if comments are unavailable."""
     try:
-        from chat_downloader import ChatDownloader
-        client = ChatDownloader()
-        try:
-            messages = client.get_chat(url, timeout=90, inactivity_timeout=15, max_attempts=2)
-            bins = Counter(int(float(m["time_in_seconds"]) // 10) for m in messages
-                           if m.get("time_in_seconds") is not None and 0 <= m["time_in_seconds"] < duration)
-        finally:
-            client.close()
-        baseline = sum(bins.values()) / max(1, math.ceil(duration / 10))
-        offset = float(cfg.get("cut", {}).get("chat_offset_seconds", 5))
-        return [(max(0, i * 10 - offset), (i + 1) * 10 - offset, min(1, n / (6 * baseline)))
-                for i, n in bins.items() if n >= max(3, 3 * baseline) and (i + 1) * 10 > offset]
+        return chat_replay(url, duration, cfg)[1]
     except Exception:
         log.warning("Twitch chat replay unavailable; using audio and scene scoring", exc_info=True)
         return []
