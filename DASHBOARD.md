@@ -7,10 +7,10 @@ python -m pip install -r requirements.txt
 python -m dashboard
 ```
 
-Open **http://127.0.0.1:8765**. Start the normal runner in a second terminal with
-`python -m pipeline.runner loop`. Restart an already-running runner after checking
-out this branch so it loads the command consumer. The dashboard never starts it,
-takes its lock, changes `app.dry_run`, or publishes anything.
+Open **http://127.0.0.1:8765** and use **Start runner** on Overview, or run
+`python -m pipeline.runner loop` from a second terminal. Restart a runner from
+an earlier checkout so it loads the current command consumer. The dashboard
+displays `app.dry_run`; publishing runs in the runner process.
 
 On Windows, double-click **setup.bat** once to create `.venv` if necessary,
 upgrade pip and install `requirements.txt`. It is safe to rerun. Then double-click
@@ -33,8 +33,14 @@ checks, scheduling and publishing.
   age, next five queued items, A/B allocation, runner heartbeat, source/Meta
   cooldowns, and a prominent dry-run banner. Times use the active posting
   profile's timezone, shown beside every calendar. With a running instrumented
-  runner, its observed settings take precedence over changed config on disk;
-  a banner asks for a restart when they differ.
+  runner, its observed scheduling settings stay visible until the next cycle
+  reloads the updated configuration.
+- **Make:** discover a batch or paste a source URL with optional time hints.
+  Job progress lists the stage and result for each requested item.
+- **Review:** compare A/B renders and apply decisions, remake a clip, or edit
+  its hook or caption.
+- **Library:** search or filter all items and select eligible clips for bulk
+  deletion or rejection.
 - **Queue & calendar:** chronological local-day timeline, A/B variant or pending
   draw, per-platform status, search and a filter for every stage. Approved items
   without a slot appear separately. The scheduler owns actual slot allocation.
@@ -49,7 +55,8 @@ checks, scheduling and publishing.
   totals, not age-normalized causal comparisons.
 - **Failures & review:** failed/rejected items with stage/reason, needs-review
   items, and the existing 24h `cut_outcome_stats` no-clean-ending rate.
-- **Connections:** per-service Test buttons and a parallel Test all, using the
+- **Settings:** local scheduling, publishing, Telegram, buffer and discovery
+  preferences. Includes per-service connection Test buttons and a parallel Test all, using the
   current local `.env` without sending its values to the browser. Loading,
   refreshing and polling never run probes. Results show masked API errors,
   status and last-check time; they remain in memory until the dashboard stops.
@@ -66,8 +73,8 @@ checks, scheduling and publishing.
   a separate, explicit Telegram action and is never part of Test all. Connection
   checks and this send action are immediate and do not need a running runner.
 
-The UI polls every 15 seconds, pausing while a confirmation dialog is open.
-Item media is not reset by background polling; use Refresh to reload details.
+The UI polls every 2.5 seconds and pauses polling while a confirmation is open.
+Item players keep playing while status refreshes.
 Gemini's remaining daily allowance is not available locally: the panel displays
 only a cooldown observed by the runner, or **Unknown**. A heartbeat on a different
 host proves recent activity, not a local PID check. No secrets are requested.
@@ -226,29 +233,21 @@ python -m dashboard --db /tmp/gta-dashboard-demo.db --media-root /tmp/gta-dashbo
 The generator refuses existing files and symlinks. It seeds 85 clearly fictional
 items across every stage, multiple weeks of A/B platform metrics, failures,
 reviews and tiny local videos (requires the pipeline's FFmpeg). The UI displays
-a DEMO banner. **Do not run the full pipeline against the demo database:** its
-source URLs and media are examples. HTTP controls can be inspected and queued
-without processing them. Automated tests exercise command application on temp DBs.
+a DEMO banner and forces dry run. Make and URL jobs use stubbed media stages.
+The demo runner handles dashboard commands and skips the live pipeline stages.
+Settings saves use an isolated overlay beside the demo database.
 
 ## Validation and limits
 
-Run `python -m pytest tests/test_dashboard.py -q` and the unchanged full suite with
-`python -m pytest -q`. Every dashboard test uses a temporary database and refuses
-the production path. Tests block external API calls and runner-lock acquisition,
-exercise concurrent confirmation, atomic rollback, stale Telegram callbacks,
-preview refusal, binding/check outcomes, pause/resume, scheduling and retries.
+Run the default suite with `python -m pytest -q`. Dashboard tests use temporary
+databases and exercise mailbox isolation, stopped-runner locking, creation-only
+workers, approval and queue guards, captions, settings and engagement scoring.
+Run `python -m pytest -o addopts= -m live tests/test_live_crash.py` separately
+for the YouTube crash/recovery check in an isolated working directory.
 
-Implementation was exercised on Linux/Python 3.12, not a Windows machine. Windows
-3.11 compatibility follows the existing pipeline plus Waitress; a Windows smoke
-test is still required. Browser screenshots could not be captured in this
-execution environment: Chromium socket creation was denied and the cloud browser
-could not access the local app. No mockups are presented as screenshots.
-
-The unchanged baseline has three render failures under FFmpeg 7.1.5 (freeze-frame
-variant B timing); FFmpeg 7.0.2 reproduces them and its bundled build also lacks a filter
-needed by six source-text fixtures. FFmpeg 4.2.2 passes those three but
-fails other existing filter tests, so downgrading is not a complete fix. See the
-handoff report for exact observed test counts; no existing tests were weakened.
+The default suite was exercised on Linux with Python 3.13 and FFmpeg 9.0.2.
+Chromium screenshots and interaction checks use the isolated demo database.
+Windows 11 setup and worker detachment still need a native smoke test.
 
 Snapshots copy the whole DB into RAM and send all stored metrics to the browser.
 This is suitable for the initial local workload, but needs pagination/aggregation
