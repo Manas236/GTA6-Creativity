@@ -23,6 +23,8 @@ from typing import Any, Sequence
 
 from . import config, endings
 
+HEATMAP_WEIGHT = 0.20
+
 DEFAULTS: dict[str, Any] = {
     "full_transcribe_max_s": 660.0,   # transcribe the whole source up to this length (discovery caps at 600)
     "region_count": 6,                # longer: only this many top-scoring regions...
@@ -52,12 +54,14 @@ class Scorer:
     scan_cut_windows always used), with prefix sums so thousands of windows are cheap."""
 
     def __init__(self, total: float, loudness: Sequence[tuple[float, float]], scene_cuts: Sequence[float],
-                 cfg: dict[str, Any] | None = None):
+                 cfg: dict[str, Any] | None = None, *, engagement=(), weight=0.0):
         cut_cfg = ((cfg or {}).get("cut") or {})
         w = cut_cfg.get("weights", {}) or {}
         self.audio_w = float(w.get("audio_energy", 0.75))
         self.scene_w = float(w.get("visual_interest", 0.25))
         self.total = float(total)
+        self.engagement = engagement
+        self.weight = weight
         pts = sorted((float(t), float(v)) for t, v in loudness)
         self.lt = [t for t, _ in pts]
         self.prefix = [0.0]
@@ -69,7 +73,18 @@ class Scorer:
         i, j = bisect.bisect_left(self.lt, a), bisect.bisect_right(self.lt, b)
         return (self.prefix[j] - self.prefix[i]) / (j - i) if j > i else None
 
+    def signal_bonus(self, a: float, b: float) -> float:
+        if not self.engagement or not self.weight:
+            return 0.0
+        overlap = sum(max(0.0, min(b, end) - max(a, start)) * value
+                      for start, end, value in self.engagement)
+        return self.weight * min(1.0, overlap / (b - a)) if b > a else 0.0
+
     def score(self, a: float, b: float) -> float:
+        base = self.base_score(a, b)
+        return base + self.signal_bonus(a, b) if self.engagement and self.weight else base
+
+    def base_score(self, a: float, b: float) -> float:
         n_cuts = bisect.bisect_right(self.cuts, b) - bisect.bisect_left(self.cuts, a)
         norm_scene = min(1.0, n_cuts / 5.0)
         m = self.mean_lufs(a, b)
@@ -128,7 +143,7 @@ class Candidate:
 
 
 def candidates(regions: Sequence[Region], scorer: Scorer, min_dur: float, max_dur: float,
-               es: dict[str, Any], sw: dict[str, Any]) -> tuple[list[Candidate], int]:
+               es: dict[str, Any], sw: dict[str, Any], *, excluded=None) -> tuple[list[Candidate], int]:
     """(one candidate per clean sentence end that admits a min_dur..max_dur window, best first;
     the number of clean sentence ends found)."""
     step = max(0.05, float(sw["start_step_s"]))
@@ -149,6 +164,8 @@ def candidates(regions: Sequence[Region], scorer: Scorer, min_dur: float, max_du
             pool |= {c for c in scorer.cuts if lo <= c <= hi}          # the old scene-cut snap
             best: Candidate | None = None
             for st in sorted(pool):
+                if excluded and min(end, excluded[1]) - max(st, excluded[0]) >= .5 * (end - st):
+                    continue
                 at_start = any(abs(st - s) <= 1e-6 for s in starts_at_sentence)
                 sc = scorer.score(st, end) + (bonus if at_start else 0.0)
                 if best is None or sc > best.score + 1e-12:

@@ -51,6 +51,16 @@ def secret(key: str, default: str = "") -> str:
     return env.get(key, default)
 
 
+def merge_config(base, override):
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def get_config(reload: bool = False) -> dict[str, Any]:
     """Retrieve parsed config.yaml."""
     global _CONFIG_CACHE
@@ -64,6 +74,9 @@ def get_config(reload: bool = False) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
+    local = ROOT_DIR / "config.local.yaml"
+    if local.is_file():
+        data = merge_config(data, yaml.safe_load(local.read_text(encoding="utf-8")) or {})
     _CONFIG_CACHE = data
     return _CONFIG_CACHE
 

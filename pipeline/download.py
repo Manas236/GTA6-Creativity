@@ -130,7 +130,7 @@ def download_single_item(
     Returns (success, message).
     """
     item_id = item["id"]
-    source = item["source"]
+    source = (item.get("manual_kind") or item["source"]).split("_")[0]
     source_url = item["source_url"]
 
     # Check source rate limit
@@ -150,7 +150,18 @@ def download_single_item(
         except OSError:
             pass
 
+    metadata = {}
+
+    def remember(progress):
+        info = progress.get("info_dict") or {}
+        if progress.get("status") == "finished":
+            for key in ("heatmap", "channel_id", "channel", "uploader", "title"):
+                if info.get(key):
+                    metadata[key] = info[key]
+
     ydl_opts = {
+        "progress_hooks": [remember],
+        "noplaylist": True,
         "format": format_selector(cfg or config.get_config()),
         "outtmpl": str(temp_pattern),
         "quiet": True,
@@ -230,11 +241,25 @@ def download_single_item(
         )
         return False, f"Rejected: Duplicate of {matching_id} ({cov*100:.1f}%)"
 
+    import json
+    from . import engagement, hooks
+
+    fields = {}
+    if source == "youtube" and engagement.spans(metadata.get("heatmap")):
+        fields["heatmap"] = json.dumps(metadata["heatmap"])
+    if item["source"] == "manual":
+        fields.update(
+            channel_id=metadata.get("channel_id") or "",
+            author_name=metadata.get("channel") or metadata.get("uploader") or item["author_name"],
+            original_title=metadata.get("title") or item["original_title"],
+        )
+        fields["authenticity"] = hooks.source_authenticity(fields, cfg)
     # Transition item to 'downloaded' stage
     db.transition_stage(
         item_id,
         "downloaded",
         extra_fields={
+            **fields,
             "download_path": str(final_path),
             "downloaded_at": db.now(),
             "original_duration": duration,

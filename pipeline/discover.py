@@ -203,7 +203,7 @@ def gather_candidates(cfg: dict[str, Any], db_path: Any = None) -> list[dict[str
     return candidates
 
 
-def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> list[dict[str, Any]]:
+def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None, *, limit=None, job_id=None) -> list[dict[str, Any]]:
     """Execute discovery, compute percentile discovery scores with real decay, and write to DB.
 
     Every source goes through the same scoring: its raw velocity is percentile-ranked within
@@ -260,9 +260,33 @@ def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> lis
 
     # Insert into database
     inserted_count = 0
+    new_items = []
     for item in scored_items:
-        if db.insert_discovered_item(item, db_path=db_path):
-            inserted_count += 1
+        if limit is not None and len(new_items) >= limit:
+            break
+        with db.db(db_path) as conn:
+            existing = source_item(item["source"], item["source_id"], db_path)
+            if existing and (limit is not None or existing["source"] == "manual"):
+                continue
+            if db.insert_discovered_item(item, db_path=db_path):
+                inserted_count += 1
+                if limit is not None:
+                    conn.execute("UPDATE items SET dashboard_job=? WHERE id=?", (job_id, item["id"]))
+                    new_items.append(item)
+
 
     log.info("Discovery complete: %d scored, %d newly inserted to DB", len(scored_items), inserted_count)
-    return scored_items
+    return scored_items if limit is None else new_items
+
+
+
+def source_item(source, source_id, db_path=None):
+    """Level-one identity shared by pasted URLs and automatic discovery."""
+    with db.db(db_path) as conn:
+        kind = "twitch_clip" if source == "twitch" else source
+        row = conn.execute(
+            "SELECT id, source FROM items WHERE (source=? AND source_id=?) "
+            "OR (source='manual' AND source_id=?) ORDER BY source='manual' LIMIT 1",
+            (source, source_id, f"{kind}:{source_id}"),
+        ).fetchone()
+    return dict(row) if row else None

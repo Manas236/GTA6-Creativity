@@ -305,6 +305,13 @@ def init_db(db_path: Path | str | None = None) -> None:
         # Gemini outages: the hooks stage waits instead of failing the item (PLAN.md call #177).
         if "transient_errors" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN transient_errors INTEGER DEFAULT 0")
+        for col, kind in {
+            "heatmap": "TEXT", "cut_signal": "TEXT", "caption_body_override": "TEXT",
+            "caption_tags_override": "TEXT", "manual_kind": "TEXT", "hint_start": "REAL",
+            "hint_end": "REAL", "dashboard_job": "TEXT", "dashboard_step": "TEXT", "cut_exclude": "TEXT",
+        }.items():
+            if col not in cols:
+                conn.execute(f"ALTER TABLE items ADD COLUMN {col} {kind}")
         # Created after the migration: the trigger bodies reference items.preview_only.
         conn.executescript(PREVIEW_ONLY_TRIGGERS)
         if "ab_excluded" not in cols:
