@@ -647,7 +647,7 @@ document
           "Confirm your change";
         submit.textContent = "Confirm & queue";
       } else {
-        const result = await api("/api/confirm", {
+        const result = await api("/api/execute", {
           ticket: confirmation.ticket,
         });
         dialog.close();

@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 import json
 import logging
 import os
 import platform
 import socket
+import signal
+import uuid
 import sys
 import threading
 import time
@@ -23,8 +26,16 @@ logging.basicConfig(
 log = logging.getLogger("gta6.runner")
 
 LOCK_KEY = "runner:lock"
-_HEARTBEAT_THREAD: threading.Thread | None = None
-_STOP_HEARTBEAT = threading.Event()
+STOP_KEY = "runner:stop"
+_LEASES: dict[str, tuple[str, threading.Event]] = {}
+
+
+@contextmanager
+def lock_transaction(path):
+    with db.db(path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        with db.connection_scope(conn, path):
+            yield
 
 
 def is_pid_alive(pid: int) -> bool:
@@ -51,83 +62,104 @@ def is_pid_alive(pid: int) -> bool:
             return False
 
 
-def _heartbeat_worker(db_path: Any, interval_s: float) -> None:
-    while not _STOP_HEARTBEAT.wait(timeout=interval_s):
+def lock_state(db_path=None, stale_timeout_s=120.0):
+    try:
+        data = json.loads(db.kv_get(LOCK_KEY, db_path=db_path) or "{}")
+        pid = int(data["pid"])
+        fresh = time.time() - float(data["heartbeat"]) <= stale_timeout_s
+        if fresh and (data["host"] != socket.gethostname() or is_pid_alive(pid)):
+            return data
+    except (ValueError, KeyError, TypeError):
+        pass
+    return {}
+
+
+def _heartbeat_worker(path, interval, token, stop):
+    while not stop.wait(interval):
         try:
-            raw = db.kv_get(LOCK_KEY, db_path=db_path)
-            if raw:
-                data = json.loads(raw)
-                if data.get("pid") == os.getpid():
-                    data["heartbeat"] = time.time()
-                    db.kv_set(LOCK_KEY, json.dumps(data), db_path=db_path)
-        except Exception as e:
-            log.debug("Heartbeat update failed: %s", e)
+            with lock_transaction(path):
+                data = json.loads(db.kv_get(LOCK_KEY, db_path=path) or "{}")
+                if data.get("token") != token:
+                    return
+                data["heartbeat"] = time.time()
+                db.kv_set(LOCK_KEY, json.dumps(data), path)
+        except Exception:
+            log.exception("Runner heartbeat failed")
 
 
-def acquire_lock(db_path: Any = None, stale_timeout_s: float = 120.0, heartbeat_interval_s: float = 30.0) -> bool:
-    """Acquire orchestrator lock. Breaks lock if PID is dead or heartbeat is older than 120s."""
-    now_t = time.time()
-    current_host = socket.gethostname()
-    current_pid = os.getpid()
+def _lease_key(path):
+    return os.path.realpath(path or db.DEFAULT_DB_PATH)
 
-    raw = db.kv_get(LOCK_KEY, db_path=db_path)
-    if raw:
-        try:
-            data = json.loads(raw)
-            lock_pid = data.get("pid")
-            lock_host = data.get("host")
-            lock_heartbeat = float(data.get("heartbeat", 0.0))
 
-            if lock_host == current_host:
-                if not is_pid_alive(lock_pid):
-                    log.warning("Breaking stale lock: process PID %s on host %s is dead", lock_pid, lock_host)
-                elif (now_t - lock_heartbeat) > stale_timeout_s:
-                    log.warning("Breaking stale lock: heartbeat is %.1fs old (>= %.0fs)", now_t - lock_heartbeat, stale_timeout_s)
-                else:
-                    log.warning("Runner lock active: PID %s on host %s is alive (heartbeat %.1fs ago)", lock_pid, lock_host, now_t - lock_heartbeat)
-                    return False
-            else:
-                if (now_t - lock_heartbeat) > stale_timeout_s:
-                    log.warning("Breaking stale remote lock: host %s heartbeat is %.1fs old (>= %.0fs)", lock_host, now_t - lock_heartbeat, stale_timeout_s)
-                else:
-                    log.warning("Runner lock active on remote host %s (heartbeat %.1fs ago)", lock_host, now_t - lock_heartbeat)
-                    return False
-        except (ValueError, TypeError):
-            log.warning("Corrupt lock payload in database; clearing and acquiring")
-
-    # Set new lock
-    lock_payload = {
-        "pid": current_pid,
-        "host": current_host,
-        "heartbeat": now_t,
-        "started_at": now_t,
-    }
-    db.kv_set(LOCK_KEY, json.dumps(lock_payload), db_path=db_path)
-
-    # Start background heartbeat updater
-    global _HEARTBEAT_THREAD, _STOP_HEARTBEAT
-    _STOP_HEARTBEAT.clear()
-    _HEARTBEAT_THREAD = threading.Thread(
-        target=_heartbeat_worker,
-        args=(db_path, heartbeat_interval_s),
-        daemon=True,
-    )
-    _HEARTBEAT_THREAD.start()
+def acquire_lock(db_path=None, stale_timeout_s=120.0, heartbeat_interval_s=30.0,
+                 *, mode="runner"):
+    db.init_db(db_path)
+    token = uuid.uuid4().hex
+    with lock_transaction(db_path):
+        if lock_state(db_path, stale_timeout_s):
+            return False
+        now = time.time()
+        lease = dict(pid=os.getpid(), host=socket.gethostname(), heartbeat=now,
+                     started_at=now, token=token, mode=mode, stage="starting")
+        db.kv_set(LOCK_KEY, json.dumps(lease), db_path)
+        db.kv_set(STOP_KEY, "", db_path)
+    stop = threading.Event()
+    _LEASES[_lease_key(db_path)] = (token, stop)
+    threading.Thread(target=_heartbeat_worker, args=(db_path, heartbeat_interval_s, token, stop),
+                     daemon=True).start()
     return True
 
 
-def release_lock(db_path: Any = None) -> None:
-    """Release runner lock and stop heartbeat thread."""
-    global _STOP_HEARTBEAT
-    _STOP_HEARTBEAT.set()
-    try:
-        raw = db.kv_get(LOCK_KEY, db_path=db_path)
-        if raw:
-            data = json.loads(raw)
-            if data.get("pid") == os.getpid():
-                db.kv_set(LOCK_KEY, "", db_path=db_path)
-    except Exception:
-        db.kv_set(LOCK_KEY, "", db_path=db_path)
+def release_lock(db_path=None):
+    lease = _LEASES.pop(_lease_key(db_path), None)
+    if lease is None:
+        return
+    token, stop = lease
+    stop.set()
+    with lock_transaction(db_path):
+        data = json.loads(db.kv_get(LOCK_KEY, db_path=db_path) or "{}")
+        if data.get("token") == token:
+            db.kv_set(LOCK_KEY, "", db_path)
+            db.kv_set(STOP_KEY, "", db_path)
+
+
+def stopping(path):
+    return bool(db.kv_get(STOP_KEY, db_path=path))
+
+
+def enter_stage(path, stage):
+    lease = _LEASES.get(_lease_key(path))
+    if not lease:
+        return True
+    with lock_transaction(path):
+        data = json.loads(db.kv_get(LOCK_KEY, db_path=path) or "{}")
+        if data.get("token") != lease[0] or stopping(path):
+            return False
+        data["stage"] = stage
+        db.kv_set(LOCK_KEY, json.dumps(data), path)
+    return True
+
+
+def request_stop(path, *, force=False, expected=None, stale_timeout_s=120):
+    with lock_transaction(path):
+        state = lock_state(path, stale_timeout_s)
+        if not state or state.get("mode") == "dashboard":
+            raise ValueError("No active runner to stop.")
+        if force:
+            if state.get("stage") in {"post", "settle"}:
+                raise ValueError("Force stop is blocked while publishing or settling posts.")
+            if not expected or any(state.get(k) != expected.get(k) for k in ("token", "stage")):
+                raise ValueError("Runner stage changed. Confirm again.")
+            since = float(db.kv_get(STOP_KEY, db_path=path) or 0)
+            if not since or time.time() - since < 120:
+                raise ValueError("Wait two minutes after requesting a graceful stop.")
+            if state["host"] != socket.gethostname():
+                raise ValueError("Only a local runner can be force stopped.")
+            os.kill(state["pid"], signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+            return "Force stop sent."
+        if not stopping(path):
+            db.kv_set(STOP_KEY, str(time.time()), path)
+        return f"Stopping, finishing {state.get('stage', 'current stage')}."
 
 
 def print_status(db_path: Any = None) -> None:
@@ -275,7 +307,9 @@ def run_stages(
         log.exception("Dashboard could not load; skipping controls this cycle")
         runner_boundary = None
 
-    for name, fn in stages or STAGES:
+    for name, fn in stages if stages is not None else STAGES:
+        if not enter_stage(db_path, name):
+            break
         t_stage = time.time()
         if runner_boundary is not None:
             try:
@@ -336,7 +370,8 @@ def run_loop(
     Returns the number of cycles run (`max_cycles` is for tests; production runs until Ctrl-C or
     SIGTERM). If another runner holds the lock it returns 0 at once rather than waiting.
     """
-    cfg = cfg or config.get_config()
+    reload_config = cfg is None
+    cfg = cfg if cfg is not None else config.get_config(reload=True)
     db.init_db(db_path)
     gap = interval_s if interval_s is not None else float(
         (cfg.get("orchestrator") or {}).get("loop_interval_seconds", 60)
@@ -349,8 +384,10 @@ def run_loop(
     log.info("Runner loop started (interval %.0fs). Ctrl-C to stop.", gap)
     cycles = 0
     try:
-        while max_cycles is None or cycles < max_cycles:
+        while (max_cycles is None or cycles < max_cycles) and not stopping(db_path):
             try:
+                if reload_config:
+                    cfg = config.get_config(reload=True)
                 result = run_stages(cfg, db_path)
                 log.info("Cycle %d: %s%s", cycles + 1, result["status"],
                          f" (failed stages: {sorted(result['errors'])})" if result["errors"] else "")
@@ -363,7 +400,14 @@ def run_loop(
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
                 break
-            sleep(gap)
+            if not enter_stage(db_path, "idle"):
+                break
+            if sleep is not time.sleep:
+                sleep(gap)
+            else:
+                deadline = time.monotonic() + gap
+                while not stopping(db_path) and time.monotonic() < deadline:
+                    sleep(max(0, min(1, deadline - time.monotonic())))
     except KeyboardInterrupt:
         log.info("Runner loop stopped.")
     finally:

@@ -13,7 +13,7 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from pipeline import binding, config, db
 import connection_checks
-from . import commands, views
+from . import commands, execution, views
 from .store import initialize, snapshot
 
 
@@ -163,6 +163,7 @@ def create_app(db_path=None, cfg=None, media_root=None):
             payload=plan["payload"],
         )
 
+    @app.post("/api/execute")
     @app.post("/api/confirm")
     def confirm():
         body = request.get_json(silent=True) or {}
@@ -176,6 +177,9 @@ def create_app(db_path=None, cfg=None, media_root=None):
         if not secrets.compare_digest(plan["client"], session["csrf"]):
             abort(403)
         command_id = hashlib.sha256(ticket.encode()).hexdigest()[:32]
+        if request.path == "/api/execute":
+            result = execution.submit(plan, command_id, path, settings())
+            return jsonify(command=result), (202 if result["status"] == "pending" else 200)
         result = commands.enqueue(plan, command_id, path)
         return jsonify(command=result), 202
 
