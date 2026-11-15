@@ -892,6 +892,23 @@ dialog label {
 .hidden {
   display: none !important;
 }
+.connections-table .connection-reason {
+  min-width: 220px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.connections-table .pill.gray {
+  color: var(--muted);
+}
+.connections-table .pill.green {
+  color: var(--green);
+}
+.connections-table button:disabled,
+[data-connection]:disabled,
+[data-send-telegram]:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
 [hidden] {
   display: none !important;
 }
