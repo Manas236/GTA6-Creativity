@@ -1,5 +1,6 @@
 "use strict";
 let state, detail, pendingAction, confirmation, refreshTimer;
+let connectionRows = [], connectionsBusy = false;
 const content = document.querySelector("#content");
 const dialog = document.querySelector("#action-dialog");
 const colors = {
@@ -498,6 +499,40 @@ function toast(message) {
   node.hidden = false;
   setTimeout(() => (node.hidden = true), 7000);
 }
+function connections() {
+  const tones = { ok: "green", failed: "red", warning: "amber", not_set: "gray", unchecked: "gray" };
+  const names = { ok: "OK", failed: "Failed", warning: "Warning", not_set: "Not set", unchecked: "Not checked" };
+  const disabled = connectionsBusy ? " disabled" : "";
+  content.innerHTML = heading(
+    "Connections",
+    "Checks run only when pressed, on this computer. Each has a 10-second timeout.",
+    `<button class="button primary" data-connection="all"${disabled}>${connectionsBusy ? "Testing…" : "Test all (sends a real success ping)"}</button>`,
+  ) + `<section class="panel">${panelHead("Service connections", "Test all checks services in parallel and sends a real Healthchecks success ping. Telegram messages require the separate button below.")}
+    <div class="table-wrap"><table class="data-table connections-table"><thead><tr><th>Service</th><th>Status</th><th>Reason</th><th>Last check</th><th>Test</th></tr></thead><tbody>
+    ${connectionRows.map((row) => `<tr><td><code>${escape(row.label)}</code></td><td>${pill(names[row.status] || row.status, tones[row.status] || "gray")}</td><td class="connection-reason">${escape(row.reason)}</td><td>${row.checked_at ? escape(formatTime(row.checked_at, { second: "2-digit" })) : "Never"}</td><td><button class="button secondary" data-connection="${escape(row.id)}"${disabled}>${row.id === "healthcheck" ? "Test (sends a real success ping)" : "Test"}</button></td></tr>`).join("")}
+    </tbody></table></div><div class="detail-actions"><button class="button secondary" data-send-telegram${disabled}>Send test message</button><span class="reason">Sends one Telegram message to the configured chat. Never included in Test all.</span></div><p id="telegram-test-result" class="reason" role="status"></p></section>`;
+}
+async function testConnection(service, sendMessage = false) {
+  if (connectionsBusy) return;
+  connectionsBusy = true;
+  connections();
+  try {
+    const data = await api(sendMessage ? "/api/connections/send-telegram-test" : "/api/connections/test", sendMessage ? {} : { service });
+    if (sendMessage) {
+      const text = `${data.result.status}: ${data.result.reason}`;
+      toast(text);
+      connectionsBusy = false;
+      connections();
+      document.querySelector("#telegram-test-result").textContent = text;
+    } else connectionRows = data.connections;
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    connectionsBusy = false;
+    if (!sendMessage) connections();
+    document.querySelectorAll("[data-connection], [data-send-telegram]").forEach((node) => node.disabled = false);
+  }
+}
 async function refresh(manual = false) {
   try {
     state = await api("/api/state");
@@ -534,11 +569,17 @@ async function refresh(manual = false) {
         queue: "Queue & calendar",
         analytics: "Analytics",
         failures: "Failures & review",
+        connections: "Connections",
         item: "Item detail",
       }[page];
     document.querySelector("#footer").textContent =
       `${state.timezone} · ${state.items.length} items · ${state.posts.length} platform posts · all data from the selected SQLite database`;
-    if (page === "item") {
+    if (page === "connections") {
+      if (!connectionsBusy) {
+        connectionRows = (await api("/api/connections")).connections;
+        connections();
+      }
+    } else if (page === "item") {
       if (manual || !detail) await itemPage();
     } else if (
       !dialog.open &&
@@ -570,6 +611,11 @@ function openAction(action, id) {
   dialog.showModal();
 }
 document.addEventListener("click", (event) => {
+  const connectionButton = event.target.closest("[data-connection], [data-send-telegram]");
+  if (connectionButton) {
+    testConnection(connectionButton.dataset.connection, connectionButton.hasAttribute("data-send-telegram"));
+    return;
+  }
   const buttonNode = event.target.closest("[data-action]");
   if (buttonNode) openAction(buttonNode.dataset.action, buttonNode.dataset.id);
 });

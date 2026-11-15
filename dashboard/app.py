@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import secrets
 import sqlite3
+import threading
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, request, send_file, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from pipeline import binding, config, db
+import connection_checks
 from . import commands, views
 from .store import initialize, snapshot
 
@@ -28,6 +30,9 @@ def create_app(db_path=None, cfg=None, media_root=None):
     app.config["DASHBOARD_DB"] = path
     signer = URLSafeTimedSerializer(app.secret_key, salt="dashboard-confirmation")
     root = Path(media_root or config.media_root()).resolve()
+    connection_results = {}
+    connection_lock = threading.Lock()
+    connection_run_lock = threading.Lock()
 
     def settings():
         return cfg if cfg is not None else config.get_config(reload=True)
@@ -75,6 +80,7 @@ def create_app(db_path=None, cfg=None, media_root=None):
     @app.get("/queue")
     @app.get("/analytics")
     @app.get("/failures")
+    @app.get("/connections")
     @app.get("/items/<item_id>")
     def page(item_id=None):
         return app.send_static_file("index.html")
@@ -85,6 +91,45 @@ def create_app(db_path=None, cfg=None, media_root=None):
         data = views.state(path, settings())
         data["csrf"] = session["csrf"]
         return jsonify(data)
+
+    @app.get("/api/connections")
+    def connections():
+        with connection_lock:
+            rows = connection_checks.describe(
+                connection_checks.current_environment(), connection_results
+            )
+        return jsonify(connections=rows)
+
+    @app.post("/api/connections/test")
+    def test_connections():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body.get("service") not in (
+            "all", *connection_checks.CHECKS
+        ):
+            return jsonify(error="Choose a known connection check."), 400
+        if not connection_run_lock.acquire(blocking=False):
+            return jsonify(error="A connection test is already running."), 409
+        try:
+            env = connection_checks.current_environment()
+            selected = None if body["service"] == "all" else [body["service"]]
+            results = connection_checks.run_checks(env, selected, settings())
+            with connection_lock:
+                connection_results.update(results)
+                rows = connection_checks.describe(env, connection_results)
+            return jsonify(connections=rows)
+        finally:
+            connection_run_lock.release()
+
+    @app.post("/api/connections/send-telegram-test")
+    def send_telegram_test():
+        if not connection_run_lock.acquire(blocking=False):
+            return jsonify(error="A connection test is already running."), 409
+        try:
+            return jsonify(result=connection_checks.send_telegram_test(
+                connection_checks.current_environment(), settings()
+            ))
+        finally:
+            connection_run_lock.release()
 
     @app.get("/api/items/<item_id>")
     def detail(item_id):

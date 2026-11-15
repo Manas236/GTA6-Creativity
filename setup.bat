@@ -67,6 +67,7 @@ rem ---- 2. Python packages ----------------------------------------------------
 echo.
 echo [2/6] Python packages from requirements.txt (first run downloads a few hundred MB)
 "%VENV_PY%" -m pip install --disable-pip-version-check -q --upgrade pip
+if errorlevel 1 call :fail "pip upgrade"
 "%VENV_PY%" -m pip install --disable-pip-version-check -q -r requirements.txt
 if errorlevel 1 (
   call :fail "pip install -r requirements.txt"
@@ -146,6 +147,7 @@ rem Sets BASE_PY to a Python 3.11 or 3.12 command (PLAN.md: Kokoro's wheels don'
 set "BASE_PY="
 for %%V in (3.11 3.12) do if not defined BASE_PY call :try_python py -%%V
 for %%D in ("%LOCALAPPDATA%\Programs\Python\Python311" "%ProgramFiles%\Python311" "%LOCALAPPDATA%\Programs\Python\Python312" "%ProgramFiles%\Python312") do if not defined BASE_PY if exist "%%~D\python.exe" call :try_python "%%~D\python.exe"
+if not defined BASE_PY call :try_python py -3
 if not defined BASE_PY call :try_python python
 exit /b 0
 
