@@ -10,6 +10,8 @@ import json
 import random
 import subprocess
 import sys
+import time
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -180,6 +182,7 @@ def build_demo(path, media=True):
             created = clock.iso(now - timedelta(days=rng.randint(1, 22)))
             fields = {
                 "created_at": created,
+                "cut_signal": ("heatmap", "chat", "audio_scene")[index % 3],
                 "cut_start": 34.5,
                 "cut_end": 54.5,
                 "cut_duration": 20,
@@ -356,6 +359,43 @@ def build_demo(path, media=True):
     print(f"Created {index} demo items at {path}")
     print(f"python -m dashboard --db {path} --media-root {media_root}")
     return path, media_root
+
+
+def stub_discovery(count, job_id, path):
+    ids = []
+    for index in range(count):
+        item_id = f"demo-make-{uuid.uuid4().hex[:8]}"
+        db.insert_discovered_item({
+            "id": item_id, "source": "youtube", "source_id": item_id,
+            "source_url": f"https://example.com/demo/{item_id}",
+            "original_title": f"Demo discovery #{index + 1}",
+            "author_name": "Leonida Lens",
+        }, path)
+        db.transition_stage(item_id, "discovered", {"creation_job": job_id}, path)
+        ids.append(item_id)
+    return ids
+
+
+def stub_produce(item_id, path):
+    """Make demo job progress visible without calling external services."""
+    from pipeline import runner
+    for phase, result in (("download", "downloaded"), ("cut", "cut"),
+                          ("hook", "cut"), ("voiceover", "cut"), ("render", "awaiting_approval")):
+        runner.set_stage(phase, path)
+        db.transition_stage(item_id, db.get_item(item_id, path)["stage"], {"creation_phase": phase}, path)
+        time.sleep(0.45)
+        db.transition_stage(item_id, result, {"creation_phase": None}, path)
+    item = db.get_item(item_id, path)
+    a, b = (str(config.media_root() / f"{variant}.mp4") for variant in ("A", "B"))
+    fields = {"cut_start": 0.0, "cut_end": 3.0, "cut_duration": 3.0, "cut_path": a,
+              "render_a_path": a, "render_b_path": b, "cut_signal": "audio_scene",
+              "hook_text": "WHAT CHANGED ON OCEAN DRIVE?", "voiceover_script": "Watch the road.",
+              "voiceover_audio_path": b}
+    segment = {**item, **fields}
+    fields["hook_binding"] = binding.hook_record(
+        segment, fields["hook_text"], fields["voiceover_script"], "", "human_approved")
+    fields["voiceover_binding"] = binding.voiceover_record(segment, fields["voiceover_script"], b)
+    db.transition_stage(item_id, "awaiting_approval", fields, path)
 
 
 if __name__ == "__main__":

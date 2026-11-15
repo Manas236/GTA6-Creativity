@@ -1047,3 +1047,10 @@ dialog label {
     transition: filter 0.15s;
   }
 }
+
+.caption-preview { white-space: pre-wrap; overflow-wrap: anywhere; }
+.settings-switches { display: flex; gap: 18px; flex-wrap: wrap; margin: 18px 0; }
+.settings-switches label, .review-choice { display: flex; gap: 8px; align-items: center; }
+.settings-switches input, [data-select-item] { width: auto; }
+#settings-form label:not(.settings-switches label) { display: grid; gap: 6px; }
+.runner-controls { margin: 0 0 8px; }

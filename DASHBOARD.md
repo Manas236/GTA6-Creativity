@@ -75,19 +75,20 @@ host proves recent activity, not a local PID check. No secrets are requested.
 ## How controls work
 
 Every control first prepares a read-only preview via POST, then needs a second
-**Confirm & queue** POST. Confirmations expire after 15 minutes and are bound to
+**Confirm** POST. Confirmations expire after 15 minutes and are bound to
 that browser session. CSRF tokens, strict same-site cookies, Origin/Host checks
 and a local-only content security policy protect the loopback UI. This is a
 single-user local tool, not an authenticated multi-user server: do not expose it
 through a proxy or tunnel.
 
-Confirmation adds an immutable command to `dashboard_commands`. The runner
-consumes commands **between stages**, under its existing serialization. An
-active render or publish finishes before a new command is applied. A stopped
-runner leaves controls pending; the UI shows pending/applied/refused/failed results.
-Do not interpret “queued” as “applied.” Commands and their effects commit in one
-short SQLite transaction, with no HTTP, rendering or model work inside it.
-Repeated confirmation and runner restarts do not apply a command twice.
+Confirmation records the request in `dashboard_commands`. If the runner has a
+fresh heartbeat and holds the lock, it applies quick commands between stages.
+The UI shows queued, running, applied, refused and failed commands and their
+messages. The loop interval is an estimate because a long active stage can
+take longer. When the runner is stopped, the dashboard acquires the same
+runner lock, applies the quick command in one transaction and releases the
+lock. If the runner wins the lock race, the command stays queued. Repeated
+confirmation uses the same command ID.
 Changed item state invalidates the command; refresh and confirm again. Unexpected
 application errors roll back that command's effects and record a terminal failure.
 The runner logs dashboard errors and runs the stage even if the mailbox or the
@@ -96,12 +97,17 @@ runner cannot record an outcome, and the unprocessed command stays pending.
 
 | Control | Behavior |
 | --- | --- |
-| Approve both / A only / Reject | Calls `telegram_bot.decide()` in the runner. Revalidates stage, bindings, files and publishing history. Releases the matching Telegram card state in the same transaction. |
+| Approve both / A only / Reject | Calls `telegram_bot.decide()` under the runner lock. Revalidates stage, bindings, files and publishing history. Releases the matching Telegram card state in the same transaction. |
 | Hook is right | Calls `decide(..., "hookok")`, preserving the existing human-review semantics. Returns the item to rendering; this is not publication approval. |
 | Pause posting | Sets an indefinite dashboard hold. The runner's settlement stage also respects it. A request already in flight may finish. |
 | Resume posting | Lifts an active dashboard hold. Any remaining Meta cooldown stays in effect. Normal slot rules still apply. |
 | Edit hook | Invalidates approval, post plans, renders and bindings, and returns an unstarted item to `cut`. See below. |
 | Re-slot | Recomputes `scheduler.next_free_slot()` at application time, honors the configured gap and caps the local-day target at two. The preview is an estimate; another reservation can move the final slot. |
+| Delete | Soft-rejects an unposted item, releases its Telegram card, removes guarded local media and retains discovery history. |
+| Unapprove | Releases pending post rows and sends the item back to review. |
+| Move up/down | Swaps two unstarted slots after checking the daily cap and minimum gap. |
+| Post now | Confirms the earliest gap- and cap-compliant local slot, bypassing the usual slot list. Upload happens during the runner's posting stage and can start later than the confirmed slot. |
+| Edit caption | Previews the caption that will post, validates the combined length and hashtag limits and appends locked attribution and unverified-footage disclosure. |
 | Retry | Only failed `download`, `cut`, `render` items with no post history. Required source/cut files must exist. Returns to the preceding runner stage. |
 
 Started, ambiguous or failed publishing is display-only. Even a dry-run row with
@@ -111,6 +117,50 @@ are refused cleanly before approval; existing database triggers remain intact.
 The physical Telegram approval message is not edited by this app: its stored card
 is released, and a later button tap is stale. Only the separate Connections
 **Send test message** button sends a Telegram message.
+
+### Creation and runner controls
+
+Use **Make** to discover 1–10 new sources or paste a supported YouTube or Twitch
+URL. Optional `mm:ss` hints limit the cut search. Title, channel and creator
+are read from the downloader, and the usual channel allowlist and hook
+grounding rules apply. A source already in the database links back to its item.
+With a loop running, creation starts at the next discover stage. Otherwise a detached
+`python -m pipeline.runner make --job ...` process acquires the lock and takes
+the requested clips through download, cut, hook, voiceover, render and the
+review hand-off. That worker has no posting, measuring or cleanup phase.
+**Remake cut** excludes windows that overlap at least half of the new window
+with the old cut. It downloads the source again if render retention purged it.
+**Regenerate hook** keeps the cut, regenerates the hook/voiceover, and renders
+the variants again so the video and caption stay in sync.
+
+**Stop runner** waits for the current stage. **Force stop** becomes available
+after two minutes and names the stage it would interrupt. It is blocked during
+the posting and publishing-settlement stages.
+
+### Engagement signals
+
+The default `cut.heatmap_weight` is **0.25**. The original audio/scene score
+roughly spans 0–1, so a sustained maximum replay peak adds at most a quarter
+of that range. This can break close calls while still rewarding stronger
+audio and scene evidence. The mean is weighted by the time each replay bin
+overlaps the candidate window. A missing signal leaves the previous score
+unchanged, and a candidate must still pass the clean-ending rule.
+
+Manually pasted Twitch VODs can use chat replay. Ten-second bins with at least
+three messages and three times the VOD's average bin count feed the same
+weighted score after a five-second default reaction offset
+(`cut.chat_offset_seconds`). Twitch clips skip chat lookup. Replay failures
+fall back to audio and scene scoring. A cut records the engagement signal when
+it contributes to the chosen window and records `audio_scene` otherwise.
+
+### Local settings
+
+Settings save to gitignored `config.local.yaml`; each save first writes a
+dated backup. The overlay merges into `config.yaml` and the runner reloads it
+at the beginning of each cycle. Turning Telegram approval cards off requires
+dashboard review, even if the base configuration would switch to automatic
+approval. Connection requests run in child processes. The demo database uses
+an isolated settings overlay and stubbed media jobs.
 
 ### Posting pause ownership
 

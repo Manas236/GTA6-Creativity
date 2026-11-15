@@ -1,5 +1,8 @@
 "use strict";
 let state, detail, pendingAction, confirmation, refreshTimer;
+let preferences, reviewId, jobId, toastTimer;
+let libraryStage = "", librarySearch = "";
+const selectedItems = new Set();
 let connectionRows = [], connectionsBusy = false;
 const content = document.querySelector("#content");
 const dialog = document.querySelector("#action-dialog");
@@ -19,6 +22,16 @@ const labels = {
   retry: "Retry stage",
   pause: "Pause all posting",
   resume: "Resume posting",
+  make: "Make N now",
+  clip_url: "Clip from URL",
+  remake_cut: "Remake cut",
+  remake_hook: "Regenerate hook",
+  delete: "Delete",
+  unapprove: "Unapprove",
+  up: "Move up",
+  down: "Move down",
+  post_now: "Post now",
+  edit_caption: "Edit caption",
 };
 const filters = { queue: "", stage: "all", failures: "all" };
 const escape = (value) =>
@@ -62,7 +75,7 @@ function pill(text, tone = "") {
   return `<span class="pill ${tone}">${escape(text)}</span>`;
 }
 function button(action, id = "", text = labels[action]) {
-  return `<button class="button ${action === "reject" ? "danger" : action === "approve" ? "primary" : "secondary"}" data-action="${action}" data-id="${escape(id)}">${escape(text)}</button>`;
+  return `<button class="button ${["reject", "delete"].includes(action) ? "danger" : action === "approve" ? "primary" : "secondary"}" data-action="${action}" data-id="${escape(id)}">${escape(text)}</button>`;
 }
 function heading(title, subtitle, controls = "") {
   return `<div class="page-heading"><div><h1>${title}</h1><p>${escape(subtitle)}</p></div>${controls}</div>`;
@@ -98,15 +111,27 @@ function queueItems() {
       ),
     );
 }
+function resultMessage(message) {
+  const rendered = escape(message);
+  return rendered.replace(/(\/items\/[A-Za-z0-9_-]+)/g, '<a href="$1">Open existing item</a>');
+}
+const commandState = (c) => c.status === "pending" ? "queued" : c.status;
 function commandsPanel() {
   if (!state.commands.length) return "";
-  return `<section class="panel commands">${panelHead("Recent controls", "Commands apply at the runner’s next stage boundary.")}${state.commands
-    .slice(0, 6)
-    .map(
-      (c) =>
-        `<div class="command-row">${pill(c.status, c.status === "applied" ? "green" : c.status === "pending" ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${escape(c.result || "Waiting for the runner. Start or resume its loop to apply this command.")}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`,
-    )
-    .join("")}</section>`;
+  return `<section id="recent-controls" class="panel commands">${panelHead("Recent controls", `Quick changes apply immediately when stopped. Queued changes usually apply within about ${state.interval}s, depending on the active stage.`)}
+    ${state.commands.slice(0, 8).map((c) => commandRow(c)).join("")}
+    ${state.commands.length > 8 ? `<details><summary class="muted">Older controls</summary>${state.commands.slice(8).map(commandRow).join("")}</details>` : ""}</section>`;
+}
+function commandRow(c) {
+  return `<div class="command-row">${pill(commandState(c), c.status === "applied" ? "green" : ["pending", "running"].includes(c.status) ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${resultMessage(c.result || (c.status === "running" ? "Worker running." : "Waiting for a worker or the next runner boundary."))}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`;
+}
+function runnerButtons() {
+  const active = state.lock.status === "alive";
+  return `<div class="detail-actions runner-controls">
+    <button class="button primary" data-runner="start" ${active ? "disabled" : ""}>Start runner</button>
+    <button class="button secondary" data-runner="stop" ${!active || state.lock.stopping ? "disabled" : ""}>Stop runner</button>
+    ${state.lock.force ? `<button class="button danger" data-runner="force" ${["post", "settle"].includes(state.lock.stage) ? "disabled" : ""}>Force stop</button>` : ""}
+  </div>`;
 }
 function overview() {
   const next = queueItems()
@@ -145,15 +170,15 @@ function overview() {
     heading(
       "Your pipeline, at a glance.",
       `${formatTime(state.at, { weekday: "long" })} · ${state.timezone}`,
-      state.dashboard_paused
+      runnerButtons() + (state.dashboard_paused
         ? button("resume", "", "Lift dashboard pause")
-        : state.meta_paused ? "" : button("pause"),
+        : state.meta_paused ? "" : button("pause")),
     ) +
     `<div class="metrics-grid">${metric("READY TO GO", `${state.ready} <em>/ ${state.target}</em>`, "Ready buffer · target from config", "pink")}${metric("LIVE PLATFORM POSTS", number(live), "Instagram + Facebook")}${metric("RECORDED VIEWS", compact(latest.reduce((n, m) => n + m.views, 0)), "Latest stored snapshot per post", "green")}${metric("AWAITING A DECISION", review, "Rendered, approval & review queues", "purple")}</div>
     <div class="grid-main"><section class="panel">${panelHead("Production funnel", "Every pipeline stage · current inventory", pill(`${state.items.length} items`))}
     ${state.stages.map((s) => `<a href="/queue?stage=${s.stage}" class="funnel-row"><span class="funnel-label">${escape(pretty(s.stage))}</span><div class="track"><div class="fill" style="width:${(s.count / max) * 100}%;background:${["failed", "rejected"].includes(s.stage) ? "var(--red)" : s.stage === "needs_review" ? "var(--amber)" : s.stage === "queued" ? "var(--pink)" : "var(--purple)"}"></div></div><b>${number(s.count)}</b></a>`).join("")}</section>
     <section class="panel">${panelHead("System health", "Observed state from the runner and SQLite")}
-    ${health("Runner", pretty(lock.status), lock.age === null ? "No valid heartbeat" : `Heartbeat ${lock.age}s ago · ${lock.host || "unknown host"}${runtime.stage ? " · " + runtime.stage : ""}`, lock.status === "alive" ? "" : lock.status === "stale" ? "red" : "gray")}
+    ${health("Runner", lock.stopping ? "Stopping" : lock.status === "alive" ? "Running" : "Stopped", lock.stopping ? `Finishing ${lock.stage || "startup"}` : lock.age === null ? "No valid heartbeat" : `Heartbeat ${lock.age}s ago · ${lock.host || "unknown host"} · ${lock.stage || "starting"}`, lock.status === "alive" ? "" : lock.status === "stale" ? "red" : "gray")}
     ${health("Meta publishing", state.meta_paused ? "Paused" : "Enabled", state.meta_paused ? metaDetails : state.dry_run ? "Dry run is on; publish requests are suppressed." : "The runner publishes at scheduled slots.", state.meta_paused ? "amber" : "")}
     ${health("Gemini quota", quotaText, quotaBlocked ? `Runner reported a block until ${formatTime(runtime.gemini_blocked_until)}.` : "Remaining daily allowance is not exposed by the pipeline.", quotaBlocked ? "amber" : quotaKnown ? "" : "gray")}
     ${state.limits
@@ -219,7 +244,7 @@ function queue() {
       pill(`${rows.length} items`),
     ) +
     `<div class="toolbar"><input type="search" id="queue-search" aria-label="Search items" placeholder="Search clips, creators or item IDs" value="${escape(filters.queue)}"><select id="stage-filter" aria-label="Filter stage"><option value="all">Approved & queued</option>${state.stages.map((s) => `<option value="${s.stage}" ${filters.stage === s.stage ? "selected" : ""}>${pretty(s.stage)} (${s.count})</option>`).join("")}</select></div>
-  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card"><div class="queue-time">${posts[0] ? escape(formatTime(posts[0].slot_datetime, { day: undefined, month: undefined })) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${itemLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><a class="button secondary" href="${itemLink(item.id)}">Review clip ↗</a></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
+  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card"><div class="queue-time">${posts[0] ? escape(formatTime(posts[0].slot_datetime, { day: undefined, month: undefined })) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${itemLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.filter((a) => ["up", "down", "unapprove", "post_now"].includes(a)).map((a) => button(a, item.id)).join("")}<a class="button secondary" href="${itemLink(item.id)}">Review clip ↗</a></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
 }
 function analytics() {
   const latest = totals(),
@@ -264,6 +289,8 @@ function analytics() {
   ${["A", "B"].map((v) => `<div class="health-row"><span>Variant ${v}</span><span class="small">${state.variants[v]?.n || 0} items · score ${(state.variants[v]?.score || 0).toFixed(3)}</span></div>`).join("")}</section></div>
   <div class="grid-half"><section class="panel">${panelHead("Performance by hook style", "Latest recorded views · grouped by post hook style")}${bars("hook_style")}</section><section class="panel">${panelHead("Performance by source", "Latest recorded views · grouped by post source")}${bars("source")}</section></div>
   <section class="panel">${panelHead("Follow an individual post", "Views at each stored observation time")}<div class="toolbar"><select id="post-select" aria-label="Select post"><option value="">Choose a platform post</option>${latest.map((m) => `<option value="${m.post_id}">${escape(itemById(m.item_id)?.original_title || m.item_id)} · ${m.platform} · ${m.variant}</option>`).join("")}</select></div><div class="chart-box"><canvas id="post-chart" role="img" aria-label="Selected post views at snapshot times"></canvas></div></section>`;
+  content.insertAdjacentHTML("beforeend", `<section class="panel commands">${panelHead("Moment selection", "Signal recorded for each selected cut")}
+     ${["heatmap", "chat", "audio_scene"].map((signal) => `<div class="health-row"><span>${pretty(signal)}</span><b>${state.items.filter((i) => i.cut_signal === signal).length}</b></div>`).join("")}</section>`);
   platformChart("analytics-chart", latest);
   const select = document.querySelector("#post-select");
   select.addEventListener("change", () => postChart(select.value));
@@ -296,8 +323,7 @@ function failures() {
  <div class="grid-main"><section class="panel">${panelHead("Failed & rejected", "Publishing failures are display-only.")}<div class="toolbar"><select id="failure-filter" aria-label="Filter failures"><option value="all">All failed & rejected</option><option value="failed" ${filters.failures === "failed" ? "selected" : ""}>Failed only</option><option value="rejected" ${filters.failures === "rejected" ? "selected" : ""}>Rejected only</option></select></div>${failureList([...failed, ...rejected].filter((i) => filters.failures === "all" || i.stage === filters.failures))}</section>
  <div><section class="panel">${panelHead("Needs a human", "Open the item to see its segment and binding.", pill(`${review.length} waiting`, "amber"))}${failureList(review)}</section><section class="panel commands">${panelHead("Cut outcomes", "Last 24 hours")}<div class="bar-row"><div class="bar-label"><span>No clean ending</span><span>${stats.no_clean_ending}</span></div><div class="track"><div class="fill" style="width:${stats.rate * 100}%;background:var(--amber)"></div></div></div><p class="reason">${stats.attempts} completed cut attempts. This rate excludes attempts still in progress.</p></section></div></div>${commandsPanel()}`;
 }
-async function itemPage() {
-  const id = decodeURIComponent(location.pathname.split("/")[2]);
+async function itemPage(id = decodeURIComponent(location.pathname.split("/")[2]), reviewBar = "") {
   detail = await api("/api/items/" + encodeURIComponent(id));
   const i = detail.item;
   let renderHelp = "Render previews will appear when available.";
@@ -309,7 +335,7 @@ async function itemPage() {
   const video = (v, title) =>
     `<div class="video-card"><header><h3>${title}</h3>${pill(v.toUpperCase(), "pink")}</header>${detail.media[v] ? `<video controls preload="metadata" src="/media/${encodeURIComponent(i.id)}/${v}#t=0.1" aria-label="${title}"></video>` : empty("No render available for this variant.")}</div>`;
   content.innerHTML =
-    `<a class="back-link" href="/queue">← Back to queue</a>` +
+    reviewBar + (reviewBar ? "" : `<a class="back-link" href="/library">← Back to library</a>`) +
     heading(
       escape(i.original_title || i.id),
       `${i.author_name} · ${i.source} · ${i.id}`,
@@ -319,6 +345,7 @@ async function itemPage() {
     detail.posts.some((p) => !["pending", "dry_run"].includes(p.status))
       ? '<div class="notice">Posting history exists. Started or failed publishes are display-only to prevent duplicate posts.</div>'
       : "") +
+    (["posted", "measured", "cleaned"].includes(i.stage) ? '<div class="notice">Remove published media on Instagram yourself.</div>' : "") +
     (i.preview_only
       ? '<div class="notice">Preview-only item. Approval and pipeline controls are blocked.</div>'
       : "") +
@@ -344,10 +371,13 @@ async function itemPage() {
        `<div class="binding-status ${v ? "warning" : ""}">${v ? "◉" : "✓"} ${escape(pretty(k))} binding${v ? `<br>${escape(v)}` : " verified for this segment"}</div>`,
    )
    .join("")}
+ <div class="label-value"><div class="eyebrow">CUT SIGNAL</div><p>${escape(pretty(i.cut_signal))}</p></div>
  <div class="detail-actions">${detail.actions
-   .filter((a) => !["approve", "aonly", "reject", "hookok"].includes(a))
+   .filter((a) => !["approve", "aonly", "reject", "hookok"].includes(a) && a !== "edit_caption")
    .map((a) => button(a, i.id))
    .join("")}</div></section></div>
+ <section class="panel commands">${panelHead("Posting caption", "Creator credit and disclosure are appended when an override is saved.")}
+ <p class="caption-preview">${escape(detail.caption)}</p>${detail.actions.includes("edit_caption") ? button("edit_caption", i.id) : ""}</section>
  ${detail.review.reason ? `<section class="panel commands">${panelHead("Review context")}<p class="reason">${escape(detail.review.reason)}</p><p>${escape(detail.review.transcript_excerpt || "")}</p></section>` : ""}
  <section class="panel commands">${panelHead("Stage history", "Full history, oldest to newest", pill(`${detail.logs.length} events`))}${detail.logs.map((l) => `<div class="log-entry"><time>${escape(formatTime(l.created_at))}</time><span>${escape(pretty(l.stage))}</span><div>${pill(l.status, ["failed", "failure"].includes(l.status) ? "red" : l.status === "success" ? "green" : "")}<p>${escape(l.message)}${l.duration_s ? ` · ${Number(l.duration_s).toFixed(1)}s` : ""}</p></div></div>`).join("") || empty("No stage history recorded.")}</section>${commandsPanel()}`;
 }
@@ -497,13 +527,15 @@ function toast(message) {
   const node = document.querySelector("#toast");
   node.textContent = message;
   node.hidden = false;
-  setTimeout(() => (node.hidden = true), 7000);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (node.hidden = true), 7000);
 }
 function connections() {
+  const settingsPage = location.pathname === "/settings";
   const tones = { ok: "green", failed: "red", warning: "amber", not_set: "gray", unchecked: "gray" };
   const names = { ok: "OK", failed: "Failed", warning: "Warning", not_set: "Not set", unchecked: "Not checked" };
   const disabled = connectionsBusy ? " disabled" : "";
-  content.innerHTML = heading(
+  content.innerHTML = (settingsPage ? settingsForm() : "") + heading(
     "Connections",
     "Checks run only when pressed, on this computer. Each has a 10-second timeout.",
     `<button class="button primary" data-connection="all"${disabled}>${connectionsBusy ? "Testing…" : "Test all (sends a real success ping)"}</button>`,
@@ -524,7 +556,7 @@ async function testConnection(service, sendMessage = false) {
       connectionsBusy = false;
       connections();
       document.querySelector("#telegram-test-result").textContent = text;
-    } else connectionRows = data.connections;
+    } else { connectionRows = data.connections; toast("Connection checks finished."); }
   } catch (error) {
     toast(error.message);
   } finally {
@@ -533,6 +565,16 @@ async function testConnection(service, sendMessage = false) {
     document.querySelectorAll("[data-connection], [data-send-telegram]").forEach((node) => node.disabled = false);
   }
 }
+function videoPlaying() {
+  return [...content.querySelectorAll("video")].some((video) => !video.paused);
+}
+
+function refreshRecentControls() {
+  const panel = document.querySelector("#recent-controls");
+  if (panel) panel.outerHTML = commandsPanel();
+  else content.insertAdjacentHTML("beforeend", commandsPanel());
+}
+
 async function refresh(manual = false) {
   try {
     state = await api("/api/state");
@@ -543,7 +585,7 @@ async function refresh(manual = false) {
       state.profile + " · " + state.timezone;
     const banner = document.querySelector("#mode-banner");
     banner.classList.toggle("live", !state.dry_run);
-    banner.innerHTML = `<span><strong>${state.dry_run ? "DRY RUN IS ON" : "LIVE POSTING IS ON"}</strong> &nbsp; ${state.dry_run ? "The runner simulates publishing." : "Approved clips can be published by the runner."}</span><span class="${state.demo ? "demo" : ""}">${state.demo ? "DEMO DATABASE · seeded example data" : state.config_changed ? "CONFIG CHANGED · restart runner to apply" : state.runtime_known ? "RUNNER SETTINGS" : state.meta_paused ? "META POSTING PAUSED" : "CONFIG SETTINGS · runner not observed"}</span>`;
+    banner.innerHTML = `<span><strong>${state.dry_run ? "DRY RUN IS ON" : "LIVE POSTING IS ON"}</strong> &nbsp; ${state.dry_run ? "The runner simulates publishing." : "Approved clips can be published by the runner."}</span><span class="${state.demo ? "demo" : ""}">${state.demo ? "DEMO DATABASE · seeded example data" : state.config_changed ? "CONFIG CHANGED · applies next cycle" : state.runtime_known ? "RUNNER SETTINGS" : state.meta_paused ? "META POSTING PAUSED" : "CONFIG SETTINGS · runner not observed"}</span>`;
     document.querySelector("#nav-queued").textContent = state.items.filter(
       (i) => i.stage === "queued",
     ).length;
@@ -570,22 +612,31 @@ async function refresh(manual = false) {
         analytics: "Analytics",
         failures: "Failures & review",
         connections: "Connections",
+        settings: "Settings",
+        make: "Make",
+        review: "Review",
+        library: "Library",
         item: "Item detail",
       }[page];
     document.querySelector("#footer").textContent =
       `${state.timezone} · ${state.items.length} items · ${state.posts.length} platform posts · all data from the selected SQLite database`;
-    if (page === "connections") {
-      if (!connectionsBusy) {
+    if (page === "connections" || page === "settings") {
+      if (!connectionsBusy && (manual || !preferences || (page === "connections" && !connectionRows.length))) {
+        if (page === "settings") preferences = await api("/api/settings");
         connectionRows = (await api("/api/connections")).connections;
         connections();
       }
+    } else if (page === "review") {
+      if (manual || !detail || (itemById(reviewId)?.stage !== detail.item.stage && !videoPlaying())) await review();
+      else refreshRecentControls();
     } else if (page === "item") {
-      if (manual || !detail) await itemPage();
+      if (manual || !detail || (itemById(detail.item.id)?.stage !== detail.item.stage && !videoPlaying())) await itemPage();
+      else refreshRecentControls();
     } else if (
       !dialog.open &&
       !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)
     )
-      (({ overview, queue, analytics, failures })[page] || overview)();
+      (({ overview, queue, analytics, failures, make, library })[page] || overview)();
   } catch (error) {
     document.querySelector("#refresh-status").textContent = "Update failed";
     toast(error.message);
@@ -603,6 +654,14 @@ function openAction(action, id) {
   fields.hidden = false;
   if (action === "edit_hook")
     fields.innerHTML = `<label for="hook-edit">New hook text</label><textarea id="hook-edit" maxlength="220" required>${escape(detail?.item?.hook_text || "")}</textarea><p class="reason">The runner checks the edited text against the cut, invalidates the old renders, and renders both variants again.</p>`;
+  else if (action === "edit_caption")
+    fields.innerHTML = `<label for="caption-body">Caption body</label><textarea id="caption-body" maxlength="2200">${escape(detail.item.caption_body ?? detail.item.hook_text)}</textarea>
+    <label for="caption-tags">Hashtags</label><input id="caption-tags" value="${escape(detail.caption_hashtags)}">
+    <p class="reason caption-preview">${escape(detail.caption_credit)}</p>`;
+  else if (action === "make")
+    fields.innerHTML = '<label for="make-count">Number of clips</label><input id="make-count" type="number" min="1" max="10" value="3" required>';
+  else if (action === "clip_url")
+    fields.innerHTML = '<label for="clip-url">YouTube or Twitch URL</label><input id="clip-url" type="url" required><div class="grid-half"><label>Start (optional)<input id="clip-start" placeholder="mm:ss"></label><label>End (optional)<input id="clip-end" placeholder="mm:ss"></label></div>';
   else if (action === "reslot")
     fields.innerHTML = `<label for="slot-after">Find a free slot after (UTC)</label><input id="slot-after" type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}"><p class="reason">The scheduler uses ${escape(state.timezone)}, the configured minimum gap and at most two items per local day. The next free slot is recalculated when applied.</p>`;
   else
@@ -616,6 +675,10 @@ document.addEventListener("click", (event) => {
     testConnection(connectionButton.dataset.connection, connectionButton.hasAttribute("data-send-telegram"));
     return;
   }
+  const runnerButton = event.target.closest("[data-runner]");
+  if (runnerButton) { changeRunner(runnerButton.dataset.runner); return; }
+  const bulkButton = event.target.closest("[data-bulk]");
+  if (bulkButton) { bulkAction(bulkButton.dataset.bulk); return; }
   const buttonNode = event.target.closest("[data-action]");
   if (buttonNode) openAction(buttonNode.dataset.action, buttonNode.dataset.id);
 });
@@ -633,6 +696,15 @@ document
         const payload = {};
         if (pendingAction.action === "edit_hook")
           payload.hook_text = document.querySelector("#hook-edit").value;
+        if (pendingAction.action === "make")
+          payload.count = Number(document.querySelector("#make-count").value);
+        if (pendingAction.action === "clip_url") {
+          for (const field of ["url", "start", "end"]) payload[field] = document.querySelector("#clip-" + field).value;
+        }
+        if (pendingAction.action === "edit_caption") {
+          payload.body = document.querySelector("#caption-body").value;
+          payload.hashtags = document.querySelector("#caption-tags").value;
+        }
         if (pendingAction.action === "reslot")
           payload.after = new Date(
             document.querySelector("#slot-after").value + "Z",
@@ -642,29 +714,37 @@ document
         document.querySelector("#dialog-error").textContent = "";
         const node = document.querySelector("#confirm-content");
         node.hidden = false;
-        node.innerHTML = `<p><strong>${escape(confirmation.description)}</strong></p>${payload.hook_text ? `<p>“${escape(payload.hook_text)}”</p>` : ""}<p class="muted">${state.lock.status === "alive" ? "The runner will apply this at its next stage boundary." : "The runner is not active. This command will remain pending until its loop starts."}</p><p class="muted">Confirm this change to ${escape(confirmation.title)}?</p>`;
+        node.innerHTML = `<p><strong>${escape(confirmation.description)}</strong></p>${payload.hook_text ? `<p>“${escape(payload.hook_text)}”</p>` : ""}<p class="muted">${state.lock.status === "alive" ? `Queued changes typically apply within about ${state.interval}s. Active stages can take longer.` : "This starts as soon as you confirm."}</p><p class="muted">Confirm this change to ${escape(confirmation.title)}?</p>`;
         document.querySelector("#dialog-title").textContent =
           "Confirm your change";
-        submit.textContent = "Confirm & queue";
+        submit.textContent = pendingAction.action === "post_now" && state.lock.status !== "alive" ? "Start runner and post" : "Confirm";
       } else {
         const result = await api("/api/confirm", {
           ticket: confirmation.ticket,
         });
         dialog.close();
-        toast(
-          "Command " +
-            result.command.status +
-            ". Its result appears in Recent controls.",
-        );
+        if (["make", "clip_url", "remake_cut", "remake_hook"].includes(result.command.action)) jobId = result.command.id;
+        const word = ["make", "clip_url", "remake_cut", "remake_hook"].includes(result.command.action) &&
+          state.lock.status !== "alive" ? "Worker starting. Follow progress on Make." :
+          `Queued. Applies within about ${state.interval}s when the runner reaches the boundary.`;
+        toast(result.warning || result.command.result || word);
         await refresh(true);
       }
     } catch (error) {
-      document.querySelector("#dialog-error").textContent = error.message;
+      document.querySelector("#dialog-error").innerHTML = resultMessage(error.message);
     } finally {
       submit.disabled = false;
     }
   });
 document.addEventListener("change", (event) => {
+  if (event.target.id === "job-select") { jobId = event.target.value; make(); }
+  if (event.target.id === "review-select") { reviewId = event.target.value; review(); }
+  if (event.target.id === "library-stage") { libraryStage = event.target.value; library(); }
+  if (event.target.matches("[data-select-item]")) {
+    if (event.target.checked) selectedItems.add(event.target.value);
+    else selectedItems.delete(event.target.value);
+    document.querySelector("#selected-count").textContent = `${selectedItems.size} selected`;
+  }
   if (event.target.id === "stage-filter") {
     filters.stage = event.target.value;
     history.replaceState(null, "", "/queue");
@@ -676,6 +756,14 @@ document.addEventListener("change", (event) => {
   }
 });
 document.addEventListener("input", (event) => {
+  if (event.target.id === "library-search") {
+    const position = event.target.selectionStart;
+    librarySearch = event.target.value;
+    library();
+    const field = document.querySelector("#library-search");
+    field.focus();
+    field.setSelectionRange(position, position);
+  }
   if (event.target.id === "queue-search") {
     const position = event.target.selectionStart;
     filters.queue = event.target.value;
@@ -694,4 +782,120 @@ window.addEventListener("resize", () => {
 refresh(true);
 setInterval(() => {
   if (!dialog.open && !document.hidden) refresh();
-}, 15000);
+}, 2500);
+
+function make() {
+  const jobs = state.commands.filter((c) => ["make", "clip_url", "remake_cut", "remake_hook"].includes(c.action));
+  const current = jobs.find((c) => c.id === jobId) || jobs[0];
+  const items = current ? state.items.filter((i) => i.creation_job === current.id) : [];
+  content.innerHTML = heading("Make", "Discover fresh clips or work from a specific source.") +
+    `<div class="grid-half">
+      <section class="panel">${panelHead("Discover clips", "Make up to 10 new clips from enabled discovery sources.")}${button("make")}</section>
+      <section class="panel">${panelHead("Clip from URL", "YouTube videos and Shorts, Twitch clips and VODs.")}${button("clip_url")}</section>
+    </div><section class="panel commands">${panelHead("Job progress", current ? (current.result || commandState(current)) : "Start a job to track each item.",
+      jobs.length > 1 ? `<select id="job-select" aria-label="Choose job">${jobs.map((job) =>
+        `<option value="${escape(job.id)}" ${job.id === current.id ? "selected" : ""}>${escape(labels[job.action])} · ${formatTime(job.created_at)} · ${commandState(job)}</option>`).join("")}</select>` : "")}
+    ${items.map((i) => `<div class="health-row"><a href="${itemLink(i.id)}">${escape(i.original_title)}</a>
+      <span>${pill(["awaiting_approval", "rendered"].includes(i.stage) ? "Ready for approval" : pretty(i.creation_phase || i.stage))}
+      ${escape(i.error_message || i.rejection_reason || "")}</span></div>`).join("")}
+    </section>${commandsPanel()}`;
+}
+
+async function review() {
+  const items = state.items.filter((i) => ["awaiting_approval", "rendered", "needs_review"].includes(i.stage));
+  const item = items.find((i) => i.id === reviewId) || items[0];
+  if (!item) {
+    content.innerHTML = heading("Review", "Compare variants before approving.") + empty("No clips are waiting for review.") + commandsPanel();
+    return;
+  }
+  reviewId = item.id;
+  const chooser = heading("Review", `${items.length} waiting for a decision`,
+    `<label class="review-choice">Clip <select id="review-select">
+       ${items.map((i) => `<option value="${escape(i.id)}" ${i.id === reviewId ? "selected" : ""}>${escape(i.original_title)}</option>`).join("")}
+     </select></label>`);
+  await itemPage(item.id, chooser);
+}
+
+function library() {
+  const items = state.items.filter((i) => (!libraryStage || i.stage === libraryStage) &&
+    (!librarySearch || `${i.original_title} ${i.author_name} ${i.source} ${i.id}`.toLowerCase().includes(librarySearch.toLowerCase())));
+  content.innerHTML = heading("Library", `${items.length} matching items`) +
+    `<div class="toolbar"><input type="search" id="library-search" placeholder="Search clips or creators" aria-label="Search library" value="${escape(librarySearch)}">
+    <select id="library-stage" aria-label="Filter by stage"><option value="">Every stage</option>
+    ${state.stages.map((s) => `<option value="${s.stage}" ${s.stage === libraryStage ? "selected" : ""}>${pretty(s.stage)}</option>`).join("")}
+    </select></div><section class="panel">
+    <div class="toolbar"><button class="button danger" data-bulk="delete">Delete selected</button>
+    <button class="button secondary" data-bulk="reject">Reject selected</button><span id="selected-count">${selectedItems.size} selected</span></div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Select</th><th scope="col">Clip</th><th scope="col">Source</th><th scope="col">Stage</th></tr></thead>
+    <tbody>${items.map((i) => `<tr><td>${i.actions.some((a) => ["delete", "reject"].includes(a)) ?
+      `<input type="checkbox" data-select-item value="${escape(i.id)}" aria-label="Select ${escape(i.original_title)}" ${selectedItems.has(i.id) ? "checked" : ""}>` : ""}
+    </td><td><a href="${itemLink(i.id)}">${escape(i.original_title)}</a></td><td>${escape(i.author_name)} · ${escape(i.source)}</td>
+    <td>${pill(pretty(i.stage))}</td></tr>`).join("")}</tbody></table></div></section>${commandsPanel()}`;
+}
+
+async function bulkAction(action) {
+  const ids = [...selectedItems].filter((id) => itemById(id)?.actions.includes(action));
+  if (!ids.length) { toast("Select items eligible for that action."); return; }
+  if (!window.confirm(`${labels[action]} for ${ids.length} selected item(s)?`)) return;
+  const counts = {};
+  for (const item_id of ids) {
+    try {
+      const { ticket } = await api("/api/prepare", { action, item_id });
+      const { command } = await api("/api/confirm", { ticket });
+      const status = commandState(command);
+      counts[status] = (counts[status] || 0) + 1;
+      if (["applied", "queued"].includes(status)) selectedItems.delete(item_id);
+    } catch {
+      counts.refused = (counts.refused || 0) + 1;
+    }
+  }
+  toast(Object.entries(counts).map(([status, n]) => `${n} ${status}`).join(" · "));
+  await refresh(true);
+}
+
+async function changeRunner(operation) {
+  const stage = state.lock.stage || "starting";
+  if (operation === "force" && !window.confirm(`Interrupt the ${stage} stage immediately?`)) return;
+  try {
+    const result = await api("/api/runner", { operation, stage });
+    toast(result.message);
+    await refresh(true);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function settingsForm() {
+  const flags = { instagram: "Instagram posting", facebook: "Facebook posting", telegram: "Telegram approval cards",
+    youtube: "YouTube discovery", twitch: "Twitch discovery" };
+  return heading("Settings", "Changes apply at the start of the runner’s next cycle.") +
+    `<form id="settings-form" class="panel commands">
+    ${panelHead("Posting and discovery", "Times use each profile’s configured timezone. Separate multiple slots with commas.")}
+    <div class="grid-half">${Object.entries(preferences.slots).map(([name, slots]) =>
+      `<label>Posting slots · ${escape(name)}<input data-profile="${escape(name)}" value="${escape(slots.join(", "))}" required></label>`).join("")}</div>
+    <div class="settings-switches">${Object.entries(flags).map(([key, text]) =>
+      `<label><input type="checkbox" name="${key}" ${preferences[key] ? "checked" : ""}> ${text}</label>`).join("")}</div>
+    <div class="grid-half"><label>Ready buffer<input type="number" name="buffer" min="1" max="50" value="${preferences.buffer}" required></label>
+    <label>Official-channel weight<input type="number" name="official_weight" min="0" max="5" step="any" value="${preferences.official_weight}" required></label>
+    <label>Heatmap weight<input type="number" name="heatmap_weight" min="0" max="2" step="any" value="${preferences.heatmap_weight}" required></label></div>
+    <div class="detail-actions"><button class="button primary">Save settings</button><span>${state.dry_run ? "Dry run enabled" : "Live posting enabled"}</span></div>
+    </form>`;
+}
+
+document.addEventListener("submit", async (event) => {
+  if (event.target.id !== "settings-form") return;
+  event.preventDefault();
+  const form = event.target;
+  const slots = Object.fromEntries([...form.querySelectorAll("[data-profile]")].map((field) =>
+    [field.dataset.profile, field.value.split(",").map((s) => s.trim())]));
+  const values = { slots };
+  for (const field of form.querySelectorAll("[name]"))
+    values[field.name] = field.type === "checkbox" ? field.checked : Number(field.value);
+  try {
+    const result = await api("/api/settings", values);
+    toast(result.message);
+    await refresh(true);
+  } catch (error) {
+    toast(error.message);
+  }
+});
