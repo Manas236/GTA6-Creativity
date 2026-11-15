@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
+import sys
 import secrets
 import sqlite3
 import threading
@@ -11,9 +14,9 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from pipeline import binding, config, db
+from pipeline import binding, config, db, runner
 import connection_checks
-from . import commands, execution, views
+from . import commands, execution, local_settings, views
 from .store import initialize, snapshot
 
 
@@ -77,6 +80,10 @@ def create_app(db_path=None, cfg=None, media_root=None):
         )
 
     @app.get("/")
+    @app.get("/make")
+    @app.get("/review")
+    @app.get("/library")
+    @app.get("/settings")
     @app.get("/queue")
     @app.get("/analytics")
     @app.get("/failures")
@@ -91,6 +98,40 @@ def create_app(db_path=None, cfg=None, media_root=None):
         data = views.state(path, settings())
         data["csrf"] = session["csrf"]
         return jsonify(data)
+
+    def probe(kind, selected=None):
+        try:
+            process = subprocess.run(
+                [sys.executable, "-m", "connection_checks"], cwd=config.ROOT_DIR,
+                input=json.dumps({"kind": kind, "selected": selected, "cfg": settings()}, default=str),
+                encoding="utf-8", capture_output=True, timeout=20, check=True,
+            )
+            return json.loads(process.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise commands.ControlError("The connection worker could not finish its check.") from exc
+
+    @app.get("/api/settings")
+    def read_settings():
+        return jsonify(settings=local_settings.editable(settings()))
+
+    @app.post("/api/settings")
+    def save_settings():
+        return jsonify(message=local_settings.save(request.get_json(silent=True), settings()))
+
+    @app.post("/api/runner/<operation>")
+    def runner_action(operation):
+        cfg_now = settings()
+        if operation == "start":
+            pid = execution.start_runner(path, cfg_now)
+            return jsonify(message=f"Runner starting (PID {pid}).")
+        if operation not in {"stop", "force"}:
+            abort(404)
+        stale, _ = runner._lock_settings(cfg_now)
+        body = request.get_json(silent=True)
+        if operation == "force" and not isinstance(body, dict):
+            abort(400)
+        return jsonify(message=commands.check(lambda: runner.request_stop(
+            path, force=operation == "force", expected=body, stale_timeout_s=stale)))
 
     @app.get("/api/connections")
     def connections():
@@ -112,7 +153,11 @@ def create_app(db_path=None, cfg=None, media_root=None):
         try:
             env = connection_checks.current_environment()
             selected = None if body["service"] == "all" else [body["service"]]
-            results = connection_checks.run_checks(env, selected, settings())
+            names = selected or connection_checks.CHECKS
+            configured = any(any(env.get(key) for key in connection_checks.CHECKS[name]["keys"])
+                             for name in names)
+            results = (probe("check", selected) if configured else
+                       connection_checks.run_checks({}, selected, settings()))
             with connection_lock:
                 connection_results.update(results)
                 rows = connection_checks.describe(env, connection_results)
@@ -125,15 +170,13 @@ def create_app(db_path=None, cfg=None, media_root=None):
         if not connection_run_lock.acquire(blocking=False):
             return jsonify(error="A connection test is already running."), 409
         try:
-            return jsonify(result=connection_checks.send_telegram_test(
-                connection_checks.current_environment(), settings()
-            ))
+            return jsonify(result=probe("send"))
         finally:
             connection_run_lock.release()
 
     @app.get("/api/items/<item_id>")
     def detail(item_id):
-        data = views.item_detail(path, item_id)
+        data = views.item_detail(path, item_id, settings())
         if data is None:
             abort(404)
         return jsonify(data)
@@ -153,6 +196,11 @@ def create_app(db_path=None, cfg=None, media_root=None):
                 path,
                 settings(),
             )
+        if plan["action"] == "post_now":
+            stale, _ = runner._lock_settings(settings())
+            if not runner.lock_state(path, stale):
+                plan["start_runner"] = True
+                plan["description"] += " · Start runner and post"
         plan["client"] = session["csrf"]
         plan["nonce"] = secrets.token_hex(16)
         return jsonify(
@@ -179,6 +227,10 @@ def create_app(db_path=None, cfg=None, media_root=None):
         command_id = hashlib.sha256(ticket.encode()).hexdigest()[:32]
         if request.path == "/api/execute":
             result = execution.submit(plan, command_id, path, settings())
+            if plan.get("start_runner") and result["status"] == "applied":
+                stale, _ = runner._lock_settings(settings())
+                if not runner.lock_state(path, stale):
+                    execution.start_runner(path, settings())
             return jsonify(command=result), (202 if result["status"] == "pending" else 200)
         result = commands.enqueue(plan, command_id, path)
         return jsonify(command=result), 202

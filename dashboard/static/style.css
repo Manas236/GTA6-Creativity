@@ -1047,3 +1047,13 @@ dialog label {
     transition: filter 0.15s;
   }
 }
+
+.control-form { display:grid; gap:.85rem; max-width:40rem; }
+.control-form label { display:grid; gap:.35rem; }
+.control-form .switch-field { display:flex; align-items:center; gap:.75rem; }
+.control-form button { justify-self:start; }
+.control-form input:not([type=checkbox]), #action-fields input { width:100%; }
+.caption-preview { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; }
+.queue-card input[type=checkbox] { width:1.1rem; height:1.1rem; accent-color:var(--pink); }
+button:disabled { opacity:.45; cursor:default; }
+#confirm-content p { white-space:pre-wrap; }

@@ -3,6 +3,8 @@
 import argparse
 from pathlib import Path
 
+from pipeline import config
+
 from .app import create_app
 
 
@@ -20,11 +22,13 @@ def main():
         parser.error("port must be between 1024 and 65535")
     from waitress import serve
 
+    if args.media_root:
+        config.set_media_root(args.media_root.resolve())
     app = create_app(args.db, media_root=args.media_root)
     print(f"GTA 6 control panel at http://127.0.0.1:{args.port}", flush=True)
     print(f"Database: {app.config['DASHBOARD_DB']}", flush=True)
     print(
-        "Controls wait for the runner's next stage boundary. Ctrl-C to stop.",
+        "Controls apply immediately while the runner is stopped. Ctrl-C stops the dashboard.",
         flush=True,
     )
     serve(

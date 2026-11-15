@@ -183,6 +183,7 @@ def build_demo(path, media=True):
                 "cut_start": 34.5,
                 "cut_end": 54.5,
                 "cut_duration": 20,
+                "cut_signal": ("audio_scene", "heatmap", "chat")[index % 3],
                 "cut_path": str(media_root / "A.mp4"),
                 "download_path": str(media_root / "A.mp4"),
                 "hook_text": hook,
@@ -338,6 +339,15 @@ def build_demo(path, media=True):
                                         hours,
                                     ),
                                 )
+    with db.db(path) as conn:
+        sample = conn.execute("SELECT id FROM items WHERE stage='awaiting_approval' LIMIT 1").fetchone()[0]
+        conn.execute(
+            "INSERT INTO dashboard_commands (id, action, payload, expected, status, result, created_at, completed_at)"
+            " VALUES ('demo-make', 'make', ?, '', 'applied', '1 of 1 ready for approval.', ?, ?)",
+            (json.dumps({"count": 1}), db.now(), db.now()),
+        )
+        conn.execute("UPDATE items SET dashboard_job='demo-make', dashboard_step='approval hand-off' WHERE id=?",
+                     (sample,))
     analytics.rebuild_ab_learning(cfg, path)
     db.kv_set("dashboard:demo", "true", path)
     db.kv_set(

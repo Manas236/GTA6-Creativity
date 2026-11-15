@@ -40,6 +40,9 @@ def lock_status(path, cfg):
             "pid": lock.get("pid"),
             "remote": lock.get("host") != socket.gethostname(),
             "started_at": lock.get("started_at", 0),
+            "stage": lock.get("stage"),
+            "token": lock.get("token"),
+            "mode": lock.get("mode", "runner"),
         }
     except (KeyError, ValueError, TypeError):
         return {"status": "stale", "age": None, "host": None}
@@ -56,7 +59,7 @@ def state(path, cfg):
             for r in conn.execute(
                 """SELECT id, source, author_name, original_title, stage,
             discovery_score, hook_text, hook_style, authenticity, chosen_variant, preview_only,
-            error_stage, error_message, rejection_reason, created_at, stage_updated_at
+            error_stage, error_message, rejection_reason, created_at, stage_updated_at, cut_signal, dashboard_job, dashboard_step
             FROM items ORDER BY created_at DESC"""
             )
         ]
@@ -82,8 +85,19 @@ def state(path, cfg):
                 "FROM dashboard_commands ORDER BY created_at DESC, rowid DESC LIMIT 30"
             )
         ]
+        by_item = {}
+        for row in conn.execute("SELECT * FROM posts"):
+            by_item.setdefault(row["item_id"], []).append(dict(row))
+        for item in items:
+            item["actions"] = available_actions(item, by_item.get(item["id"], []))
         runtime = decode(db.kv_get("dashboard:runtime", db_path=path))
         lock = lock_status(path, cfg)
+        from pipeline.runner import STOP_KEY
+        stop = float(db.kv_get(STOP_KEY, db_path=path) or 0)
+        lock["stopping"] = bool(stop and lock["status"] == "alive")
+        lock["force_allowed"] = (lock["stopping"] and time.time() - stop >= 120
+                                 and lock.get("stage") not in {"settle", "post"}
+                                 and not lock.get("remote"))
         runtime_known = bool(
             lock["status"] == "alive"
             and runtime.get("at")
@@ -109,6 +123,7 @@ def state(path, cfg):
         dashboard_paused = rate_limit.dashboard_meta_paused(path)
         meta_until, meta_reason = rate_limit.active_cooldown(posting.META_SOURCE, path)
         return {
+            "loop_interval": cfg.get("orchestrator", {}).get("loop_interval_seconds", 60),
             "runtime_known": runtime_known,
             "config_changed": config_changed,
             "at": db.now(),
@@ -140,7 +155,7 @@ def state(path, cfg):
         }
 
 
-def item_detail(path, item_id):
+def item_detail(path, item_id, cfg=None):
     with snapshot(path) as conn:
         item = db.get_item(item_id, path)
         if item is None:
@@ -168,6 +183,7 @@ def item_detail(path, item_id):
                 if k not in ("source_transcript", "transcript_words")
             },
             "posts": posts,
+            "caption": posting.caption_for_item(item, cfg),
             "logs": logs,
             "media": media,
             "review": decode(item.get("hook_review")),

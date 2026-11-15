@@ -292,3 +292,16 @@ def run_checks(env, selected=None, cfg=None, transport=None):
 def current_environment():
     # Read fresh values after local .env edits, without changing the runner cache.
     return config.load_env(config.project_root() / ".env")
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    task = json.load(sys.stdin)
+    env = current_environment()
+    if task["kind"] == "send":
+        result_data = send_telegram_test(env, task["cfg"])
+    else:
+        result_data = run_checks(env, task["selected"], task["cfg"])
+    print(json.dumps(result_data))

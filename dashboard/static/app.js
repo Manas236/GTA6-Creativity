@@ -1,5 +1,6 @@
 "use strict";
 let state, detail, pendingAction, confirmation, refreshTimer;
+let editableSettings, selectedItems = new Set();
 let connectionRows = [], connectionsBusy = false;
 const content = document.querySelector("#content");
 const dialog = document.querySelector("#action-dialog");
@@ -10,6 +11,17 @@ const colors = {
   B: "#70d8b2",
 };
 const labels = {
+  make: "Make clips",
+  clip_url: "Clip from URL",
+  delete: "Delete item",
+  bulk_reject: "Reject item",
+  edit_caption: "Edit caption",
+  unapprove: "Unapprove",
+  post_now: "Post now",
+  up: "Move up",
+  down: "Move down",
+  remake: "Remake cut",
+  remake_hook: "Regenerate hook",
   approve: "Approve both variants",
   aonly: "Approve A only",
   reject: "Reject item",
@@ -98,13 +110,24 @@ function queueItems() {
       ),
     );
 }
+function statusText(status) {
+  return status === "pending" ? "queued" : status;
+}
+function commandMessage(command) {
+  const item = itemById(command.item_id);
+  const stage = item ? " · " + pretty(item.stage) : "";
+  return command.result ? command.result + stage : command.status === "running" ? "Creation stages running." :
+    state.lock.status === "alive" ? `Applies within about ${state.loop_interval}s, after the current stage.` :
+    ["make", "clip_url", "remake", "remake_hook"].includes(command.action) ? "Waiting for the creation worker." :
+    "Queued for the next runner boundary.";
+}
 function commandsPanel() {
   if (!state.commands.length) return "";
-  return `<section class="panel commands">${panelHead("Recent controls", "Commands apply at the runner’s next stage boundary.")}${state.commands
+  return `<section class="panel commands">${panelHead("Recent controls", "Live command results")}${state.commands
     .slice(0, 6)
     .map(
       (c) =>
-        `<div class="command-row">${pill(c.status, c.status === "applied" ? "green" : c.status === "pending" ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${escape(c.result || "Waiting for the runner. Start or resume its loop to apply this command.")}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`,
+        `<div class="command-row">${pill(statusText(c.status), c.status === "applied" ? "green" : c.status === "pending" ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${escape(commandMessage(c))}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`,
     )
     .join("")}</section>`;
 }
@@ -145,15 +168,15 @@ function overview() {
     heading(
       "Your pipeline, at a glance.",
       `${formatTime(state.at, { weekday: "long" })} · ${state.timezone}`,
-      state.dashboard_paused
+      runnerButtons(lock) + (state.dashboard_paused
         ? button("resume", "", "Lift dashboard pause")
-        : state.meta_paused ? "" : button("pause"),
+        : state.meta_paused ? "" : button("pause")),
     ) +
     `<div class="metrics-grid">${metric("READY TO GO", `${state.ready} <em>/ ${state.target}</em>`, "Ready buffer · target from config", "pink")}${metric("LIVE PLATFORM POSTS", number(live), "Instagram + Facebook")}${metric("RECORDED VIEWS", compact(latest.reduce((n, m) => n + m.views, 0)), "Latest stored snapshot per post", "green")}${metric("AWAITING A DECISION", review, "Rendered, approval & review queues", "purple")}</div>
     <div class="grid-main"><section class="panel">${panelHead("Production funnel", "Every pipeline stage · current inventory", pill(`${state.items.length} items`))}
-    ${state.stages.map((s) => `<a href="/queue?stage=${s.stage}" class="funnel-row"><span class="funnel-label">${escape(pretty(s.stage))}</span><div class="track"><div class="fill" style="width:${(s.count / max) * 100}%;background:${["failed", "rejected"].includes(s.stage) ? "var(--red)" : s.stage === "needs_review" ? "var(--amber)" : s.stage === "queued" ? "var(--pink)" : "var(--purple)"}"></div></div><b>${number(s.count)}</b></a>`).join("")}</section>
+    ${state.stages.map((s) => `<a href="/library?stage=${s.stage}" class="funnel-row"><span class="funnel-label">${escape(pretty(s.stage))}</span><div class="track"><div class="fill" style="width:${(s.count / max) * 100}%;background:${["failed", "rejected"].includes(s.stage) ? "var(--red)" : s.stage === "needs_review" ? "var(--amber)" : s.stage === "queued" ? "var(--pink)" : "var(--purple)"}"></div></div><b>${number(s.count)}</b></a>`).join("")}</section>
     <section class="panel">${panelHead("System health", "Observed state from the runner and SQLite")}
-    ${health("Runner", pretty(lock.status), lock.age === null ? "No valid heartbeat" : `Heartbeat ${lock.age}s ago · ${lock.host || "unknown host"}${runtime.stage ? " · " + runtime.stage : ""}`, lock.status === "alive" ? "" : lock.status === "stale" ? "red" : "gray")}
+    ${health("Runner", lock.stopping ? `Stopping, finishing ${lock.stage || "current stage"}` : lock.status === "alive" ? "Running" : "Stopped", lock.age === null ? "No valid heartbeat" : `Heartbeat ${lock.age}s ago · ${lock.host || "unknown host"}${lock.stage ? " · " + lock.stage : ""}`, lock.status === "alive" ? "" : lock.status === "stale" ? "red" : "gray")}
     ${health("Meta publishing", state.meta_paused ? "Paused" : "Enabled", state.meta_paused ? metaDetails : state.dry_run ? "Dry run is on; publish requests are suppressed." : "The runner publishes at scheduled slots.", state.meta_paused ? "amber" : "")}
     ${health("Gemini quota", quotaText, quotaBlocked ? `Runner reported a block until ${formatTime(runtime.gemini_blocked_until)}.` : "Remaining daily allowance is not exposed by the pipeline.", quotaBlocked ? "amber" : quotaKnown ? "" : "gray")}
     ${state.limits
@@ -219,7 +242,7 @@ function queue() {
       pill(`${rows.length} items`),
     ) +
     `<div class="toolbar"><input type="search" id="queue-search" aria-label="Search items" placeholder="Search clips, creators or item IDs" value="${escape(filters.queue)}"><select id="stage-filter" aria-label="Filter stage"><option value="all">Approved & queued</option>${state.stages.map((s) => `<option value="${s.stage}" ${filters.stage === s.stage ? "selected" : ""}>${pretty(s.stage)} (${s.count})</option>`).join("")}</select></div>
-  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card"><div class="queue-time">${posts[0] ? escape(formatTime(posts[0].slot_datetime, { day: undefined, month: undefined })) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${itemLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><a class="button secondary" href="${itemLink(item.id)}">Review clip ↗</a></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
+  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card"><div class="queue-time">${posts[0] ? escape(formatTime(posts[0].slot_datetime, { day: undefined, month: undefined })) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${itemLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${actionButtons(item, ["up", "down", "unapprove", "post_now"])}<a class="button secondary" href="${itemLink(item.id)}">Open clip ↗</a></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
 }
 function analytics() {
   const latest = totals(),
@@ -264,6 +287,9 @@ function analytics() {
   ${["A", "B"].map((v) => `<div class="health-row"><span>Variant ${v}</span><span class="small">${state.variants[v]?.n || 0} items · score ${(state.variants[v]?.score || 0).toFixed(3)}</span></div>`).join("")}</section></div>
   <div class="grid-half"><section class="panel">${panelHead("Performance by hook style", "Latest recorded views · grouped by post hook style")}${bars("hook_style")}</section><section class="panel">${panelHead("Performance by source", "Latest recorded views · grouped by post source")}${bars("source")}</section></div>
   <section class="panel">${panelHead("Follow an individual post", "Views at each stored observation time")}<div class="toolbar"><select id="post-select" aria-label="Select post"><option value="">Choose a platform post</option>${latest.map((m) => `<option value="${m.post_id}">${escape(itemById(m.item_id)?.original_title || m.item_id)} · ${m.platform} · ${m.variant}</option>`).join("")}</select></div><div class="chart-box"><canvas id="post-chart" role="img" aria-label="Selected post views at snapshot times"></canvas></div></section>`;
+  const signals = ["heatmap", "chat", "audio_scene"];
+  content.insertAdjacentHTML("beforeend", `<section class="panel commands">${panelHead("Cut signals", "Selected signal across completed cuts")}${signals.map((signal) =>
+    `<div class="health-row"><span>${pretty(signal)}</span><strong>${state.items.filter((i) => i.cut_signal === signal).length}</strong></div>`).join("")}</section>`);
   platformChart("analytics-chart", latest);
   const select = document.querySelector("#post-select");
   select.addEventListener("change", () => postChart(select.value));
@@ -319,6 +345,7 @@ async function itemPage() {
     detail.posts.some((p) => !["pending", "dry_run"].includes(p.status))
       ? '<div class="notice">Posting history exists. Started or failed publishes are display-only to prevent duplicate posts.</div>'
       : "") +
+    (["posted","measured","cleaned"].includes(i.stage) ? '<div class="notice">Remove it on Instagram yourself.</div>' : "") +
     (i.preview_only
       ? '<div class="notice">Preview-only item. Approval and pipeline controls are blocked.</div>'
       : "") +
@@ -348,6 +375,8 @@ async function itemPage() {
    .filter((a) => !["approve", "aonly", "reject", "hookok"].includes(a))
    .map((a) => button(a, i.id))
    .join("")}</div></section></div>
+ <section class="panel commands">${panelHead("Posting caption", "Exact text sent with the post", pill(pretty(i.cut_signal || "unrecorded") + " cut signal"))}
+ <pre class="caption-preview">${escape(detail.caption)}</pre></section>
  ${detail.review.reason ? `<section class="panel commands">${panelHead("Review context")}<p class="reason">${escape(detail.review.reason)}</p><p>${escape(detail.review.transcript_excerpt || "")}</p></section>` : ""}
  <section class="panel commands">${panelHead("Stage history", "Full history, oldest to newest", pill(`${detail.logs.length} events`))}${detail.logs.map((l) => `<div class="log-entry"><time>${escape(formatTime(l.created_at))}</time><span>${escape(pretty(l.stage))}</span><div>${pill(l.status, ["failed", "failure"].includes(l.status) ? "red" : l.status === "success" ? "green" : "")}<p>${escape(l.message)}${l.duration_s ? ` · ${Number(l.duration_s).toFixed(1)}s` : ""}</p></div></div>`).join("") || empty("No stage history recorded.")}</section>${commandsPanel()}`;
 }
@@ -499,11 +528,11 @@ function toast(message) {
   node.hidden = false;
   setTimeout(() => (node.hidden = true), 7000);
 }
-function connections() {
+function connectionMarkup() {
   const tones = { ok: "green", failed: "red", warning: "amber", not_set: "gray", unchecked: "gray" };
   const names = { ok: "OK", failed: "Failed", warning: "Warning", not_set: "Not set", unchecked: "Not checked" };
   const disabled = connectionsBusy ? " disabled" : "";
-  content.innerHTML = heading(
+  return heading(
     "Connections",
     "Checks run only when pressed, on this computer. Each has a 10-second timeout.",
     `<button class="button primary" data-connection="all"${disabled}>${connectionsBusy ? "Testing…" : "Test all (sends a real success ping)"}</button>`,
@@ -511,6 +540,14 @@ function connections() {
     <div class="table-wrap"><table class="data-table connections-table"><thead><tr><th>Service</th><th>Status</th><th>Reason</th><th>Last check</th><th>Test</th></tr></thead><tbody>
     ${connectionRows.map((row) => `<tr><td><code>${escape(row.label)}</code></td><td>${pill(names[row.status] || row.status, tones[row.status] || "gray")}</td><td class="connection-reason">${escape(row.reason)}</td><td>${row.checked_at ? escape(formatTime(row.checked_at, { second: "2-digit" })) : "Never"}</td><td><button class="button secondary" data-connection="${escape(row.id)}"${disabled}>${row.id === "healthcheck" ? "Test (sends a real success ping)" : "Test"}</button></td></tr>`).join("")}
     </tbody></table></div><div class="detail-actions"><button class="button secondary" data-send-telegram${disabled}>Send test message</button><span class="reason">Sends one Telegram message to the configured chat. Never included in Test all.</span></div><p id="telegram-test-result" class="reason" role="status"></p></section>`;
+}
+function connections() {
+  if (location.pathname === "/settings") {
+    const target = document.querySelector("#settings-connections");
+    if (target) target.innerHTML = connectionMarkup();
+  } else {
+    content.innerHTML = connectionMarkup();
+  }
 }
 async function testConnection(service, sendMessage = false) {
   if (connectionsBusy) return;
@@ -543,7 +580,7 @@ async function refresh(manual = false) {
       state.profile + " · " + state.timezone;
     const banner = document.querySelector("#mode-banner");
     banner.classList.toggle("live", !state.dry_run);
-    banner.innerHTML = `<span><strong>${state.dry_run ? "DRY RUN IS ON" : "LIVE POSTING IS ON"}</strong> &nbsp; ${state.dry_run ? "The runner simulates publishing." : "Approved clips can be published by the runner."}</span><span class="${state.demo ? "demo" : ""}">${state.demo ? "DEMO DATABASE · seeded example data" : state.config_changed ? "CONFIG CHANGED · restart runner to apply" : state.runtime_known ? "RUNNER SETTINGS" : state.meta_paused ? "META POSTING PAUSED" : "CONFIG SETTINGS · runner not observed"}</span>`;
+    banner.innerHTML = `<span><strong>${state.dry_run ? "DRY RUN IS ON" : "LIVE POSTING IS ON"}</strong> &nbsp; ${state.dry_run ? "The runner simulates publishing." : "Approved clips can be published by the runner."}</span><span class="${state.demo ? "demo" : ""}">${state.demo ? "DEMO DATABASE · seeded example data" : state.config_changed ? "CONFIG CHANGED · applies next cycle" : state.runtime_known ? "RUNNER SETTINGS" : state.meta_paused ? "META POSTING PAUSED" : "CONFIG SETTINGS · runner not observed"}</span>`;
     document.querySelector("#nav-queued").textContent = state.items.filter(
       (i) => i.stage === "queued",
     ).length;
@@ -570,6 +607,10 @@ async function refresh(manual = false) {
         analytics: "Analytics",
         failures: "Failures & review",
         connections: "Connections",
+        make: "Make",
+        review: "Review",
+        library: "Library",
+        settings: "Settings",
         item: "Item detail",
       }[page];
     document.querySelector("#footer").textContent =
@@ -579,6 +620,19 @@ async function refresh(manual = false) {
         connectionRows = (await api("/api/connections")).connections;
         connections();
       }
+    } else if (page === "settings") {
+      if (!editableSettings || !document.querySelector("#settings-form")) {
+        editableSettings = (await api("/api/settings")).settings;
+        connectionRows = (await api("/api/connections")).connections;
+        settingsPage();
+      }
+    } else if (page === "make") {
+      if (!document.querySelector("#job-list")) makePage();
+      else document.querySelector("#job-list").innerHTML = jobsMarkup();
+    } else if (page === "review") {
+      reviewPage(manual);
+    } else if (page === "library") {
+      libraryPage(manual);
     } else if (page === "item") {
       if (manual || !detail) await itemPage();
     } else if (
@@ -601,7 +655,11 @@ function openAction(action, id) {
   document.querySelector("#confirm-content").hidden = true;
   const fields = document.querySelector("#action-fields");
   fields.hidden = false;
-  if (action === "edit_hook")
+  if (action === "edit_caption")
+    fields.innerHTML = `<label for="caption-body">Caption body</label><textarea id="caption-body" maxlength="2200">${escape(detail?.item?.caption_body_override ?? detail?.item?.hook_text ?? "")}</textarea><label for="caption-tags">Hashtags</label><input id="caption-tags" value="${escape(detail?.item?.caption_tags_override ?? (detail?.caption || "").split("\n").at(-1).match(/#[\w]+/g)?.join(" ") ?? "")}"><p class="reason">Creator credit and disclosure are appended automatically.</p>`;
+  else if (action === "delete")
+    fields.innerHTML = '<p class="reason">Remove the item from the pipeline and delete its local media. Its source stays marked as seen.</p>';
+  else if (action === "edit_hook")
     fields.innerHTML = `<label for="hook-edit">New hook text</label><textarea id="hook-edit" maxlength="220" required>${escape(detail?.item?.hook_text || "")}</textarea><p class="reason">The runner checks the edited text against the cut, invalidates the old renders, and renders both variants again.</p>`;
   else if (action === "reslot")
     fields.innerHTML = `<label for="slot-after">Find a free slot after (UTC)</label><input id="slot-after" type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}"><p class="reason">The scheduler uses ${escape(state.timezone)}, the configured minimum gap and at most two items per local day. The next free slot is recalculated when applied.</p>`;
@@ -617,7 +675,21 @@ document.addEventListener("click", (event) => {
     return;
   }
   const buttonNode = event.target.closest("[data-action]");
-  if (buttonNode) openAction(buttonNode.dataset.action, buttonNode.dataset.id);
+  if (buttonNode) {
+    const id = buttonNode.dataset.id;
+    const action = buttonNode.dataset.action;
+    if (["edit_hook", "edit_caption"].includes(action) && detail?.item?.id !== id) {
+      api("/api/items/" + encodeURIComponent(id)).then((data) => {
+        detail = data;
+        openAction(action, id);
+      }).catch((error) => toast(error.message));
+    } else openAction(action, id);
+  }
+  const lifecycle = event.target.closest("[data-runner]");
+  if (lifecycle) runnerAction(lifecycle.dataset.runner, lifecycle);
+  const bulk = event.target.closest("[data-bulk]");
+  if (bulk) bulkAction(bulk.dataset.bulk);
+
 });
 document.querySelector("#close-dialog").onclick = () => dialog.close();
 document.querySelector("#cancel-dialog").onclick = () => dialog.close();
@@ -631,6 +703,10 @@ document
     try {
       if (!confirmation) {
         const payload = {};
+        if (pendingAction.action === "edit_caption") {
+          payload.body = document.querySelector("#caption-body").value;
+          payload.hashtags = document.querySelector("#caption-tags").value;
+        }
         if (pendingAction.action === "edit_hook")
           payload.hook_text = document.querySelector("#hook-edit").value;
         if (pendingAction.action === "reslot")
@@ -642,21 +718,17 @@ document
         document.querySelector("#dialog-error").textContent = "";
         const node = document.querySelector("#confirm-content");
         node.hidden = false;
-        node.innerHTML = `<p><strong>${escape(confirmation.description)}</strong></p>${payload.hook_text ? `<p>“${escape(payload.hook_text)}”</p>` : ""}<p class="muted">${state.lock.status === "alive" ? "The runner will apply this at its next stage boundary." : "The runner is not active. This command will remain pending until its loop starts."}</p><p class="muted">Confirm this change to ${escape(confirmation.title)}?</p>`;
+        node.innerHTML = `<p><strong>${escape(confirmation.description)}</strong></p>${payload.hook_text ? `<p>“${escape(payload.hook_text)}”</p>` : ""}<p class="muted">${state.lock.status === "alive" ? `Applies within about ${state.loop_interval}s, after the current stage.` : "The panel applies this change immediately."}</p><p class="muted">Confirm this change to ${escape(confirmation.title)}?</p>`;
         document.querySelector("#dialog-title").textContent =
           "Confirm your change";
-        submit.textContent = "Confirm & queue";
+        submit.textContent = confirmation.description.includes("Start runner and post") ? "Start runner and post" : "Confirm";
       } else {
         const result = await api("/api/execute", {
           ticket: confirmation.ticket,
         });
         dialog.close();
-        toast(
-          "Command " +
-            result.command.status +
-            ". Its result appears in Recent controls.",
-        );
         await refresh(true);
+        toast(`${pretty(statusText(result.command.status))}: ${commandMessage(result.command)}`);
       }
     } catch (error) {
       document.querySelector("#dialog-error").textContent = error.message;
@@ -695,3 +767,193 @@ refresh(true);
 setInterval(() => {
   if (!dialog.open && !document.hidden) refresh();
 }, 15000);
+
+function actionButtons(item, choices) {
+  return choices.filter((action) => item.actions?.includes(action))
+    .map((action) => button(action, item.id)).join("");
+}
+
+function runnerButtons(lock) {
+  return `<button class="button primary" data-runner="start" ${lock.status === "alive" ? "disabled" : ""}>Start runner</button>
+    <button class="button secondary" data-runner="stop" ${lock.status !== "alive" || lock.stopping ? "disabled" : ""}>Stop runner</button>
+    ${lock.force_allowed ? '<button class="button danger" data-runner="force">Force stop</button>' : ""}`;
+}
+
+async function runnerAction(operation, node) {
+  const lock = state.lock;
+  if (operation === "force" && !confirm(`Force stop the runner and interrupt ${lock.stage}?`)) return;
+  node.disabled = true;
+  try {
+    const result = await api("/api/runner/" + operation, { token: lock.token, stage: lock.stage });
+    toast(result.message);
+    await refresh(true);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    node.disabled = false;
+  }
+}
+
+function jobsMarkup() {
+  const jobs = state.commands.filter((c) => ["make", "clip_url", "remake", "remake_hook"].includes(c.action));
+  return `<section class="panel">${panelHead("Creation jobs", "Clip progress updates automatically")}
+    ${jobs.map((job) => {
+      const items = state.items.filter((item) => item.dashboard_job === job.id);
+      const source = /\/items\/[A-Za-z0-9_-]+/.exec(job.result || "");
+      return `<div class="command-row">${pill(statusText(job.status), job.status === "applied" ? "green" : "amber")}<div class="grow">
+        <strong>${escape(labels[job.action])}</strong><p>${escape(commandMessage(job))} ${source ? `<a href="${source[0]}">Open existing item</a>` : ""}</p>
+        ${items.map((item) => `<div class="health-row"><a href="${itemLink(item.id)}">${escape(item.original_title)}</a><span>${escape(
+          ["rendered", "awaiting_approval"].includes(item.stage) ? "Ready for approval" :
+          item.error_message || item.rejection_reason || (item.stage === "needs_review" ? "Hook needs review" : pretty(item.dashboard_step || item.stage)))}</span></div>`).join("")}
+      </div></div>`;
+    }).join("") || empty("No creation jobs yet.")}</section>`;
+}
+
+function makePage() {
+  content.innerHTML = heading("Make clips", "Discover fresh candidates or choose a source yourself.") +
+    `<div class="grid-half"><section class="panel">${panelHead("Make N now", "Discover and render up to ten new clips.")}
+    <form class="control-form" data-create="make"><label>How many clips? <input name="count" type="number" min="1" max="10" value="3" required></label><button class="button primary">Make clips now</button></form>
+    </section><section class="panel">${panelHead("Clip from URL", "YouTube video or Short, Twitch clip or VOD.")}
+    <form class="control-form" data-create="clip_url"><label>Source URL<input name="url" type="url" placeholder="https://…" required></label>
+    <label>Start hint <input name="start" placeholder="mm:ss" pattern="[0-9]+:[0-5][0-9]"></label>
+    <label>End hint <input name="end" placeholder="mm:ss" pattern="[0-9]+:[0-5][0-9]"></label>
+    <button class="button primary">Make clip</button><p class="reason" role="status"></p></form></section></div>
+    <div id="job-list" class="commands">${jobsMarkup()}</div>`;
+}
+
+async function perform(action, item, payload = {}) {
+  const plan = await api("/api/prepare", { action, item_id: item, payload });
+  return (await api("/api/execute", { ticket: plan.ticket })).command;
+}
+
+function reviewPage(manual) {
+  const items = state.items.filter((i) => ["rendered", "awaiting_approval", "needs_review"].includes(i.stage) && !i.preview_only);
+  const signature = JSON.stringify(items.map((i) => [i.id, i.stage, i.actions, i.hook_text]));
+  if (!manual && content.dataset.review === signature) {
+    document.querySelector("#review-commands").innerHTML = commandsPanel();
+    return;
+  }
+  content.dataset.review = signature;
+  content.innerHTML = heading("Review clips", "Compare both vertical renders before approving.") + items.map((item) =>
+    `<section class="panel commands">${panelHead(escape(item.original_title), escape(`${item.author_name} · ${pretty(item.stage)}`))}
+      ${item.stage !== "needs_review" ? `<div class="video-grid">${["a", "b"].map((v) => `<div class="video-card"><header>Variant ${v.toUpperCase()}</header><video controls preload="none" src="/media/${encodeURIComponent(item.id)}/${v}"></video></div>`).join("")}</div>` : ""}
+      <div class="detail-actions">${actionButtons(item, ["approve", "aonly", "reject", "hookok", "remake", "remake_hook", "edit_hook", "edit_caption"])}
+      <a class="button secondary" href="${itemLink(item.id)}">Item details</a></div></section>`
+  ).join("") + (!items.length ? empty("No clips are waiting for review.") : "") + `<div id="review-commands">${commandsPanel()}</div>`;
+}
+
+function libraryPage(manual) {
+  if (document.querySelector("#library-search")) {
+    const node = document.querySelector("#library-commands");
+    if (node) node.innerHTML = commandsPanel();
+    if (document.activeElement.id !== "library-search") libraryRows();
+    return;
+  }
+  const fromURL = new URLSearchParams(location.search).get("stage");
+  content.innerHTML = heading("Clip library", "All discovered, rendered and posted items.") +
+    `<div class="toolbar"><input type="search" id="library-search" placeholder="Search clips or creators" aria-label="Search library">
+    <select id="library-stage" aria-label="Library stage"><option value="">Any stage</option>${state.stages.map((s) => `<option value="${s.stage}" ${s.stage === fromURL ? "selected" : ""}>${pretty(s.stage)}</option>`).join("")}</select>
+    <button class="button danger" data-bulk="delete">Delete selected</button><button class="button secondary" data-bulk="bulk_reject">Reject selected</button></div>
+    <div id="library-list"></div><div id="library-commands">${commandsPanel()}</div>`;
+  libraryRows();
+}
+function libraryRows() {
+  const value = document.querySelector("#library-search").value.toLowerCase();
+  const stage = document.querySelector("#library-stage").value;
+  const rows = state.items.filter((item) => (!stage || stage === item.stage) &&
+    `${item.original_title} ${item.author_name}`.toLowerCase().includes(value));
+  document.querySelector("#library-list").innerHTML = rows.map((item) =>
+    `<article class="queue-card">${item.actions.includes("delete") || item.actions.includes("bulk_reject") ?
+      `<input type="checkbox" data-select-item="${escape(item.id)}" aria-label="Select ${escape(item.original_title)}" ${selectedItems.has(item.id) ? "checked" : ""}>` : "<span></span>"}
+    <div><h3><a href="${itemLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)}</p></div>
+    <div>${pill(pretty(item.stage))}${["posted", "measured", "cleaned"].includes(item.stage) ? "<p>Remove it on Instagram yourself.</p>" : ""}</div></article>`
+  ).join("") || empty("No matching clips.");
+}
+
+async function bulkAction(action) {
+  const ids = [...selectedItems].filter((id) => itemById(id)?.actions.includes(action));
+  if (!ids.length) return toast("Select eligible items first.");
+  if (!confirm(`${action === "delete" ? "Delete" : "Reject"} ${ids.length} selected item(s)?`)) return;
+  const results = [];
+  for (const id of ids) {
+    try {
+      results.push({ status: "fulfilled", value: await perform(action, id) });
+    } catch (error) {
+      results.push({ status: "rejected", reason: error.message });
+    }
+  }
+  selectedItems.clear();
+  await refresh(true);
+  const counts = {};
+  results.forEach((r) => {
+    const status = r.status === "fulfilled" ? statusText(r.value.status) : "refused";
+    counts[status] = (counts[status] || 0) + 1;
+  });
+  toast(Object.entries(counts).map(([status, n]) => `${n} ${status}`).join(" · "));
+}
+
+const settingsLabels = {
+  instagram: "Instagram posting", facebook: "Facebook posting", telegram: "Telegram approval",
+  youtube: "YouTube discovery", twitch: "Twitch discovery", buffer: "Ready buffer target",
+  official_weight: "Official-channel weight", heatmap_weight: "YouTube replay heatmap weight",
+};
+function settingsPage() {
+  content.innerHTML = heading("Settings", "Saved locally. The runner reloads settings each cycle.") +
+    `<section class="panel"><form class="control-form" id="settings-form">
+    ${Object.entries(editableSettings.slots).map(([profile, slots]) => `<label>${escape(profile)} posting slots <input name="slot:${escape(profile)}" value="${escape(slots.join(", "))}" required></label>`).join("")}
+    ${Object.entries(settingsLabels).map(([key, label]) => typeof editableSettings[key] === "boolean" ?
+      `<label class="switch-field"><input name="${key}" type="checkbox" ${editableSettings[key] ? "checked" : ""}> ${label}</label>` :
+      `<label>${label}<input name="${key}" type="number" value="${editableSettings[key]}" min="${key === "buffer" ? 1 : 0}" max="${key === "buffer" ? 100 : 1}" step="${key === "buffer" ? 1 : "any"}" required></label>`
+    ).join("")}
+    <button class="button primary">Save settings</button></form></section>
+    <div id="settings-connections" class="commands">${connectionMarkup()}</div>`;
+}
+
+document.addEventListener("input", (event) => {
+  if (event.target.id === "library-search") libraryRows();
+});
+document.addEventListener("change", (event) => {
+  if (event.target.id === "library-stage") libraryRows();
+  const id = event.target.dataset.selectItem;
+  if (id) event.target.checked ? selectedItems.add(id) : selectedItems.delete(id);
+});
+document.addEventListener("submit", async (event) => {
+  const form = event.target;
+  const action = form.dataset.create;
+  if (!action && form.id !== "settings-form") return;
+  event.preventDefault();
+  const submit = form.querySelector("button");
+  submit.disabled = true;
+  try {
+    if (action) {
+      const payload = Object.fromEntries(new FormData(form));
+      if (action === "make") payload.count = Number(payload.count);
+      const command = await perform(action, null, payload);
+      await refresh();
+      toast(`${pretty(statusText(command.status))}: ${commandMessage(command)}`);
+    } else {
+      const values = { slots: Object.fromEntries(Object.keys(editableSettings.slots)
+        .map((name) => [name, form.elements["slot:" + name].value.split(",").map((s) => s.trim())])) };
+      for (const key of Object.keys(settingsLabels)) values[key] = typeof editableSettings[key] === "boolean"
+        ? form.elements[key].checked : Number(form.elements[key].value);
+      const result = await api("/api/settings", values);
+      editableSettings = values;
+      toast(result.message);
+    }
+  } catch (error) {
+    toast(error.message);
+    const link = /\/items\/[A-Za-z0-9_-]+/.exec(error.message);
+    const notice = form.querySelector("p[role=status]");
+    if (notice) {
+      notice.textContent = error.message + " ";
+      if (link) {
+        const anchor = document.createElement("a");
+        anchor.href = link[0];
+        anchor.textContent = "Open existing item";
+        notice.append(anchor);
+      }
+    }
+  } finally {
+    submit.disabled = false;
+  }
+});

@@ -470,14 +470,53 @@ def test_media_range_and_path_safety(control, clip, tmp_db, tmp_path):
     )
 
 
-def test_controls_leave_runner_lock_and_dry_run_unchanged(control, clip, tmp_db):
-    _, _, cfg, _ = control
+def test_controls_acquire_recheck_and_release_runner_lock(control, clip, tmp_db, monkeypatch):
+    _, client, cfg, csrf = control
     original = config.ROOT_DIR.joinpath("config.yaml").read_bytes()
-    lock = json.dumps({"pid": 123, "host": "test", "heartbeat": 1})
-    db.kv_set("runner:lock", lock, tmp_db)
-    confirmed(control, "aonly", clip["id"])
-    commands.runner_boundary(cfg, tmp_db, "schedule")
-    assert db.kv_get("runner:lock", db_path=tmp_db) == lock
+    # The autouse fixture guards the legacy mailbox endpoints. Record the actual lease here.
+    from contextlib import contextmanager
+
+    @contextmanager
+    def test_lease():
+        db.kv_set(runner.LOCK_KEY, "test lease", tmp_db)
+        try:
+            yield
+        finally:
+            db.kv_set(runner.LOCK_KEY, "", tmp_db)
+
+    def execute(action):
+        plan = post(client, csrf, "/api/prepare", {"action": action, "item_id": clip["id"]})
+        assert plan.status_code == 200
+        return post(client, csrf, "/api/execute", {"ticket": plan.get_json()["ticket"]})
+
+    calls = []
+    def contend(*args, **kwargs):
+        calls.append("contended")
+        return False
+
+    monkeypatch.setattr(runner, "acquire_lock", contend)
+    lock = json.dumps({"pid": 123, "host": "remote-test", "heartbeat": __import__("time").time()})
+    db.kv_set(runner.LOCK_KEY, lock, tmp_db)
+    assert execute("aonly").get_json()["command"]["status"] == "pending"
+    assert calls == [] and db.kv_get(runner.LOCK_KEY, db_path=tmp_db) == lock
+
+    db.kv_set(runner.LOCK_KEY, "", tmp_db)
+    assert execute("aonly").get_json()["command"]["status"] == "pending"
+    assert calls == ["contended"]
+
+    held = None
+    def acquire(*args, **kwargs):
+        nonlocal held
+        assert not runner.lock_state(tmp_db)
+        held = test_lease()
+        held.__enter__()
+        return True
+
+    monkeypatch.setattr(runner, "acquire_lock", acquire)
+    monkeypatch.setattr(runner, "release_lock", lambda *_: held.__exit__(None, None, None))
+    assert execute("aonly").get_json()["command"]["status"] == "applied"
+    assert db.get_item(clip["id"], tmp_db)["stage"] == "approved"
+    assert db.kv_get(runner.LOCK_KEY, db_path=tmp_db) == ""
     assert cfg["app"]["dry_run"] is True
     assert config.ROOT_DIR.joinpath("config.yaml").read_bytes() == original
 
