@@ -34,6 +34,7 @@ def create_app(db_path=None, cfg=None, media_root=None):
     connection_results = {}
     connection_lock = threading.Lock()
     connection_run_lock = threading.Lock()
+    submit_lock = threading.Lock()
 
     def settings():
         loaded = cfg if cfg is not None else config.get_config(reload=True)
@@ -210,7 +211,8 @@ def create_app(db_path=None, cfg=None, media_root=None):
         effective = settings()
         with db.db(path) as conn:
             seen = conn.execute("SELECT id FROM dashboard_commands WHERE id=?", (command_id,)).fetchone()
-        result = commands.submit(plan, command_id, path, effective, media_root=root)
+        with submit_lock:
+            result = commands.submit(plan, command_id, path, effective, media_root=root)
         action = plan["action"]
         if not seen and result["status"] in ("pending", "applied"):
             try:

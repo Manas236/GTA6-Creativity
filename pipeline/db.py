@@ -351,8 +351,8 @@ def insert_discovered_item(item_data: dict[str, Any], db_path: Path | str | None
     ts = now()
     with db(db_path) as conn:
         if item_data["source"] != "manual" and conn.execute(
-            "SELECT 1 FROM items WHERE source='manual' AND source_platform=? AND source_id=?",
-            (item_data["source"], item_data["source_id"]),
+            "SELECT 1 FROM items WHERE source='manual' AND source_platform=? AND source_id IN (?, ?)",
+            (item_data["source"], item_data["source_id"], f"{item_data['source']}:{item_data['source_id']}"),
         ).fetchone():
             return False
         cursor = conn.execute(

@@ -55,8 +55,9 @@ def hint(value):
 def existing(platform, source_id, path):
     with db.db(path) as conn:
         row = conn.execute(
-            "SELECT id FROM items WHERE source_id=? AND (source=? OR (source='manual' AND source_platform=?))",
-            (source_id, platform, platform),
+            "SELECT id FROM items WHERE (source=? AND source_id=?) "
+            "OR (source='manual' AND source_platform=? AND source_id IN (?, ?))",
+            (platform, source_id, platform, source_id, f"{platform}:{source_id}"),
         ).fetchone()
     return row["id"] if row else None
 
@@ -69,7 +70,7 @@ def insert_manual(payload, job_id, path):
         prior = existing(platform, source_id, path)
         if prior:
             raise ValueError(f"Source already seen: /items/{prior}")
-        db.insert_discovered_item({"id": item_id, "source": "manual", "source_id": source_id,
+        db.insert_discovered_item({"id": item_id, "source": "manual", "source_id": f"{platform}:{source_id}",
                                    "source_url": url, "original_title": url}, path)
         db.transition_stage(item_id, "discovered", {"source_platform": platform, "creation_job": job_id,
                                                      "hint_start": hint(payload.get("start")),

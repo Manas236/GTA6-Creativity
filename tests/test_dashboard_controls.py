@@ -261,3 +261,32 @@ def test_post_now_slot_obeys_daily_cap_and_min_gap(local, clip, tmp_db, fake_clo
     tz = queue_controls.scheduler.active_profile(cfg)[1]
     assert slot.astimezone(tz).date() > start.astimezone(tz).date()
     assert queue_controls.allowed(slot, taken, cfg)
+
+
+def test_manual_source_ids_are_separate_by_platform(tmp_db):
+    video = "dQw4w9WgXcQ"
+    yt_id = creation.insert_manual({"url": f"https://youtu.be/{video}"}, "make-1", tmp_db)
+    tw_id = creation.insert_manual({"url": f"https://clips.twitch.tv/{video}"}, "make-2", tmp_db)
+    assert yt_id != tw_id
+    assert creation.existing("youtube", video, tmp_db) == yt_id
+    assert creation.existing("twitch", video, tmp_db) == tw_id
+    assert not db.insert_discovered_item({"id": "new", "source_id": video, "source": "youtube",
+                                          "source_url": f"https://youtu.be/{video}"}, tmp_db)
+
+
+def test_post_now_applies_confirmed_slot_and_only_starts_runner(local, clip, tmp_db, fake_clock, monkeypatch):
+    _, client, cfg, csrf = local
+    item_id = clip["id"]
+    db.transition_stage(item_id, "approved", db_path=tmp_db)
+    started = []
+    monkeypatch.setattr(workers, "control", lambda operation, *_: started.append(operation))
+    preparation = post(client, csrf, "/api/prepare", {"action": "post_now", "item_id": item_id})
+    assert preparation.status_code == 200
+    assert "dry run" in preparation.json["description"] and "Start runner and post" in preparation.json["description"]
+    applied = post(client, csrf, "/api/confirm", {"ticket": preparation.json["ticket"]})
+    assert applied.json["command"]["status"] == "applied"
+    assert db.get_item(item_id, tmp_db)["stage"] == "queued"
+    posts = posting.get_posts_for_item(item_id, tmp_db)
+    assert posting.item_slot(posts) == preparation.json["payload"]["slot"]
+    assert {row["status"] for row in posts} == {"pending"}
+    assert started == ["start"]

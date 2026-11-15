@@ -252,7 +252,7 @@ def download_single_item(
         fields.update(channel_id=metadata.get("channel_id") or "",
                       author_name=metadata.get("channel") or metadata.get("uploader") or "Creator",
                       original_title=metadata.get("title") or item["original_title"])
-        if source == "twitch" and item["source_id"].startswith("vod:"):
+        if source == "twitch" and source_url.startswith("https://www.twitch.tv/videos/"):
             chat = engagement.chat_heatmap(source_url, duration, cfg)
             fields["chat_heatmap"] = json.dumps(chat) if chat else None
     # Transition item to 'downloaded' stage
