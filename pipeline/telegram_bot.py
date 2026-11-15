@@ -897,6 +897,8 @@ def effective_mode(cfg: dict[str, Any] | None = None, db_path: Any = None) -> st
     keep approving by hand - that also undoes a switch that already happened.
     """
     approval = ((cfg or {}).get("approval") or {})
+    if approval.get("dashboard_only"):
+        return "dashboard"
     mode = str(approval.get("mode") or "telegram").lower()
     if mode == "auto":
         return "auto"
@@ -965,6 +967,9 @@ def run_approval_stage(
     cfg = cfg or config.get_config()
     mode = effective_mode(cfg, db_path)
 
+    if mode == "dashboard":
+        set_card_state(None, db_path)
+        return {"mode": mode}
     if mode == "auto":
         switched = db.kv_get(K_AUTO_SINCE, db_path=db_path)
         notice = announce_auto_switch(cfg, db_path, bot) if switched else False

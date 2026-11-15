@@ -4,6 +4,7 @@ import copy
 import json
 import socket
 import time
+import re
 from pathlib import Path
 
 from pipeline import binding, clock, db, posting, rate_limit, scheduler, telegram_bot
@@ -40,6 +41,7 @@ def lock_status(path, cfg):
             "pid": lock.get("pid"),
             "remote": lock.get("host") != socket.gethostname(),
             "started_at": lock.get("started_at", 0),
+            "token": lock.get("token"),
         }
     except (KeyError, ValueError, TypeError):
         return {"status": "stale", "age": None, "host": None}
@@ -56,7 +58,8 @@ def state(path, cfg):
             for r in conn.execute(
                 """SELECT id, source, author_name, original_title, stage,
             discovery_score, hook_text, hook_style, authenticity, chosen_variant, preview_only,
-            error_stage, error_message, rejection_reason, created_at, stage_updated_at
+            error_stage, error_message, rejection_reason, created_at, stage_updated_at,
+            cut_signal, creation_job, creation_phase, cut_path, cut_start, source_url, voiceover_script
             FROM items ORDER BY created_at DESC"""
             )
         ]
@@ -64,7 +67,8 @@ def state(path, cfg):
             dict(r)
             for r in conn.execute(
                 """SELECT id, item_id, platform, variant, slot_datetime, status,
-            remote_id, posted_at, hook_style, source, error_message FROM posts ORDER BY slot_datetime"""
+            remote_id, posted_at, hook_style, source, error_message, remote_container_id,
+            attempt_count, publish_started_at FROM posts ORDER BY slot_datetime"""
             )
         ]
         metrics = [
@@ -79,9 +83,15 @@ def state(path, cfg):
             dict(r)
             for r in conn.execute(
                 "SELECT id, action, item_id, status, result, created_at, completed_at "
-                "FROM dashboard_commands ORDER BY created_at DESC, rowid DESC LIMIT 30"
+                "FROM dashboard_commands ORDER BY created_at DESC, rowid DESC"
             )
         ]
+        grouped = {}
+        for post in posts:
+            grouped.setdefault(post["item_id"], []).append(post)
+        for item in items:
+            item["actions"] = available_actions(item, grouped.get(item["id"], []))
+            item.pop("cut_path")
         runtime = decode(db.kv_get("dashboard:runtime", db_path=path))
         lock = lock_status(path, cfg)
         runtime_known = bool(
@@ -90,6 +100,13 @@ def state(path, cfg):
             and clock.parse(runtime["at"]).timestamp()
             >= float(lock.get("started_at") or 0)
         )
+        from pipeline.runner import STOP_KEY
+        stop = decode(db.kv_get(STOP_KEY, db_path=path))
+        lock["stage"] = db.kv_get("runner:stage", db_path=path)
+        lock["stopping"] = bool(lock["status"] == "alive" and stop.get("token") == lock.get("token")
+                                and stop.get("at"))
+        lock["force"] = bool(lock["stopping"] and not lock.get("remote")
+                             and time.time() - stop["at"] >= 120)
         config_changed = runtime_known and runtime.get("settings") != display_settings(
             cfg
         )
@@ -97,6 +114,7 @@ def state(path, cfg):
             cfg = copy.deepcopy(cfg)
             for section, values in runtime["settings"].items():
                 cfg.setdefault(section, {}).update(values)
+        lock.pop("token", None)
         profile, tz, slots = scheduler.active_profile(cfg)
         probabilities, reason = scheduler.variant_probabilities(cfg, path)
         limits = []
@@ -136,11 +154,12 @@ def state(path, cfg):
             "posts": posts,
             "metrics": metrics,
             "commands": commands,
+            "interval": cfg.get("orchestrator", {}).get("loop_interval_seconds", 60),
             "demo": bool(db.kv_get("dashboard:demo", db_path=path)),
         }
 
 
-def item_detail(path, item_id):
+def item_detail(path, item_id, cfg=None):
     with snapshot(path) as conn:
         item = db.get_item(item_id, path)
         if item is None:
@@ -168,6 +187,10 @@ def item_detail(path, item_id):
                 if k not in ("source_transcript", "transcript_words")
             },
             "posts": posts,
+            "caption": posting.caption_for_item(item, cfg),
+            "caption_credit": posting.caption_credit(item),
+            "caption_hashtags": item.get("caption_hashtags") if item.get("caption_body") is not None
+                                else " ".join(re.findall(r"(?<!\w)#[\w]+", posting.caption_for_item(item, cfg))),
             "logs": logs,
             "media": media,
             "review": decode(item.get("hook_review")),

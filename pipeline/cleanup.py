@@ -43,10 +43,10 @@ def retention(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
-def inside_media(path: Path) -> bool:
+def inside_media(path: Path, media_root: Path | None = None) -> bool:
     """True only for a path that really lies inside the media folder (symlinks and .. resolved)."""
     try:
-        root = config.media_root().resolve()
+        root = (media_root or config.media_root()).resolve()
         resolved = path.resolve()
         return resolved != root and root in resolved.parents
     except OSError:
@@ -54,7 +54,8 @@ def inside_media(path: Path) -> bool:
 
 
 class Cleaner:
-    def __init__(self, cfg: dict[str, Any], db_path: Any = None, now: datetime | None = None):
+    def __init__(self, cfg: dict[str, Any], db_path: Any = None, now: datetime | None = None, *, media_root=None):
+        self.media_root = media_root or config.media_root()
         self.cfg = cfg
         self.db_path = db_path
         self.now = now or clock.utcnow()
@@ -75,7 +76,7 @@ class Cleaner:
 
     def _delete(self, path: Path) -> bool:
         """Delete one file if it is inside media/. True when the file is gone afterwards."""
-        if not inside_media(path):
+        if not inside_media(path, self.media_root):
             log.warning("cleanup: %s is outside the media folder; left alone", path)
             return False
         try:
@@ -102,7 +103,7 @@ class Cleaner:
             if self._delete(Path(value)):
                 cleared.append(col)
         if subtitles:
-            sub_dir = config.media_root() / "subtitles"
+            sub_dir = self.media_root / "subtitles"
             if sub_dir.is_dir():
                 for pattern in (f"{item['id']}_*", f"{item['id']}.*"):
                     for f in sub_dir.glob(pattern):

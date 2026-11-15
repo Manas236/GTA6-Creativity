@@ -203,7 +203,7 @@ def gather_candidates(cfg: dict[str, Any], db_path: Any = None) -> list[dict[str
     return candidates
 
 
-def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> list[dict[str, Any]]:
+def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None, *, limit=None, job_id=None) -> list[dict[str, Any]]:
     """Execute discovery, compute percentile discovery scores with real decay, and write to DB.
 
     Every source goes through the same scoring: its raw velocity is percentile-ranked within
@@ -260,9 +260,21 @@ def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None) -> lis
 
     # Insert into database
     inserted_count = 0
+    selected = []
     for item in scored_items:
+        if limit is not None:
+            with db.db(db_path) as conn:
+                exists = conn.execute("SELECT 1 FROM items WHERE source=? AND source_id=?",
+                                      (item["source"], item["source_id"])).fetchone()
+            if exists:
+                continue
         if db.insert_discovered_item(item, db_path=db_path):
             inserted_count += 1
+            if job_id:
+                db.transition_stage(item["id"], "discovered", {"creation_job": job_id}, db_path)
+            selected.append(item)
+            if limit is not None and len(selected) >= limit:
+                break
 
     log.info("Discovery complete: %d scored, %d newly inserted to DB", len(scored_items), inserted_count)
-    return scored_items
+    return scored_items if limit is None else selected

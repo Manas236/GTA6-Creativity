@@ -1,6 +1,9 @@
 """Media downloader using yt-dlp with pull-based buffering, atomic renames, and crash safety."""
 from __future__ import annotations
 
+import json
+from . import engagement
+
 import logging
 import os
 import subprocess
@@ -130,7 +133,7 @@ def download_single_item(
     Returns (success, message).
     """
     item_id = item["id"]
-    source = item["source"]
+    source = item.get("source_platform") or item["source"]
     source_url = item["source_url"]
 
     # Check source rate limit
@@ -150,7 +153,17 @@ def download_single_item(
         except OSError:
             pass
 
+    metadata = {}
+
+    def collect(progress):
+        info = progress.get("info_dict") or {}
+        for key in ("heatmap", "channel_id", "channel", "uploader", "title"):
+            if info.get(key):
+                metadata[key] = info[key]
+
     ydl_opts = {
+        "noplaylist": True,
+        "progress_hooks": [collect],
         "format": format_selector(cfg or config.get_config()),
         "outtmpl": str(temp_pattern),
         "quiet": True,
@@ -230,11 +243,24 @@ def download_single_item(
         )
         return False, f"Rejected: Duplicate of {matching_id} ({cov*100:.1f}%)"
 
+    cfg = cfg or config.get_config()
+    fields = {}
+    peaks = engagement.heatmap(metadata.get("heatmap")) if source == "youtube" else []
+    if peaks:
+        fields["heatmap"] = json.dumps(peaks)
+    if item["source"] == "manual":
+        fields.update(channel_id=metadata.get("channel_id") or "",
+                      author_name=metadata.get("channel") or metadata.get("uploader") or "Creator",
+                      original_title=metadata.get("title") or item["original_title"])
+        if source == "twitch" and item["source_id"].startswith("vod:"):
+            chat = engagement.chat_heatmap(source_url, duration, cfg)
+            fields["chat_heatmap"] = json.dumps(chat) if chat else None
     # Transition item to 'downloaded' stage
     db.transition_stage(
         item_id,
         "downloaded",
         extra_fields={
+            **fields,
             "download_path": str(final_path),
             "downloaded_at": db.now(),
             "original_duration": duration,

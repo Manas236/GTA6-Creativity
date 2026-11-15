@@ -45,8 +45,6 @@ def forbid_dashboard_side_effects(monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         raise AssertionError("dashboard attempted an external API or runner lock")
 
-    # Existing mailbox tests exercise an active runner.
-    monkeypatch.setattr(runner, "active_lock", lambda *args: {"token": "test"})
     monkeypatch.setattr(posting.MetaClient, "request", forbidden)
     monkeypatch.setattr(telegram_bot.ApprovalBot, "send_message", forbidden)
     monkeypatch.setattr(telegram_bot.ApprovalBot, "send_video", forbidden)
@@ -54,7 +52,9 @@ def forbid_dashboard_side_effects(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def control(tmp_db, tmp_path):
+def control(tmp_db, tmp_path, monkeypatch):
+    # Shared mailbox tests simulate an active runner.
+    monkeypatch.setattr(runner, "active_lock", lambda *args: {"token": "test"})
     cfg = copy.deepcopy(config.get_config(reload=True))
     cfg["approval"]["switch_to_auto_after_days"] = None
     app = create_app(tmp_db, cfg, tmp_path)

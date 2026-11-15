@@ -154,8 +154,26 @@ def build_caption(
     return caption[:IG_CAPTION_LIMIT]
 
 
+def caption_credit(item: dict[str, Any]) -> str:
+    author = item.get("author_name") or "Creator"
+    source = item.get("source_platform") or item.get("source")
+    if source == "twitch":
+        channel = twitch_channel(author)
+        credit = f"Clipped from {author} on Twitch"
+        if channel:
+            credit += f"\ntwitch.tv/{channel}"
+    else:
+        credit = f"Credit: {author}"
+    if item.get("authenticity") != "official":
+        credit += "\nUnverified footage"
+    return credit
+
+
 def caption_for_item(item: dict[str, Any], cfg: dict[str, Any] | None = None) -> str:
     """The caption to send for an item: the stored one, else built from the template."""
+    if item.get("caption_body") is not None:
+        return "\n\n".join(filter(None, (item["caption_body"], caption_credit(item),
+                                         item.get("caption_hashtags"))))
     stored = (item.get("caption_text") or "").strip()
     if stored:
         return stored[:IG_CAPTION_LIMIT]

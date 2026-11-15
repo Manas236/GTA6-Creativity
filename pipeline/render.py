@@ -947,6 +947,7 @@ def run_render_item(
     cfg: dict[str, Any] | None = None,
     db_path: Any = None,
     preset: str | None = None,
+    *, progress=None,
 ) -> tuple[bool, str, dict[str, float]]:
     """Execute complete render stage for an item in 'cut' stage.
 
@@ -982,6 +983,8 @@ def run_render_item(
     hook_text = item.get("hook_text")
     stale = binding.hook_binding_problem(item)
     if stale:
+        if progress:
+            progress("hook")
         log.info("Generating hook for item %s (%s)...", item_id, stale)
         ok, msg = hooks.run_hooks_for_item(item_id, cfg=cfg, db_path=db_path)
         if not ok:
@@ -999,6 +1002,8 @@ def run_render_item(
     vo_path_str = item.get("voiceover_audio_path")
     vo_stale = binding.voiceover_binding_problem(item)
     if not vo_path_str or not Path(vo_path_str).exists() or vo_stale:
+        if progress:
+            progress("voiceover")
         log.info("Generating voiceover for item %s%s...", item_id, f" ({vo_stale})" if vo_stale else "")
         ok, msg = voiceover.run_voiceover_for_item(item_id, cfg=cfg, db_path=db_path)
         if not ok:
@@ -1012,6 +1017,8 @@ def run_render_item(
         db.mark_failed(item_id, "render", "Voiceover audio missing on disk", db_path=db_path)
         return False, "Voiceover audio missing", {}
 
+    if progress:
+        progress("render")
     rs = render_settings(cfg)
     tkey = transcribe.cache_key(cfg)
     speech_words = cut_speech_words(item, cut_path, tkey, cfg)
@@ -1061,11 +1068,11 @@ def run_render_item(
 
     # Generate Creator Credit Social Caption
     author = item.get("author_name") or "Creator"
-    caption_text = posting.build_caption(hook_text, author, item.get("source") or "youtube", cfg=cfg)
+    caption_text = posting.build_caption(hook_text, author, item.get("source_platform") or item.get("source") or "youtube", cfg=cfg)
 
     # Purge raw source download immediately per project retention rule
     download_path_str = item.get("download_path")
-    if download_path_str:
+    if download_path_str and (cfg.get("retention") or {}).get("purge_downloads_immediately", True):
         Path(download_path_str).unlink(missing_ok=True)
         log.info("Purged raw source download: %s", download_path_str)
 

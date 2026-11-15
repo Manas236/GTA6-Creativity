@@ -16,6 +16,8 @@ Pure arithmetic over words / envelopes / profiles, so it is unit-testable withou
 """
 from __future__ import annotations
 
+from . import engagement
+
 import bisect
 import math
 from dataclasses import dataclass, field
@@ -52,12 +54,14 @@ class Scorer:
     scan_cut_windows always used), with prefix sums so thousands of windows are cheap."""
 
     def __init__(self, total: float, loudness: Sequence[tuple[float, float]], scene_cuts: Sequence[float],
-                 cfg: dict[str, Any] | None = None):
+                 cfg: dict[str, Any] | None = None, *, peaks=()):
         cut_cfg = ((cfg or {}).get("cut") or {})
         w = cut_cfg.get("weights", {}) or {}
         self.audio_w = float(w.get("audio_energy", 0.75))
         self.scene_w = float(w.get("visual_interest", 0.25))
         self.total = float(total)
+        self.peaks = peaks
+        self.engagement_weight = float(cut_cfg.get("heatmap_weight", 0.25))
         pts = sorted((float(t), float(v)) for t, v in loudness)
         self.lt = [t for t, _ in pts]
         self.prefix = [0.0]
@@ -75,7 +79,11 @@ class Scorer:
         m = self.mean_lufs(a, b)
         norm_audio = 0.5 if m is None else max(0.0, min(1.0, (m + 50.0) / 40.0))
         penalty = (0.05 if a < 0.05 * self.total else 0.0) + (0.05 if b > 0.95 * self.total else 0.0)
-        return self.audio_w * norm_audio + self.scene_w * norm_scene - penalty
+        base = self.audio_w * norm_audio + self.scene_w * norm_scene - penalty
+        return base + self.bonus(a, b) if self.peaks else base
+
+    def bonus(self, start, end):
+        return self.engagement_weight * engagement.mean(self.peaks, start, end) if self.peaks else 0.0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -128,7 +136,7 @@ class Candidate:
 
 
 def candidates(regions: Sequence[Region], scorer: Scorer, min_dur: float, max_dur: float,
-               es: dict[str, Any], sw: dict[str, Any]) -> tuple[list[Candidate], int]:
+               es: dict[str, Any], sw: dict[str, Any], exclude=None) -> tuple[list[Candidate], int]:
     """(one candidate per clean sentence end that admits a min_dur..max_dur window, best first;
     the number of clean sentence ends found)."""
     step = max(0.05, float(sw["start_step_s"]))
@@ -149,6 +157,8 @@ def candidates(regions: Sequence[Region], scorer: Scorer, min_dur: float, max_du
             pool |= {c for c in scorer.cuts if lo <= c <= hi}          # the old scene-cut snap
             best: Candidate | None = None
             for st in sorted(pool):
+                if exclude and exclude(st, end):
+                    continue
                 at_start = any(abs(st - s) <= 1e-6 for s in starts_at_sentence)
                 sc = scorer.score(st, end) + (bonus if at_start else 0.0)
                 if best is None or sc > best.score + 1e-12:

@@ -6,12 +6,16 @@ import copy
 import hashlib
 import json
 import logging
+import re
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from pipeline import (
     binding,
     clock,
+    cleanup,
+    creation,
     db,
     hooks,
     posting,
@@ -21,6 +25,7 @@ from pipeline import (
     telegram_bot,
 )
 from .store import transaction
+from . import queue_controls
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +39,16 @@ ACTIONS = {
     "retry": "Retry failed stage",
     "pause": "Pause all posting",
     "resume": "Resume posting",
+    "make": "Make clips now",
+    "clip_url": "Clip from URL",
+    "remake_cut": "Remake with another moment",
+    "remake_hook": "Regenerate hook and render",
+    "delete": "Delete item and its local media",
+    "unapprove": "Return to review",
+    "up": "Move up",
+    "down": "Move down",
+    "post_now": "Post at the earliest allowed time",
+    "edit_caption": "Save caption",
 }
 DECISIONS = {"approve": "ok", "aonly": "aonly", "reject": "no", "hookok": "hookok"}
 EDITABLE = {
@@ -97,6 +112,8 @@ def fingerprint(item, posts):
         "error_message",
         "hook_review",
         "approval_type",
+        "caption_body",
+        "caption_hashtags",
     )
     state = {k: item.get(k) for k in fields} if item else {}
     # A card being sent changes rendered to awaiting_approval without changing its content.
@@ -138,6 +155,22 @@ def validate(action, item, posts, payload, path):
         if action == "resume" and not rate_limit.dashboard_meta_paused(path):
             raise ControlError("No dashboard pause to resume. Meta cooldowns expire on their own.")
         return
+    if action == "make":
+        if type(payload.get("count")) is not int or not 1 <= payload["count"] <= 10:
+            raise ControlError("Choose 1–10 clips.")
+        return
+    if action == "clip_url":
+        try:
+            platform, source_id, _ = creation.source_from_url(payload["url"])
+            start, end = (creation.hint(payload.get(key)) for key in ("start", "end"))
+            if end is not None and end <= (start or 0):
+                raise ValueError("The end hint must be after the start.")
+            prior = creation.existing(platform, source_id, path)
+            if prior:
+                raise ValueError(f"Source already seen: /items/{prior}")
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ControlError(str(exc)) from None
+        return
     if not item:
         raise ControlError("Item no longer exists.")
     if not db.is_releasable(item):
@@ -149,6 +182,27 @@ def validate(action, item, posts, payload, path):
             "Publishing has started or failed. This item is display-only to prevent duplicate posts."
         )
     stage = item["stage"]
+    if stage in ("posted", "measured", "cleaned"):
+        raise ControlError("Remove published media on Instagram yourself.")
+    if action == "delete" and stage == "rejected" and item.get("rejection_reason") == "deleted from dashboard":
+        raise ControlError("This item is already deleted.")
+    if action == "unapprove" and stage not in ("approved", "queued"):
+        raise ControlError("Only approved or queued items can return to review.")
+    if action in ("up", "down") and (stage != "queued" or not posts):
+        raise ControlError("Only scheduled items can move in the queue.")
+    if action == "post_now" and stage not in ("approved", "queued"):
+        raise ControlError("Approve the item before posting.")
+    if action in ("remake_cut", "remake_hook") and action not in available_actions(item, posts):
+        raise ControlError("This item has no usable source or cut for that remake.")
+    if action == "edit_caption":
+        if stage not in EDITABLE:
+            raise ControlError("Caption editing requires an unposted cut or render.")
+        body, tags = caption_values(payload)
+        caption = posting.caption_for_item({**item, "caption_body": body, "caption_hashtags": tags})
+        if len(caption) > posting.IG_CAPTION_LIMIT:
+            raise ControlError("Keep the full caption, including credit, within 2,200 characters.")
+        if len(re.findall(r"(?<!\w)#[\w]+", caption)) > 30:
+            raise ControlError("Use no more than 30 hashtags across the caption.")
     if action in DECISIONS:
         expected = (
             {"needs_review"}
@@ -217,11 +271,33 @@ def validate(action, item, posts, payload, path):
             )
 
 
+def caption_values(payload):
+    body, hashtags = payload.get("body", ""), payload.get("hashtags", "")
+    if not isinstance(body, str) or not isinstance(hashtags, str):
+        raise ControlError("Caption and hashtags must be text.")
+    tags = hashtags.split()
+    if any(not re.fullmatch(r"#[\w]+", tag) for tag in tags):
+        raise ControlError("Separate hashtags with spaces and start each with #.")
+    return body.strip(), " ".join(tags)
+
+
 def available_actions(item, posts):
     if not db.is_releasable(item) or not unstarted(posts):
         return []
     stage = item["stage"]
-    actions = []
+    if stage in ("posted", "measured", "cleaned"):
+        return []
+    actions = [] if item.get("rejection_reason") == "deleted from dashboard" else ["delete"]
+    if stage in ("approved", "queued"):
+        actions += ["unapprove", "post_now"]
+    if stage == "queued" and posts:
+        actions += ["up", "down"]
+    if stage in EDITABLE:
+        actions.append("edit_caption")
+    if actions and item.get("source_url") and item.get("cut_start") is not None:
+        actions.append("remake_cut")
+    if actions and item.get("cut_path") and Path(item["cut_path"]).is_file():
+        actions.append("remake_hook")
     if stage in ("rendered", "awaiting_approval"):
         actions += ["approve", "aonly", "reject"]
     if stage == "needs_review":
@@ -236,10 +312,25 @@ def available_actions(item, posts):
 
 
 def prepare(action, item_id, payload, path, cfg):
+    if item_id and action in ("pause", "resume", "make", "clip_url"):
+        raise ControlError("This control does not select an item.")
     item = db.get_item(item_id, path) if item_id else None
     posts = posting.get_posts_for_item(item_id, path) if item_id else []
     validate(action, item, posts, payload, path)
     detail = ACTIONS[action]
+    if action == "post_now":
+        if posting.meta_paused(path)[0] or not posting.enabled_platforms(cfg):
+            raise ControlError("Posting is paused or no platforms are enabled.")
+        try:
+            slot = queue_controls.earliest(cfg, path, item_id)
+        except ValueError as exc:
+            raise ControlError(str(exc)) from None
+        payload = {**payload, "slot": clock.iso(slot)}
+        detail = f"Earliest allowed slot: {slot.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}"
+        if posting.is_dry_run(cfg):
+            detail += " (dry run)"
+        if not runner.active_lock(path, runner._lock_settings(cfg)[0]):
+            detail += ". Start runner and post."
     if action == "reslot":
         bounded = copy.deepcopy(cfg)
         bounded.setdefault("posting", {})["daily_post_target"] = min(
@@ -324,6 +415,51 @@ def apply(command, cfg, path):
             raise ControlError(message)
         release_card(item_id, path)
         return message
+    if action in ("delete", "unapprove", "remake_cut", "remake_hook"):
+        with db.db(path) as conn:
+            conn.execute("DELETE FROM posts WHERE item_id=?", (item_id,))
+        release_card(item_id, path)
+        if action == "delete":
+            db.mark_rejected(item_id, "deleted from dashboard", db_path=path)
+            return "Deleted from dashboard."
+        fields = {"chosen_variant": None, "approval_type": None, "ab_excluded": 0}
+        if action == "unapprove":
+            db.transition_stage(item_id, "awaiting_approval", fields, path)
+            return "Returned to review."
+        stage = "cut" if action == "remake_hook" else "downloaded"
+        if stage == "downloaded" and not Path(item.get("download_path") or "").is_file():
+            stage = "discovered"
+        fields.update(binding.SEGMENT_CONTENT_FIELDS, creation_job=command["id"], error_message=None,
+                      error_stage=None, caption_body=None, caption_hashtags=None)
+        db.transition_stage(item_id, stage, fields, path)
+        return "Remake started."
+    if action == "edit_caption":
+        body, tags = caption_values(payload)
+        fields = {"caption_body": body, "caption_hashtags": tags}
+        db.transition_stage(item_id, item["stage"], fields, path)
+        with db.db(path) as conn:
+            conn.execute("UPDATE posts SET caption_text=?, updated_at=? WHERE item_id=?",
+                         (posting.caption_for_item({**item, **fields}, cfg), db.now(), item_id))
+        return "Caption saved."
+    if action in ("up", "down"):
+        return queue_controls.move(item_id, -1 if action == "up" else 1, cfg, path)
+    if action == "post_now":
+        if posting.meta_paused(path)[0] or not posting.enabled_platforms(cfg):
+            raise ControlError("Posting is paused or no platforms are enabled.")
+        slot = clock.parse(payload["slot"])
+        if (not queue_controls.allowed(slot, scheduler.reserved_times(path, item_id), cfg)
+                or not queue_controls.allowed(max(slot, clock.utcnow()),
+                                              scheduler.reserved_times(path, item_id), cfg)):
+            raise ControlError("The earliest slot changed. Open the confirmation again.")
+        if (clock.utcnow() - slot).total_seconds() > posting.missed_slot_grace(cfg):
+            raise ControlError("The confirmed slot expired. Open the confirmation again.")
+        reason = posting.refusal_reason(item, cfg)
+        if reason:
+            raise ControlError(reason)
+        posting.ensure_post_rows(item, clock.iso(slot), cfg, path)
+        queue_controls.set_slot(item_id, clock.iso(slot), path)
+        db.transition_stage(item_id, "queued", db_path=path)
+        return f"Scheduled for {slot.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}."
     if action == "edit_hook":
         with db.db(path) as conn:
             conn.execute("DELETE FROM posts WHERE item_id = ?", (item_id,))
@@ -405,14 +541,15 @@ def runner_boundary(cfg, path, stage):
         ids = [
             r[0]
             for r in conn.execute(
-                "SELECT id FROM dashboard_commands WHERE status='pending' ORDER BY created_at, rowid LIMIT 50"
+                "SELECT id FROM dashboard_commands WHERE status='pending' AND action NOT IN "
+                "('make','clip_url','remake_cut','remake_hook') ORDER BY created_at, rowid LIMIT 50"
             )
         ]
     for command_id in ids:
         apply_pending(command_id, cfg, path)
 
 
-def apply_pending(command_id, cfg, path):
+def apply_pending(command_id, cfg, path, media_root=None):
     with transaction(path) as conn:
         row = conn.execute(
             "SELECT * FROM dashboard_commands WHERE id=? AND status='pending'",
@@ -447,19 +584,27 @@ def apply_pending(command_id, cfg, path):
             (status, message, db.now(), command_id),
         )
 
-        return dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (command_id,)).fetchone())
+        result = dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (command_id,)).fetchone())
+    if status == "applied" and row["action"] == "delete":
+        item = db.get_item(row["item_id"], path)
+        try:
+            cleanup.Cleaner(cfg, path, media_root=media_root).purge(
+                item, cleanup.ALL_COLUMNS, subtitles=True)
+        except (OSError, sqlite3.OperationalError):
+            log.exception("Media cleanup could not finish for deleted item %s", row["item_id"])
+    return result
 
 
-def submit(plan, command_id, path, cfg):
+def submit(plan, command_id, path, cfg, media_root=None):
     command = enqueue(plan, command_id, path)
     if command["status"] != "pending":
         return command
     stale, heartbeat = runner._lock_settings(cfg)
     if runner.active_lock(path, stale):
         return command
-    if not runner.acquire_lock(path, stale, heartbeat):
+    if plan["action"] in creation.ACTIONS or not runner.acquire_lock(path, stale, heartbeat, "dashboard"):
         return command
     try:
-        return apply_pending(command_id, cfg, path) or command
+        return apply_pending(command_id, cfg, path, media_root) or command
     finally:
         runner.release_lock(path)

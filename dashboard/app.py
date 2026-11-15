@@ -11,9 +11,9 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from pipeline import binding, config, db
+from pipeline import binding, config, creation, db, runner
 import connection_checks
-from . import commands, views
+from . import commands, settings as preferences, views, workers
 from .store import initialize, snapshot
 
 
@@ -30,12 +30,20 @@ def create_app(db_path=None, cfg=None, media_root=None):
     app.config["DASHBOARD_DB"] = path
     signer = URLSafeTimedSerializer(app.secret_key, salt="dashboard-confirmation")
     root = Path(media_root or config.media_root()).resolve()
+    demo = bool(db.kv_get("dashboard:demo", db_path=path))
     connection_results = {}
     connection_lock = threading.Lock()
     connection_run_lock = threading.Lock()
 
     def settings():
-        return cfg if cfg is not None else config.get_config(reload=True)
+        loaded = cfg if cfg is not None else config.get_config(reload=True)
+        if not demo:
+            return loaded
+        import yaml
+        local = path.parent / "config.local.yaml"
+        overlay = yaml.safe_load(local.read_text(encoding="utf-8")) if local.exists() else {}
+        return config.merge_config(config.merge_config(loaded, overlay or {}),
+                                   {"app": {"dry_run": True}})
 
     @app.before_request
     def protect_local_controls():
@@ -80,6 +88,10 @@ def create_app(db_path=None, cfg=None, media_root=None):
     @app.get("/queue")
     @app.get("/analytics")
     @app.get("/failures")
+    @app.get("/make")
+    @app.get("/review")
+    @app.get("/library")
+    @app.get("/settings")
     @app.get("/connections")
     @app.get("/items/<item_id>")
     def page(item_id=None):
@@ -91,6 +103,22 @@ def create_app(db_path=None, cfg=None, media_root=None):
         data = views.state(path, settings())
         data["csrf"] = session["csrf"]
         return jsonify(data)
+
+    @app.get("/api/settings")
+    def get_preferences():
+        return jsonify(preferences.values(settings()))
+
+    @app.post("/api/settings")
+    def save_preferences():
+        target = path.parent if demo else config.project_root()
+        return jsonify(message=preferences.save(request.get_json(silent=True), settings(), target))
+
+    @app.post("/api/runner")
+    def runner_control():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or body.get("operation") not in ("start", "stop", "force"):
+            abort(400)
+        return jsonify(message=workers.control(body["operation"], path, settings(), root, body.get("stage")))
 
     @app.get("/api/connections")
     def connections():
@@ -110,9 +138,9 @@ def create_app(db_path=None, cfg=None, media_root=None):
         if not connection_run_lock.acquire(blocking=False):
             return jsonify(error="A connection test is already running."), 409
         try:
-            env = connection_checks.current_environment()
+            env = {} if demo else connection_checks.current_environment()
             selected = None if body["service"] == "all" else [body["service"]]
-            results = connection_checks.run_checks(env, selected, settings())
+            results = connection_checks.run_checks(env, selected, settings(), transport=workers.connection_transport)
             with connection_lock:
                 connection_results.update(results)
                 rows = connection_checks.describe(env, connection_results)
@@ -125,15 +153,18 @@ def create_app(db_path=None, cfg=None, media_root=None):
         if not connection_run_lock.acquire(blocking=False):
             return jsonify(error="A connection test is already running."), 409
         try:
-            return jsonify(result=connection_checks.send_telegram_test(
-                connection_checks.current_environment(), settings()
-            ))
+            env = connection_checks.current_environment() if not demo else {}
+            if not env.get("TELEGRAM_BOT_TOKEN") or not env.get("TELEGRAM_CHAT_ID"):
+                return jsonify(result=connection_checks.result("not_set", "Telegram credentials are missing."))
+            return jsonify(result=workers.connection_request(
+                {"operation": "telegram", "env": {key: env[key] for key in
+                 ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")}, "cfg": {}}))
         finally:
             connection_run_lock.release()
 
     @app.get("/api/items/<item_id>")
     def detail(item_id):
-        data = views.item_detail(path, item_id)
+        data = views.item_detail(path, item_id, settings())
         if data is None:
             abort(404)
         return jsonify(data)
@@ -176,7 +207,29 @@ def create_app(db_path=None, cfg=None, media_root=None):
         if not secrets.compare_digest(plan["client"], session["csrf"]):
             abort(403)
         command_id = hashlib.sha256(ticket.encode()).hexdigest()[:32]
-        result = commands.submit(plan, command_id, path, settings())
+        effective = settings()
+        with db.db(path) as conn:
+            seen = conn.execute("SELECT id FROM dashboard_commands WHERE id=?", (command_id,)).fetchone()
+        result = commands.submit(plan, command_id, path, effective, media_root=root)
+        action = plan["action"]
+        if not seen and result["status"] in ("pending", "applied"):
+            try:
+                active = runner.active_lock(path, runner._lock_settings(effective)[0])
+                if action in creation.ACTIONS and (not active or active.get("kind") == "dashboard"):
+                    workers.spawn(path, root, "make", "--job", command_id)
+                if action == "post_now" and not active:
+                    workers.control("start", path, effective, root)
+            except (OSError, commands.ControlError) as error:
+                if not runner.active_lock(path, runner._lock_settings(effective)[0]):
+                    warning = f"Worker could not start: {error}"
+                    if action in creation.ACTIONS:
+                        with db.db(path) as conn:
+                            conn.execute(
+                                "UPDATE dashboard_commands SET status='failed', result=?, completed_at=? "
+                                "WHERE id=? AND status='pending'", (warning[:500], db.now(), command_id))
+                            result = dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?",
+                                                       (command_id,)).fetchone())
+                    return jsonify(command=result, warning=warning), 202
         return jsonify(command=result), 202
 
     @app.get("/media/<item_id>/<variant>")

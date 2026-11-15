@@ -554,6 +554,7 @@ def run_cut_item(
     db_path: Any = None,
     transcriber: Transcriber | None = None,
     envelope: EnvelopeFn | None = None,
+    *, exclude_current: bool = False,
 ) -> tuple[bool, str]:
     """Cut stage for a downloaded item: sentence-aligned window selection, then cut-level dedupe.
 
@@ -592,10 +593,35 @@ def run_cut_item(
         _outcome(item_id, "rejected", "static_source (low scene density) or too short", db_path)
         return False, "Rejected: static_source"
 
+    peaks = json.loads(item.get("heatmap") or item.get("chat_heatmap") or "[]")
+    signal = "heatmap" if item.get("heatmap") else "chat"
+    scorer = sentence_windows.Scorer(scan.total_duration, scan.loudness, scan.scene_cuts, cfg, peaks=peaks)
+    lower = float(item.get("hint_start") or 0)
+    upper = min(scan.total_duration, float(item.get("hint_end") or scan.total_duration))
+    if upper - lower < scan.min_dur:
+        reason = "Time hint leaves less than the minimum clip duration."
+        db.mark_failed(item_id, "cut", reason, db_path=db_path)
+        return False, reason
+
+    def excluded(start, end):
+        if not exclude_current or item.get("cut_start") is None or item.get("cut_end") is None:
+            return False
+        overlap = min(end, item["cut_end"]) - max(start, item["cut_start"])
+        return overlap >= 0.5 * (end - start)
+
     tail = float(es["tail_s"])
     max_windows = max(1, int(es["max_windows"]))
-    spans = sentence_windows.transcribe_regions(scan.total_duration, scan.windows, scan.min_dur,
+    windows = scan.windows
+    if item.get("hint_start") is not None or item.get("hint_end") is not None:
+        length = min(scan.target_dur, upper - lower)
+        starts = [lower + i for i in range(int(upper - lower - length) + 1)]
+        starts.append(upper - length)
+        windows = [CutWindow(a, a + length, scorer.score(a, a + length)) for a in starts]
+    if peaks:
+        windows = sorted(windows, key=lambda w: scorer.score(w.start, w.end), reverse=True)
+    spans = sentence_windows.transcribe_regions(scan.total_duration, windows, scan.min_dur,
                                                 scan.max_dur, tail, sw)
+    spans = [(max(a, lower), min(b, upper)) for a, b in spans if min(b, upper) > max(a, lower)]
     try:
         words_all, wall, cached = load_source_transcript(item, download_path, spans, tkey, transcriber, db_path)
     except Exception as e:
@@ -612,9 +638,9 @@ def run_cut_item(
     choices: list[tuple[EndChoice, dict[str, Any]]] = []
     if not words_all:
         # Nobody speaks: the old audio/scene windows with a loudness-trough end.
-        for rank, win in enumerate(scan.windows[:max_windows], start=1):
-            ch = clean_end_for_window(win, scan, [], min(scan.total_duration, win.start + scan.max_dur), es)
-            if ch:
+        for rank, win in enumerate(windows if exclude_current else windows[:max_windows], start=1):
+            ch = clean_end_for_window(win, scan, [], min(upper, win.start + scan.max_dur), es)
+            if ch and not excluded(ch.start, ch.end):
                 choices.append((ch, {"rank": rank, "score": round(win.score, 4), "mode": "no_speech"}))
         selection.update(clean_ends=0, candidates=len(choices))
     else:
@@ -622,8 +648,7 @@ def run_cut_item(
         for a, b in spans:
             rw = [w for w in words_all if a - 1e-6 <= float(w["start"]) < b]
             regions.append(sentence_windows.Region(a, b, rw, envelope(download_path, a, b) if rw else None))
-        scorer = sentence_windows.Scorer(scan.total_duration, scan.loudness, scan.scene_cuts, cfg)
-        cands, n_ends = sentence_windows.candidates(regions, scorer, scan.min_dur, scan.max_dur, es, sw)
+        cands, n_ends = sentence_windows.candidates(regions, scorer, scan.min_dur, scan.max_dur, es, sw, excluded)
         selection.update(clean_ends=n_ends, candidates=len(cands))
         for rank, c in enumerate(cands, start=1):
             cut_words = [
@@ -705,6 +730,7 @@ def run_cut_item(
             "cut",
             extra_fields={
                 **stale,
+                "cut_signal": signal if scorer.bonus(choice.start, choice.end) > 0 else "audio_scene",
                 "cut_start": choice.start,
                 "cut_end": choice.end,
                 "cut_duration": actual_dur,

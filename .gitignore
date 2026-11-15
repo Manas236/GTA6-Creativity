@@ -66,3 +66,7 @@ backups/
 # Windows / OneDrive folder metadata
 desktop.ini
 Thumbs.db
+
+# Dashboard-only overrides and dated backups
+/config.local.yaml
+/config.local.yaml.*.bak

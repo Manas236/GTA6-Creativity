@@ -80,7 +80,7 @@ def _heartbeat_worker(db_path, interval, token, stop):
             log.exception("Heartbeat update failed")
 
 
-def acquire_lock(db_path=None, stale_timeout_s=120.0, heartbeat_interval_s=30.0):
+def acquire_lock(db_path=None, stale_timeout_s=120.0, heartbeat_interval_s=30.0, kind="stage"):
     """Claim the lock atomically, with conditional heartbeat and release."""
     token, stop = uuid.uuid4().hex, threading.Event()
     with db.db(db_path) as conn:
@@ -91,8 +91,9 @@ def acquire_lock(db_path=None, stale_timeout_s=120.0, heartbeat_interval_s=30.0)
             now = time.time()
             db.kv_set(LOCK_KEY, json.dumps({
                 "pid": os.getpid(), "host": socket.gethostname(), "heartbeat": now,
-                "started_at": now, "token": token,
+                "started_at": now, "token": token, "kind": kind,
             }), db_path=db_path)
+            set_stage("starting", db_path)
     _owner.token, _owner.stop = token, stop
     threading.Thread(target=_heartbeat_worker, args=(db_path, heartbeat_interval_s, token, stop),
                      daemon=True).start()
@@ -110,6 +111,10 @@ def release_lock(db_path=None):
             (LOCK_KEY, token),
         )
     _owner.token = None
+
+
+def set_stage(name, db_path=None):
+    db.kv_set("runner:stage", name, db_path=db_path)
 
 
 def stopping(db_path=None):
@@ -168,6 +173,13 @@ def _stage_settle(cfg: dict[str, Any], db_path: Any) -> Any:
 
 
 def _stage_discover(cfg: dict[str, Any], db_path: Any) -> Any:
+    from .creation import run_jobs
+    with db.db(db_path) as conn:
+        mailbox = conn.execute("SELECT 1 FROM sqlite_master WHERE name='dashboard_commands'").fetchone()
+    if mailbox:
+        run_jobs(cfg, db_path)
+    if stopping(db_path) or db.kv_get("dashboard:demo", db_path=db_path):
+        return {"candidates": 0}
     return {"candidates": len(discover.run_discovery(cfg=cfg, db_path=db_path))}
 
 
@@ -205,6 +217,8 @@ def _stage_approve(cfg: dict[str, Any], db_path: Any) -> Any:
 
 
 def _stage_schedule(cfg: dict[str, Any], db_path: Any) -> Any:
+    if not posting.enabled_platforms(cfg):
+        return {"skipped": "No posting platforms enabled"}
     return scheduler.run_scheduler_stage(cfg=cfg, db_path=db_path)
 
 
@@ -266,6 +280,8 @@ def run_stages(
         log.exception("Dashboard could not load; skipping controls this cycle")
         runner_boundary = None
 
+    if stages is None and db.kv_get("dashboard:demo", db_path=db_path):
+        stages = [("discover", _stage_discover)]
     for name, fn in stages or STAGES:
         if graceful:
             with db.db(db_path) as conn:
@@ -341,7 +357,7 @@ def run_loop(
         (cfg.get("orchestrator") or {}).get("loop_interval_seconds", 60)
     )
     stale_timeout, hb_interval = _lock_settings(cfg)
-    if not acquire_lock(db_path=db_path, stale_timeout_s=stale_timeout, heartbeat_interval_s=hb_interval):
+    if not acquire_lock(db_path=db_path, stale_timeout_s=stale_timeout, heartbeat_interval_s=hb_interval, kind="loop"):
         log.warning("Could not acquire lock; another runner is active. Loop not started.")
         return 0
 
@@ -355,7 +371,8 @@ def run_loop(
                 log.info("Cycle %d: %s%s", cycles + 1, result["status"],
                          f" (failed stages: {sorted(result['errors'])})" if result["errors"] else "")
                 # Dead-man switch: only after a fully successful cycle; never raises.
-                healthcheck.ping(result, cfg=cfg, transport=healthcheck_transport)
+                if not stopping(db_path) and not db.kv_get("dashboard:demo", db_path=db_path):
+                    healthcheck.ping(result, cfg=cfg, transport=healthcheck_transport)
             except KeyboardInterrupt:
                 raise
             except Exception:  # noqa: BLE001 - run_stages already isolates; this is the last net
@@ -398,6 +415,8 @@ def main() -> None:
     subparsers.add_parser("cycle", help="Run complete pipeline cycle")
     loop_parser = subparsers.add_parser("loop", help="The long-running process: every stage in order, forever")
     loop_parser.add_argument("--interval", type=float, default=None, help="Seconds between cycles")
+    make_parser = subparsers.add_parser("make", help="Create clips without publishing")
+    make_parser.add_argument("--job", required=True)
     subparsers.add_parser("status", help="Print current database status and stage counts")
 
     args = parser.parse_args()
@@ -511,6 +530,9 @@ def main() -> None:
         run_single_cycle(db_path=db_p)
     elif args.command == "loop":
         run_loop(db_path=db_p, interval_s=args.interval)
+    elif args.command == "make":
+        from .creation import make_worker
+        make_worker(args.job, db_path=db_p)
     elif args.command == "status":
         print_status(db_path=db_p)
     else:

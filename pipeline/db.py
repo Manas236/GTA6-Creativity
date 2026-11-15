@@ -279,6 +279,7 @@ def init_db(db_path: Path | str | None = None) -> None:
     """Initialize SQLite database with schema in WAL mode."""
     with db(db_path) as conn:
         conn.executescript(SCHEMA)
+        conn.execute("BEGIN IMMEDIATE")
         # Migrate channel_id and authenticity if missing in existing table
         cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
         if "channel_id" not in cols:
@@ -305,8 +306,13 @@ def init_db(db_path: Path | str | None = None) -> None:
         # Gemini outages: the hooks stage waits instead of failing the item (PLAN.md call #177).
         if "transient_errors" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN transient_errors INTEGER DEFAULT 0")
-        # Created after the migration: the trigger bodies reference items.preview_only.
-        conn.executescript(PREVIEW_ONLY_TRIGGERS)
+        for col, kind in (
+            ("source_platform", "TEXT"), ("creation_job", "TEXT"), ("creation_phase", "TEXT"), ("hint_start", "REAL"),
+            ("hint_end", "REAL"), ("heatmap", "TEXT"), ("chat_heatmap", "TEXT"),
+            ("cut_signal", "TEXT"), ("caption_body", "TEXT"), ("caption_hashtags", "TEXT"),
+        ):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE items ADD COLUMN {col} {kind}")
         if "ab_excluded" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN ab_excluded INTEGER DEFAULT 0")
         post_cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
@@ -332,6 +338,8 @@ def init_db(db_path: Path | str | None = None) -> None:
                 "UPDATE posts SET variant_decided_at = COALESCE(publish_started_at, posted_at, updated_at) "
                 "WHERE status NOT IN ('pending', 'dry_run') OR remote_container_id IS NOT NULL"
             )
+        # Trigger bodies reference the migrated items.preview_only column.
+        conn.executescript(PREVIEW_ONLY_TRIGGERS)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +350,11 @@ def insert_discovered_item(item_data: dict[str, Any], db_path: Path | str | None
     """Insert newly discovered item. Returns True if inserted, False if already exists."""
     ts = now()
     with db(db_path) as conn:
+        if item_data["source"] != "manual" and conn.execute(
+            "SELECT 1 FROM items WHERE source='manual' AND source_platform=? AND source_id=?",
+            (item_data["source"], item_data["source_id"]),
+        ).fetchone():
+            return False
         cursor = conn.execute(
             """
             INSERT INTO items (

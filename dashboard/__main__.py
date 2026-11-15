@@ -24,7 +24,7 @@ def main():
     print(f"GTA 6 control panel at http://127.0.0.1:{args.port}", flush=True)
     print(f"Database: {app.config['DASHBOARD_DB']}", flush=True)
     print(
-        "Controls wait for the runner's next stage boundary. Ctrl-C to stop.",
+        "Quick controls apply immediately when the runner is stopped. Ctrl-C closes this dashboard.",
         flush=True,
     )
     serve(
