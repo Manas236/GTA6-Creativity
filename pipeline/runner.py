@@ -316,6 +316,8 @@ def run_stages(
                 runner_boundary(cfg, db_path, name)
             except Exception:
                 log.exception("Dashboard boundary failed before %s; running the stage", name)
+        if not enter_stage(db_path, name):
+            break
         try:
             results[name] = fn(cfg, db_path)
             log.info("Stage %-9s ok in %.1fs: %s", name, time.time() - t_stage, str(results[name])[:300])
@@ -415,6 +417,29 @@ def run_loop(
     return cycles
 
 
+
+def run_make(command_id, cfg=None, db_path=None):
+    """Creation-only detached worker. The loop can take over a queued job if it wins the lease."""
+    from dashboard import commands, jobs
+    from dashboard.store import initialize
+
+    cfg = cfg or config.get_config(reload=True)
+    initialize(db_path)
+    stale, interval = _lock_settings(cfg)
+    while not acquire_lock(db_path, stale, interval, mode="make"):
+        owner = lock_state(db_path, stale)
+        if owner and owner.get("mode", "runner") == "runner":
+            return
+        time.sleep(0.25)
+    try:
+        jobs.run(command_id, cfg, db_path)
+        if not stopping(db_path):
+            # Quick actions queued during the job are safe to apply without running any stages.
+            commands.runner_boundary(cfg, db_path, "make hand-off")
+    finally:
+        release_lock(db_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GTA 6 Pipeline Runner")
     parser.add_argument("--db", type=str, default=None, help="Custom database path")
@@ -434,6 +459,8 @@ def main() -> None:
     subparsers.add_parser("cycle", help="Run complete pipeline cycle")
     loop_parser = subparsers.add_parser("loop", help="The long-running process: every stage in order, forever")
     loop_parser.add_argument("--interval", type=float, default=None, help="Seconds between cycles")
+    make = subparsers.add_parser("make", help="Run a targeted dashboard creation job")
+    make.add_argument("command_id")
     subparsers.add_parser("status", help="Print current database status and stage counts")
 
     args = parser.parse_args()
@@ -544,6 +571,8 @@ def main() -> None:
         run_single_cycle(db_path=db_p)
     elif args.command == "loop":
         run_loop(db_path=db_p, interval_s=args.interval)
+    elif args.command == "make":
+        run_make(args.command_id, db_path=db_p)
     elif args.command == "status":
         print_status(db_path=db_p)
     else:
@@ -551,4 +580,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Dashboard boundary callbacks import pipeline.runner. They must see this CLI's lease.
+    sys.modules["pipeline.runner"] = sys.modules[__name__]
     main()

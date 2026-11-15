@@ -299,3 +299,24 @@ def run_scheduler_stage(
     scheduled = schedule_approved(now, cfg, db_path, rng)
     return {"profile": active_profile(cfg)[0], "reset_after_dry_run": reset, "rescheduled": moved,
             "scheduled": scheduled}
+
+
+def slot_allowed(candidate, taken, cfg):
+    min_gap = timedelta(hours=float(cfg.get("posting", {}).get("min_gap_hours", 3)))
+    return (all(candidate != t and abs(candidate - t) >= min_gap for t in taken)
+            and sum(local_day(t, cfg) == local_day(candidate, cfg) for t in taken) < 2)
+
+
+def earliest_slot(after, cfg, db_path=None, exclude_item_id=None):
+    """First permissible instant, independent of the normal posting slot list."""
+    _, tz, _ = active_profile(cfg)
+    taken = reserved_times(db_path, exclude_item_id)
+    min_gap = timedelta(hours=float(cfg.get("posting", {}).get("min_gap_hours", 3)))
+    candidates = {after, *(t + max(min_gap, timedelta(seconds=1)) for t in taken)}
+    day = after.astimezone(tz).date()
+    for offset in range(1, int(cfg.get("posting", {}).get("max_slot_search_days", 60)) + 1):
+        candidates.add(datetime.combine(day + timedelta(days=offset), dtime(), tz).astimezone(timezone.utc))
+    for candidate in sorted(t for t in candidates if t >= after):
+        if slot_allowed(candidate, taken, cfg):
+            return candidate
+    raise ValueError("No posting time satisfies the minimum gap and two-per-day limit.")

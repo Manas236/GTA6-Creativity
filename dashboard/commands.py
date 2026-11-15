@@ -12,6 +12,8 @@ from pathlib import Path
 from pipeline import (
     binding,
     clock,
+    cleanup,
+    creation,
     db,
     hooks,
     posting,
@@ -19,11 +21,23 @@ from pipeline import (
     scheduler,
     telegram_bot,
 )
+from . import queue_controls
 from .store import transaction
 
 log = logging.getLogger(__name__)
 
 ACTIONS = {
+    "delete": "Delete item",
+    "bulk_reject": "Reject item",
+    "unapprove": "Return to review",
+    "up": "Move up",
+    "down": "Move down",
+    "post_now": "Post now",
+    "edit_caption": "Save caption",
+    "make": "Make clips",
+    "clip_url": "Clip from URL",
+    "remake": "Remake next-best cut",
+    "remake_hook": "Regenerate hook",
     "approve": "Approve both variants",
     "aonly": "Approve A only",
     "reject": "Reject item",
@@ -34,6 +48,8 @@ ACTIONS = {
     "pause": "Pause all posting",
     "resume": "Resume posting",
 }
+LONG = {"make", "clip_url", "remake", "remake_hook"}
+ITEM_TERMINAL = {"posted", "measured", "cleaned"}
 DECISIONS = {"approve": "ok", "aonly": "aonly", "reject": "no", "hookok": "hookok"}
 EDITABLE = {
     "cut",
@@ -57,11 +73,13 @@ def display_settings(cfg):
         "posting": (
             "profile",
             "profiles",
+            "platforms",
             "min_gap_hours",
             "daily_post_target",
             "max_slot_search_days",
         ),
         "approval": ("mode", "switch_to_auto_after_days"),
+        "cut": ("heatmap_weight",),
         "buffer": ("target_ready_items",),
         "autopilot": (
             "week_one_days",
@@ -82,6 +100,9 @@ def display_settings(cfg):
 def fingerprint(item, posts):
     fields = (
         "stage",
+        "caption_body_override",
+        "caption_tags_override",
+        "rejection_reason",
         "cut_start",
         "cut_end",
         "cut_path",
@@ -133,6 +154,13 @@ def unstarted(posts):
 def validate(action, item, posts, payload, path):
     if action not in ACTIONS:
         raise ControlError("Unknown action.")
+    if action == "make":
+        if type(payload.get("count")) is not int or not 1 <= payload["count"] <= 10:
+            raise ControlError("Choose 1–10 clips.")
+        return
+    if action == "clip_url":
+        check(creation.manual_details, payload, path)
+        return
     if action in ("pause", "resume"):
         if action == "resume" and not rate_limit.dashboard_meta_paused(path):
             raise ControlError("No dashboard pause to resume. Meta cooldowns expire on their own.")
@@ -148,6 +176,23 @@ def validate(action, item, posts, payload, path):
             "Publishing has started or failed. This item is display-only to prevent duplicate posts."
         )
     stage = item["stage"]
+    if stage in ITEM_TERMINAL:
+        raise ControlError("This item has posted. Remove it on Instagram yourself.")
+    if action in ("delete", "bulk_reject") and stage == "rejected":
+        if action == "bulk_reject" or item.get("rejection_reason") == "deleted from dashboard":
+            raise ControlError("This item has already been rejected or deleted.")
+    if action in ("unapprove", "post_now", "up", "down"):
+        if stage not in ("approved", "queued") or (action in ("up", "down") and not posts):
+            raise ControlError("This control requires an unstarted approved or queued item.")
+    if action == "edit_caption":
+        if stage not in {"rendered", "awaiting_approval", "approved", "queued"}:
+            raise ControlError("Wait until the clip has rendered.")
+        check(queue_controls.caption_fields, item, payload)
+    if action in ("remake", "remake_hook"):
+        if item.get("rejection_reason") == "deleted from dashboard" or item.get("cut_start") is None:
+            raise ControlError("Remake requires an existing cut.")
+        if action == "remake_hook" and not Path(item.get("cut_path") or "").is_file():
+            raise ControlError("The cut file is missing.")
     if action in DECISIONS:
         expected = (
             {"needs_review"}
@@ -216,11 +261,32 @@ def validate(action, item, posts, payload, path):
             )
 
 
+def check(fn, *args):
+    try:
+        return fn(*args)
+    except ValueError as exc:
+        raise ControlError(str(exc)) from exc
+
+
 def available_actions(item, posts):
     if not db.is_releasable(item) or not unstarted(posts):
         return []
     stage = item["stage"]
-    actions = []
+    if stage in ITEM_TERMINAL or item.get("rejection_reason") == "deleted from dashboard":
+        return []
+    actions = ["delete"]
+    if stage != "rejected":
+        actions.append("bulk_reject")
+    if item.get("cut_start") is not None:
+        actions.append("remake")
+        if item.get("cut_path"):
+            actions.append("remake_hook")
+    if stage in {"rendered", "awaiting_approval", "approved", "queued"}:
+        actions.append("edit_caption")
+    if stage in {"approved", "queued"}:
+        actions += ["unapprove", "post_now"]
+    if stage == "queued" and posts:
+        actions += ["up", "down"]
     if stage in ("rendered", "awaiting_approval"):
         actions += ["approve", "aonly", "reject"]
     if stage == "needs_review":
@@ -239,6 +305,16 @@ def prepare(action, item_id, payload, path, cfg):
     posts = posting.get_posts_for_item(item_id, path) if item_id else []
     validate(action, item, posts, payload, path)
     detail = ACTIONS[action]
+    payload = dict(payload)
+    if action == "post_now":
+        slot = check(queue_controls.next_post, item_id, cfg, path)
+        payload["slot"] = clock.iso(slot)
+        detail = f"{'Dry-run simulation' if posting.is_dry_run(cfg) else 'Post'} at {slot.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}"
+    if action in ("up", "down"):
+        payload["swap"] = check(queue_controls.swap, item_id, -1 if action == "up" else 1,
+                                path, cfg, unstarted)
+    if action == "edit_caption":
+        detail = check(queue_controls.caption_fields, item, payload)[2]
     if action == "reslot":
         bounded = copy.deepcopy(cfg)
         bounded.setdefault("posting", {})["daily_post_target"] = min(
@@ -309,6 +385,47 @@ def apply(command, cfg, path):
         raise ControlError(
             "State changed before the runner reached this command. Refresh and confirm again."
         )
+    if action in ("delete", "bulk_reject", "unapprove"):
+        with db.db(path) as conn:
+            conn.execute("DELETE FROM posts WHERE item_id=?", (item_id,))
+        release_card(item_id, path)
+        if action == "unapprove":
+            db.transition_stage(item_id, "awaiting_approval",
+                                {"approval_type": None, "chosen_variant": None, "ab_excluded": 0}, path)
+            return "Returned to review. Posting slot released."
+        reason = "deleted from dashboard" if action == "delete" else "user_rejected"
+        if action == "bulk_reject" and item["stage"] in {"rendered", "awaiting_approval", "needs_review"}:
+            return telegram_bot.decide(item_id, "no", path)[1]
+        db.mark_rejected(item_id, reason, db_path=path)
+        return "Item deleted." if action == "delete" else "Item rejected."
+    if action == "edit_caption":
+        body, tags, caption = check(queue_controls.caption_fields, item, payload)
+        with db.db(path) as conn:
+            conn.execute("UPDATE items SET caption_body_override=?, caption_tags_override=?, updated_at=? WHERE id=?",
+                         (body, tags, db.now(), item_id))
+            conn.execute("UPDATE posts SET caption_text=?, updated_at=? WHERE item_id=?",
+                         (caption, db.now(), item_id))
+        return "Caption saved."
+    if action in ("up", "down"):
+        other, here, there = check(queue_controls.swap, item_id, -1 if action == "up" else 1,
+                                   path, cfg, unstarted, payload["swap"])
+        with db.db(path) as conn:
+            conn.executemany("UPDATE posts SET slot_datetime=?, updated_at=? WHERE item_id=?",
+                             ((there, db.now(), item_id), (here, db.now(), other)))
+        return f"Moved {'up' if action == 'up' else 'down'} in the queue."
+    if action == "post_now":
+        check(queue_controls.next_post, item_id, cfg, path)
+        slot = clock.parse(payload["slot"])
+        if not scheduler.slot_allowed(slot, scheduler.reserved_times(path, item_id), cfg):
+            raise ControlError("The confirmed time is no longer available. Confirm a new time.")
+        if slot < clock.utcnow() - timedelta(minutes=posting.missed_slot_grace(cfg)):
+            raise ControlError("The confirmed time has passed. Confirm a new time.")
+        posting.ensure_post_rows(item, payload["slot"], cfg, path)
+        with db.db(path) as conn:
+            conn.execute("UPDATE posts SET slot_datetime=?, status='pending', updated_at=? WHERE item_id=?",
+                         (payload["slot"], db.now(), item_id))
+        db.transition_stage(item_id, "queued", db_path=path)
+        return f"Queued for {slot.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}."
     if action == "pause":
         rate_limit.set_dashboard_meta_pause(True, path)
         return "Posting paused by the dashboard until resumed."
@@ -404,11 +521,18 @@ def runner_boundary(cfg, path, stage):
         ids = [
             r[0]
             for r in conn.execute(
-                "SELECT id FROM dashboard_commands WHERE status='pending' ORDER BY created_at, rowid LIMIT 50"
+                "SELECT id FROM dashboard_commands WHERE status IN ('pending','running') ORDER BY created_at, rowid LIMIT 50"
             )
         ]
     for command_id in ids:
-        process(command_id, cfg, path)
+        with db.db(path) as conn:
+            row = conn.execute("SELECT action FROM dashboard_commands WHERE id=?", (command_id,)).fetchone()
+        if row and row["action"] in LONG:
+            if stage == "discover":
+                from . import jobs
+                jobs.run(command_id, cfg, path)
+        else:
+            process(command_id, cfg, path)
 
 
 def process(command_id, cfg, path):
@@ -445,3 +569,10 @@ def process(command_id, cfg, path):
             "UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
             (status, message, db.now(), command_id),
         )
+    if status == "applied" and row["action"] == "delete":
+        item = db.get_item(row["item_id"], path)
+        if item and item.get("rejection_reason") == "deleted from dashboard":
+            try:
+                cleanup.Cleaner(cfg, path).purge(item, cleanup.ALL_COLUMNS, subtitles=True)
+            except Exception:
+                log.exception("Dashboard media deletion incomplete for %s; cleanup can retry", item["id"])

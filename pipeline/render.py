@@ -486,7 +486,9 @@ def _video_chain(
     freeze = f",tpad=start={freeze_frames}:start_mode=clone" if freeze_frames > 0 else ""
     parts.append(
         f"[{cur}]tpad=stop=-1:stop_mode=clone:stop_duration=2,trim=end_frame={n_cut_frames},"
-        f"setpts=PTS-STARTPTS{freeze},split=2[vs1][vs2]"
+        # FFmpeg 7 can reuse source PTS for cloned start frames. Assign a monotonic CFR clock
+        # before the overlay synchronizes the two streams.
+        f"setpts=PTS-STARTPTS{freeze},setpts=N/({fps}*TB),split=2[vs1][vs2]"
     )
     parts.append(
         f"[vs1]scale={W // 3}:{H // 3}:force_original_aspect_ratio=increase,crop={W // 3}:{H // 3},"
@@ -947,6 +949,7 @@ def run_render_item(
     cfg: dict[str, Any] | None = None,
     db_path: Any = None,
     preset: str | None = None,
+    *, enter_stage=None,
 ) -> tuple[bool, str, dict[str, float]]:
     """Execute complete render stage for an item in 'cut' stage.
 
@@ -954,6 +957,7 @@ def run_render_item(
     Returns (success: bool, message: str, timing_stats: dict).
     """
     cfg = cfg or config.get_config()
+    enter_stage = enter_stage or (lambda _stage: True)
     item = db.get_item(item_id, db_path=db_path)
     if not item:
         return False, f"Item {item_id} not found", {}
@@ -982,6 +986,8 @@ def run_render_item(
     hook_text = item.get("hook_text")
     stale = binding.hook_binding_problem(item)
     if stale:
+        if not enter_stage("hook"):
+            return False, "creation stopped", {}
         log.info("Generating hook for item %s (%s)...", item_id, stale)
         ok, msg = hooks.run_hooks_for_item(item_id, cfg=cfg, db_path=db_path)
         if not ok:
@@ -999,6 +1005,8 @@ def run_render_item(
     vo_path_str = item.get("voiceover_audio_path")
     vo_stale = binding.voiceover_binding_problem(item)
     if not vo_path_str or not Path(vo_path_str).exists() or vo_stale:
+        if not enter_stage("voiceover"):
+            return False, "creation stopped", {}
         log.info("Generating voiceover for item %s%s...", item_id, f" ({vo_stale})" if vo_stale else "")
         ok, msg = voiceover.run_voiceover_for_item(item_id, cfg=cfg, db_path=db_path)
         if not ok:
@@ -1012,6 +1020,8 @@ def run_render_item(
         db.mark_failed(item_id, "render", "Voiceover audio missing on disk", db_path=db_path)
         return False, "Voiceover audio missing", {}
 
+    if not enter_stage("render"):
+        return False, "creation stopped", {}
     rs = render_settings(cfg)
     tkey = transcribe.cache_key(cfg)
     speech_words = cut_speech_words(item, cut_path, tkey, cfg)
@@ -1061,7 +1071,8 @@ def run_render_item(
 
     # Generate Creator Credit Social Caption
     author = item.get("author_name") or "Creator"
-    caption_text = posting.build_caption(hook_text, author, item.get("source") or "youtube", cfg=cfg)
+    caption_source = "twitch" if (item.get("manual_kind") or "").startswith("twitch") else item.get("source")
+    caption_text = posting.build_caption(hook_text, author, caption_source or "youtube", cfg=cfg)
 
     # Purge raw source download immediately per project retention rule
     download_path_str = item.get("download_path")

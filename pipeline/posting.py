@@ -154,15 +154,31 @@ def build_caption(
     return caption[:IG_CAPTION_LIMIT]
 
 
+def override_caption(item, body, hashtags):
+    name = item.get("author_name") or "Creator"
+    source = item.get("manual_kind") or item.get("source") or ""
+    credit = f"Credit: {name}"
+    if source.startswith("twitch"):
+        credit = f"Clipped from {name} on Twitch"
+        channel = twitch_channel(name)
+        if channel:
+            credit += f"\ntwitch.tv/{channel}"
+    disclosure = "Unofficial / unverified footage" if item.get("authenticity") != "official" else ""
+    return "\n\n".join(part for part in (body.strip(), credit, disclosure, hashtags.strip()) if part)
+
+
 def caption_for_item(item: dict[str, Any], cfg: dict[str, Any] | None = None) -> str:
     """The caption to send for an item: the stored one, else built from the template."""
+    if item.get("caption_body_override") is not None:
+        return override_caption(item, item["caption_body_override"], item.get("caption_tags_override") or "")
     stored = (item.get("caption_text") or "").strip()
     if stored:
         return stored[:IG_CAPTION_LIMIT]
     return build_caption(
         item.get("hook_text") or "",
         item.get("author_name") or "Creator",
-        item.get("source") or DEFAULT_CAPTION_SOURCE,
+        "twitch" if (item.get("manual_kind") or "").startswith("twitch")
+        else item.get("source") or DEFAULT_CAPTION_SOURCE,
         cfg=cfg,
     )
 

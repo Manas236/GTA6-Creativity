@@ -30,7 +30,18 @@ def submit(plan, command_id, path, cfg):
     if row["status"] != "pending":
         return row
     stale, interval = runner._lock_settings(cfg)
-    if runner.lock_state(path, stale):
+    owner = runner.lock_state(path, stale)
+    if plan["action"] in commands.LONG:
+        if not owner or owner.get("mode") != "runner":
+            try:
+                spawn(path, "make", command_id)
+            except OSError as exc:
+                with db.db(path) as conn:
+                    conn.execute("UPDATE dashboard_commands SET status='failed', result=?, completed_at=? WHERE id=? AND status='pending'",
+                                 (f"Could not start worker: {exc}", db.now(), command_id))
+                    return dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (command_id,)).fetchone())
+        return row
+    if owner:
         return row
     if not runner.acquire_lock(path, stale, interval, mode="dashboard"):
         return row
@@ -40,3 +51,13 @@ def submit(plan, command_id, path, cfg):
             return dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (command_id,)).fetchone())
     finally:
         runner.release_lock(path)
+
+
+def start_runner(path, cfg):
+    stale, _ = runner._lock_settings(cfg)
+    if runner.lock_state(path, stale):
+        raise commands.ControlError("A runner or creation worker is already active.")
+    try:
+        return spawn(path, "loop")
+    except OSError as exc:
+        raise commands.ControlError(f"Could not start runner: {exc}") from exc
