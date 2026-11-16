@@ -725,6 +725,7 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
   } catch (error) {
     if (inlineError) inlineError.innerHTML = resultMessage(error.message);
     toast(actionError(action, title, error.message), { error: true });
+    if (location.pathname === "/queue" && ["position", "up", "down"].includes(action)) await refresh(true);
     return false;
   } finally {
     busyActions.delete(key);
