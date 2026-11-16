@@ -67,3 +67,40 @@ def set_slot(item_id, slot, path):
             "UPDATE posts SET slot_datetime=?, status='pending', variant_decided_at=NULL, updated_at=? WHERE item_id=?",
             (slot, db.now(), item_id),
         )
+
+
+def scheduled(path):
+    with db.db(path) as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT i.id, MIN(p.slot_datetime) AS slot FROM items i JOIN posts p ON p.item_id=i.id "
+            "WHERE i.stage='queued' GROUP BY i.id HAVING slot IS NOT NULL ORDER BY slot, i.id"
+        )]
+
+
+def reposition(item_id, target_id, expected, cfg, path):
+    """Reuse the allocated slots after validating every item and reservation."""
+    from .commands import ControlError, unstarted
+
+    rows = scheduled(path)
+    if rows != expected:
+        raise ControlError("The schedule changed. Refresh and try the move again.")
+    order = [row["id"] for row in rows]
+    old, new = order.index(item_id), order.index(target_id)
+    order.insert(new, order.pop(old))
+    left, right = sorted((old, new))
+    reserved = scheduler.reserved_times(path)
+    for index in range(left, right + 1):
+        previous = rows[index]
+        if not db.is_releasable(db.get_item(previous["id"], path)) or not unstarted(
+            posting.get_posts_for_item(previous["id"], path)
+        ):
+            raise ControlError("A clip in the affected positions can no longer be moved.")
+        reserved.remove(clock.parse(previous["slot"]))
+    for index in range(left, right + 1):
+        slot = clock.parse(rows[index]["slot"])
+        if not allowed(slot, reserved, cfg):
+            raise ControlError("The resulting schedule would violate the posting gap or daily cap.")
+        reserved.append(slot)
+    for index in range(left, right + 1):
+        set_slot(order[index], rows[index]["slot"], path)
+    return f"Moved to position {new + 1}."

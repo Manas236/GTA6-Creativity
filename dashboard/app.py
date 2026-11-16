@@ -107,6 +107,11 @@ def create_app(db_path=None, cfg=None, media_root=None):
         data["csrf"] = session["csrf"]
         return jsonify(data)
 
+    @app.get("/api/library")
+    def library():
+        with snapshot(path):
+            return jsonify(views.library_page(path, settings(), request.args))
+
     @app.get("/api/settings")
     def get_preferences():
         return jsonify(preferences.values(settings()))

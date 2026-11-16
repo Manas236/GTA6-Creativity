@@ -60,7 +60,7 @@ def state(path, cfg):
                 """SELECT id, source, author_name, original_title, stage,
             discovery_score, hook_text, hook_style, authenticity, chosen_variant, preview_only,
             error_stage, error_message, rejection_reason, created_at, stage_updated_at,
-            cut_signal, creation_job, creation_phase, cut_path, cut_start, source_url, voiceover_script
+            cut_signal, source_platform, creation_job, creation_phase, cut_path, cut_start, source_url, voiceover_script
             FROM items ORDER BY created_at DESC"""
             )
         ]
@@ -202,3 +202,53 @@ def item_detail(path, item_id, cfg=None):
                 "voiceover": binding.voiceover_binding_problem(item),
             },
         }
+
+
+def library_page(path, cfg, filters):
+    """Return one page of matching item IDs in the dashboard's display timezone."""
+    from datetime import date
+
+    def positive_int(value, default):
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    def date_filter(name):
+        try:
+            return date.fromisoformat(filters.get(name, ""))
+        except ValueError:
+            return None
+
+    size = positive_int(filters.get("size"), 25)
+    if size not in (25, 50, 100):
+        size = 25
+    _, tz, *_ = scheduler.active_profile(cfg)
+    first, last = date_filter("from"), date_filter("to")
+    search = filters.get("q", "").casefold()
+    with db.db(path) as conn:
+        rows = conn.execute(
+            """SELECT i.id, i.created_at, i.original_title, i.author_name, i.hook_text,
+            i.stage, COALESCE(NULLIF(i.source_platform, ''), i.source) AS platform,
+            COALESCE(NULLIF(i.authenticity, ''), 'unverified') AS authenticity, i.cut_signal AS signal,
+            EXISTS(SELECT 1 FROM posts p WHERE p.item_id=i.id AND p.posted_at IS NOT NULL) AS posted
+            FROM items i ORDER BY i.created_at DESC, i.id"""
+        )
+        matched = []
+        for row in rows:
+            if any(filters.get(key) and filters[key] != row[key] for key in ("stage", "platform", "authenticity", "signal")):
+                continue
+            if filters.get("posted") in ("yes", "no") and bool(row["posted"]) != (filters["posted"] == "yes"):
+                continue
+            if search and search not in " ".join(str(row[key] or "") for key in (
+                "original_title", "author_name", "hook_text", "id"
+            )).casefold():
+                continue
+            if first or last:
+                day = clock.parse(row["created_at"]).astimezone(tz).date()
+                if (first and day < first) or (last and day > last):
+                    continue
+            matched.append(row["id"])
+    pages = max(1, (len(matched) + size - 1) // size)
+    page = min(pages, positive_int(filters.get("page"), 1))
+    return {"ids": matched[(page - 1) * size:page * size], "total": len(matched), "page": page, "pages": pages}

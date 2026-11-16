@@ -46,6 +46,8 @@ ACTIONS = {
     "remake_hook": "Regenerate hook and render",
     "delete": "Delete item and its local media",
     "unapprove": "Return to review",
+    "position": "Move to queue position",
+    "restore_approval": "Restore previous approval",
     "up": "Move up",
     "down": "Move down",
     "post_now": "Post at the earliest allowed time",
@@ -189,8 +191,14 @@ def validate(action, item, posts, payload, path):
         raise ControlError("This item is already deleted.")
     if action == "unapprove" and stage not in ("approved", "queued"):
         raise ControlError("Only approved or queued items can return to review.")
-    if action in ("up", "down") and (stage != "queued" or not posts):
+    if action in ("up", "down", "position") and (stage != "queued" or not posts):
         raise ControlError("Only scheduled items can move in the queue.")
+    if action == "position":
+        order = [row["id"] for row in queue_controls.scheduled(path)]
+        if item["id"] not in order or payload.get("target") not in order or payload["target"] == item["id"]:
+            raise ControlError("Choose another scheduled clip as the target.")
+    if action == "restore_approval" and (stage != "awaiting_approval" or posts):
+        raise ControlError("The clip is no longer available for approval.")
     if action == "post_now" and stage not in ("approved", "queued"):
         raise ControlError("Approve the item before posting.")
     if action in ("remake_cut", "remake_hook") and action not in available_actions(item, posts):
@@ -319,6 +327,22 @@ def prepare(action, item_id, payload, path, cfg):
     posts = posting.get_posts_for_item(item_id, path) if item_id else []
     validate(action, item, posts, payload, path)
     detail = ACTIONS[action]
+    if action in ("position", "up", "down"):
+        rows = queue_controls.scheduled(path)
+        order = [row["id"] for row in rows]
+        if item_id not in order:
+            raise ControlError("The clip has no scheduled slot.")
+        old = order.index(item_id)
+        new = order.index(payload["target"]) if action == "position" else old + (-1 if action == "up" else 1)
+        if not 0 <= new < len(order):
+            raise ControlError("The item is already at that end of the queue.")
+        payload = {"target": order[new], "undo_target": order[old + (1 if new > old else -1)],
+                   "schedule": rows}
+    if action == "unapprove":
+        payload = {"previous_slot": posting.item_slot(posts), "stage": item["stage"],
+                   "a_only": item["approval_type"] == "approved_a_only"}
+    if action == "restore_approval":
+        payload = {"command_id": str(payload.get("command_id", ""))}
     if action == "delete":
         detail = ("Deletes this clip's video files for good. The item stays in history so discovery "
                   "never picks this clip again. This can't be undone.")
@@ -419,6 +443,35 @@ def apply(command, cfg, path):
             raise ControlError(message)
         release_card(item_id, path)
         return message
+    if action == "restore_approval":
+        with db.db(path) as conn:
+            prior = conn.execute(
+                "SELECT payload FROM dashboard_commands WHERE id=? AND item_id=? "
+                "AND action='unapprove' AND status='applied'",
+                (payload["command_id"], item_id),
+            ).fetchone()
+        if prior is None:
+            raise ControlError("The original unapproval did not apply.")
+        original = json.loads(prior["payload"])
+        slot = original.get("previous_slot")
+        if original.get("stage") == "queued":
+            if not slot or clock.parse(slot) < clock.utcnow() - timedelta(seconds=posting.missed_slot_grace(cfg)):
+                raise ControlError("The previous slot has expired.")
+            if not queue_controls.allowed(clock.parse(slot), scheduler.reserved_times(path, item_id), cfg):
+                raise ControlError("The previous slot is no longer available.")
+            if not posting.enabled_platforms(cfg):
+                raise ControlError("No publishing platforms are enabled.")
+        decision = "aonly" if original.get("a_only") else "approve"
+        validate(decision, item, posts, {}, path)
+        outcome, message = telegram_bot.decide(item_id, DECISIONS[decision], path)
+        if not outcome or outcome == telegram_bot.NOT_APPLICABLE:
+            raise ControlError(message)
+        if slot and original.get("stage") == "queued":
+            restored = db.get_item(item_id, path)
+            posting.ensure_post_rows(restored, slot, cfg, path)
+            db.transition_stage(item_id, "queued", db_path=path)
+        release_card(item_id, path)
+        return "Previous approval restored."
     if action in ("delete", "unapprove", "remake_cut", "remake_hook"):
         with db.db(path) as conn:
             conn.execute("DELETE FROM posts WHERE item_id=?", (item_id,))
@@ -445,8 +498,10 @@ def apply(command, cfg, path):
             conn.execute("UPDATE posts SET caption_text=?, updated_at=? WHERE item_id=?",
                          (posting.caption_for_item({**item, **fields}, cfg), db.now(), item_id))
         return "Caption saved."
-    if action in ("up", "down"):
-        return queue_controls.move(item_id, -1 if action == "up" else 1, cfg, path)
+    if action in ("up", "down", "position"):
+        if action != "position" and "schedule" not in payload:
+            return queue_controls.move(item_id, -1 if action == "up" else 1, cfg, path)
+        return queue_controls.reposition(item_id, payload["target"], payload["schedule"], cfg, path)
     if action == "post_now":
         if posting.meta_paused(path)[0] or not posting.enabled_platforms(cfg):
             raise ControlError("Posting is paused or no platforms are enabled.")
