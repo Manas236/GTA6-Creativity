@@ -1166,6 +1166,7 @@ document.addEventListener("keydown", (event) => {
     if (items[index + step]) { reviewId = items[index + step].id; review(true); }
   } else if (key === " " && !event.target.closest?.("button, a")) {
     event.preventDefault();
+    event.stopPropagation();
     const players = [...document.querySelectorAll("#review-selected .video-grid video")];
     const play = players.every((player) => player.paused);
     for (const player of players) play ? player.play().catch(() => {}) : player.pause();
@@ -1175,7 +1176,7 @@ document.addEventListener("keydown", (event) => {
     const control = document.querySelector(`#review-selected [data-action="${keys[key]}"]`);
     if (control && !control.disabled) { event.preventDefault(); control.click(); }
   }
-});
+}, { capture: true });
 
 function updateLibraryFilter(field) {
   const query = new URLSearchParams(location.search);
