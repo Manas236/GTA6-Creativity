@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -143,7 +144,7 @@ def build_demo(path, media=True):
         "cut": 3,
         "needs_review": 3,
         "rendered": 2,
-        "awaiting_approval": 1,
+        "awaiting_approval": 6,
         "approved": 2,
         "queued": 4,
         "posted": 3,
@@ -179,24 +180,31 @@ def build_demo(path, media=True):
                 },
                 path,
             )
-            created = clock.iso(now - timedelta(days=rng.randint(1, 22)))
+            age = rng.randint(1, 22)
+            if stage == "rejected" and source == "twitch":
+                age = now.weekday() + 3
+            created = clock.iso(now - timedelta(days=age))
+            clip_root = media_root / item_id
+            clip_root.mkdir()
+            for variant in ("A", "B"):
+                shutil.copyfile(media_root / f"{variant}.mp4", clip_root / f"{variant}.mp4")
             fields = {
                 "created_at": created,
                 "cut_signal": ("heatmap", "chat", "audio_scene")[index % 3],
                 "cut_start": 34.5,
                 "cut_end": 54.5,
                 "cut_duration": 20,
-                "cut_path": str(media_root / "A.mp4"),
-                "download_path": str(media_root / "A.mp4"),
+                "cut_path": str(clip_root / "A.mp4"),
+                "download_path": str(clip_root / "A.mp4"),
                 "hook_text": hook,
                 "voiceover_script": script,
                 "hook_style": hook_style,
                 "hook_grounded": 1,
                 "authenticity": "official" if index % 5 == 0 else "unverified",
                 "style_preset": "P0",
-                "render_a_path": str(media_root / "A.mp4"),
-                "render_b_path": str(media_root / "B.mp4"),
-                "voiceover_audio_path": str(media_root / "B.mp4"),
+                "render_a_path": str(clip_root / "A.mp4"),
+                "render_b_path": str(clip_root / "B.mp4"),
+                "voiceover_audio_path": str(clip_root / "B.mp4"),
                 "chosen_variant": "A" if index % 2 else "B",
             }
             segment = {"id": item_id, **fields}

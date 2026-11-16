@@ -1,7 +1,15 @@
 "use strict";
 let state, detail, pendingAction, confirmation, refreshTimer;
-let preferences, reviewId, jobId, toastTimer;
-let libraryStage = "", librarySearch = "";
+let preferences, reviewId = new URLSearchParams(location.search).get("item"), jobId;
+const busyActions = new Set();
+const inboxPending = new Map();
+const waitingCommands = new Map();
+let lastUndo, inlineDecision, reviewRequest = 0;
+const quickActions = new Set(["approve", "aonly", "hookok", "up", "down", "unapprove", "pause", "resume", "edit_hook", "edit_caption", "make", "clip_url", "retry", "position"]);
+const inlineConfirm = new Set(["reject", "remake_cut", "remake_hook"]);
+const keys = { a: "approve", "1": "aonly", h: "hookok", r: "reject", e: "edit_hook", c: "edit_caption", m: "remake_cut", g: "remake_hook" };
+const reviewLink = (id) => "/review?item=" + encodeURIComponent(id);
+let libraryAnchor, libraryRequest = 0, draggedItem, queueCompact = false;
 const selectedItems = new Set();
 let connectionRows = [], connectionsBusy = false;
 const content = document.querySelector("#content");
@@ -233,7 +241,7 @@ function queue() {
     );
   const groups = new Map();
   for (const row of rows) {
-    const key = dayKey(row.posts[0]?.slot_datetime);
+    const key = queueCompact ? "compact" : dayKey(row.posts[0]?.slot_datetime);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   }
@@ -241,11 +249,47 @@ function queue() {
     heading(
       "The publishing calendar.",
       `${state.profile} profile · ${state.timezone} · slots ${state.slots.join(" & ")}`,
-      pill(`${rows.length} items`),
+      `<button class="button secondary" id="queue-view" aria-pressed="${queueCompact}">${queueCompact ? "Calendar" : "Compact list"}</button>`,
     ) +
     `<div class="toolbar"><input type="search" id="queue-search" aria-label="Search items" placeholder="Search clips, creators or item IDs" value="${escape(filters.queue)}"><select id="stage-filter" aria-label="Filter stage"><option value="all">Approved & queued</option>${state.stages.map((s) => `<option value="${s.stage}" ${filters.stage === s.stage ? "selected" : ""}>${pretty(s.stage)} (${s.count})</option>`).join("")}</select></div>
-  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card"><div class="queue-time">${posts[0] ? escape(formatTime(posts[0].slot_datetime, { day: undefined, month: undefined })) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${itemLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.filter((a) => ["up", "down", "unapprove", "post_now"].includes(a)).map((a) => button(a, item.id)).join("")}<a class="button secondary" href="${itemLink(item.id)}">Review clip ↗</a></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
+  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "compact" ? "QUEUE ORDER" : day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card ${queueCompact ? "queue-compact" : ""}" data-queue-item="${escape(item.id)}" draggable="${item.actions.includes("up")}"><div class="queue-time">${posts[0] ? escape(formatTime(posts[0].slot_datetime, { day: undefined, month: undefined })) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${reviewLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.includes("post_now") ? button("post_now", item.id) : ""}
+      <details class="queue-menu"><summary class="button secondary" aria-label="More actions">…</summary>
+      <div>${item.actions.filter((action) => ["unapprove", "up", "down"].includes(action)).map((action) => button(action, item.id)).join("")}
+      <a href="${reviewLink(item.id)}">Open in Review</a></div></details></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
 }
+document.addEventListener("click", (event) => {
+  if (event.target.closest("#queue-view")) { queueCompact = !queueCompact; queue(); return; }
+  const row = event.target.closest("[data-queue-item]");
+  if (row && !event.target.closest("a, button, details")) location.href = reviewLink(row.dataset.queueItem);
+});
+
+document.addEventListener("dragstart", (event) => {
+  const row = event.target.closest('[data-queue-item][draggable="true"]');
+  if (!row || event.target !== row) return;
+  draggedItem = row.dataset.queueItem;
+  event.dataTransfer.setData("text/plain", draggedItem);
+  event.dataTransfer.effectAllowed = "move";
+  row.classList.add("dragging");
+});
+document.addEventListener("dragover", (event) => {
+  const row = event.target.closest("[data-queue-item]");
+  if (!draggedItem || !row || row.dataset.queueItem === draggedItem) return;
+  event.preventDefault();
+  document.querySelector(".drop-target")?.classList.remove("drop-target");
+  row.classList.add("drop-target");
+});
+document.addEventListener("drop", (event) => {
+  const row = event.target.closest("[data-queue-item]");
+  if (!draggedItem || !row || row.dataset.queueItem === draggedItem) return;
+  event.preventDefault();
+  runAction("position", draggedItem, { target: row.dataset.queueItem });
+});
+document.addEventListener("dragend", () => {
+  draggedItem = null;
+  document.querySelector(".dragging")?.classList.remove("dragging");
+  document.querySelector(".drop-target")?.classList.remove("drop-target");
+});
+
 function analytics() {
   const latest = totals(),
     views = latest.reduce((n, m) => n + m.views, 0);
@@ -523,13 +567,169 @@ async function api(url, body) {
     throw new Error(data.error || `Request failed (${response.status}).`);
   return data;
 }
-function toast(message) {
-  const node = document.querySelector("#toast");
-  node.textContent = message;
-  node.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (node.hidden = true), 7000);
+function toast(message, inverse, original) {
+  const stack = document.querySelector("#toast");
+  const entry = document.createElement("div");
+  entry.className = "toast-entry";
+  entry.append(document.createTextNode(message));
+  stack.append(entry);
+  stack.hidden = false;
+  if (inverse) {
+    const undo = document.createElement("button");
+    undo.textContent = "Undo";
+    undo.className = "button secondary";
+    const run = async () => {
+      if (!undo.isConnected) return;
+      undo.remove();
+      if (lastUndo === run) lastUndo = null;
+      if (original?.status === "pending") {
+        toast("Undo requested. Waiting for the first change to apply.");
+        try {
+          await waitForCommand(original.id);
+        } catch (error) {
+          toast(error.message);
+          return;
+        }
+      }
+      await runAction(...inverse);
+    };
+    lastUndo = run;
+    undo.onclick = run;
+    entry.append(undo);
+    setTimeout(() => {
+      undo.remove();
+      if (lastUndo === run) lastUndo = null;
+    }, 6000);
+  }
+  setTimeout(() => {
+    entry.remove();
+    stack.hidden = !stack.childElementCount;
+  }, 7000);
 }
+
+async function waitForCommand(id) {
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    const fresh = await api("/api/state");
+    const command = fresh.commands.find((entry) => entry.id === id);
+    if (command?.status === "applied") return;
+    if (command && ["failed", "refused"].includes(command.status)) throw new Error(command.result);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("The original change is still waiting for a runner boundary.");
+}
+
+function showCompletedControls() {
+  for (const [id, title] of waitingCommands) {
+    const entry = state.commands.find((command) => command.id === id);
+    if (!entry || ["pending", "running"].includes(entry.status)) continue;
+    waitingCommands.delete(id);
+    toast(title + " · " + (entry.result || entry.status));
+  }
+}
+
+async function runAction(action, id, payload = {}, trigger, inlineError, reverseEdit) {
+  const key = id || action;
+  if (busyActions.has(key)) return false;
+  busyActions.add(key);
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.classList.add("working");
+  }
+  const title = itemById(id)?.original_title || labels[action] || "Queue";
+  try {
+    const plan = await api("/api/prepare", { action, item_id: id || null, payload });
+    const { command, warning } = await api("/api/confirm", { ticket: plan.ticket });
+    if (["refused", "failed"].includes(command.status)) throw new Error(warning || command.result);
+    if (["make", "clip_url", "remake_cut", "remake_hook"].includes(action)) jobId = command.id;
+    const inverse = {
+      approve: ["unapprove", id], aonly: ["unapprove", id],
+      pause: ["resume"], resume: ["pause"], up: ["down", id], down: ["up", id],
+      position: ["position", id, { target: plan.payload.undo_target }],
+      unapprove: ["restore_approval", id, { command_id: command.id }],
+    }[action] || reverseEdit;
+    if (command.status === "pending" && !["make", "clip_url"].includes(action)) waitingCommands.set(command.id, title);
+    toast(title + " · " + (warning || command.result || "Queued"), inverse, command);
+    if (location.pathname === "/review" && id === reviewId &&
+        ["approve", "aonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook"].includes(action)) {
+      const items = inboxItems();
+      const index = items.findIndex((item) => item.id === id);
+      reviewId = (items[index + 1] || items[index - 1])?.id;
+      inboxPending.set(id, command.id);
+      await review();
+    }
+    await refresh(true);
+    return true;
+  } catch (error) {
+    if (inlineError) inlineError.innerHTML = resultMessage(error.message);
+    else toast(title + " · " + error.message);
+    return false;
+  } finally {
+    busyActions.delete(key);
+    if (trigger) {
+      trigger.disabled = false;
+      trigger.classList.remove("working");
+    }
+  }
+}
+
+function triggerAction(node) {
+  const { action, id } = node.dataset;
+  if (["edit_hook", "edit_caption"].includes(action) && detail?.item.id === id) {
+    openInlineEditor(action, id);
+    return;
+  }
+  if (inlineConfirm.has(action)) {
+    if (inlineDecision === node) {
+      inlineDecision = null;
+      node.textContent = labels[action];
+    } else {
+      inlineDecision = node;
+      const label = node.textContent;
+      node.textContent = "Click again to " + ({ reject: "reject", remake_cut: "remake cut", remake_hook: "regenerate hook" })[action];
+      setTimeout(() => {
+        if (inlineDecision === node) inlineDecision = null;
+        node.textContent = label;
+      }, 3000);
+      return;
+    }
+  } else if (!quickActions.has(action)) {
+    openAction(action, id, node);
+    return;
+  }
+  runAction(action, id, {}, node);
+}
+
+function openInlineEditor(action, id) {
+  const caption = action === "edit_caption";
+  const region = document.querySelector(caption ? ".caption-preview" : ".hook-display");
+  if (!region || region.querySelector("form")) return;
+  const previous = region.innerHTML;
+  const initial = { body: detail.item.caption_body ?? detail.item.hook_text ?? "", hashtags: detail.caption_hashtags };
+  region.innerHTML = `<form class="inline-editor"><label>${caption ? "Caption" : "Hook"}<textarea required maxlength="${caption ? 2200 : 220}">${escape(caption ? detail.item.caption_body ?? detail.item.hook_text : detail.item.hook_text)}</textarea></label>${caption ? `<label>Hashtags<input value="${escape(detail.caption_hashtags)}"></label>` : ""}<button class="button primary">Save</button> <button type="button" class="button secondary">Cancel</button><p role="status"></p></form>`;
+  const form = region.querySelector("form");
+  const field = form.querySelector("textarea");
+  const cancel = () => { region.innerHTML = previous; };
+  form.querySelector('[type="button"]').onclick = cancel;
+  form.onkeydown = (event) => {
+    if (event.key === "Escape") { event.preventDefault(); cancel(); }
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); }
+  };
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const payload = caption ? { body: field.value, hashtags: form.querySelector("input").value } : { hook_text: field.value };
+    if (await runAction(action, id, payload, form.querySelector("button"), form.querySelector("p"), caption ? ["edit_caption", id, initial] : null)) {
+      if (form.isConnected) {
+        cancel();
+        if (location.pathname === "/review") await review(true);
+        else await itemPage(id);
+      }
+    }
+  };
+  field.focus();
+  field.select();
+}
+
 function connections() {
   const settingsPage = location.pathname === "/settings";
   const tones = { ok: "green", failed: "red", warning: "amber", not_set: "gray", unchecked: "gray" };
@@ -578,6 +778,7 @@ function refreshRecentControls() {
 async function refresh(manual = false) {
   try {
     state = await api("/api/state");
+    showCompletedControls();
     document.querySelector("#refresh-status").textContent =
       "Updated " +
       new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -586,11 +787,15 @@ async function refresh(manual = false) {
     const banner = document.querySelector("#mode-banner");
     banner.classList.toggle("live", !state.dry_run);
     banner.innerHTML = `<span><strong>${state.dry_run ? "DRY RUN IS ON" : "LIVE POSTING IS ON"}</strong> &nbsp; ${state.dry_run ? "The runner simulates publishing." : "Approved clips can be published by the runner."}</span><span class="${state.demo ? "demo" : ""}">${state.demo ? "DEMO DATABASE · seeded example data" : state.config_changed ? "CONFIG CHANGED · applies next cycle" : state.runtime_known ? "RUNNER SETTINGS" : state.meta_paused ? "META POSTING PAUSED" : "CONFIG SETTINGS · runner not observed"}</span>`;
+    document.querySelector("#nav-review").textContent = inboxItems().length;
+    const runnerDot = document.querySelector("#nav-runner");
+    runnerDot.dataset.status = state.lock.status;
+    runnerDot.setAttribute("aria-label", state.lock.status === "alive" ? "Runner active" : "Runner stopped");
     document.querySelector("#nav-queued").textContent = state.items.filter(
       (i) => i.stage === "queued",
     ).length;
     document.querySelector("#nav-failed").textContent = state.items.filter(
-      (i) => ["failed", "needs_review"].includes(i.stage),
+      (i) => i.stage === "failed",
     ).length;
     const page = location.pathname.startsWith("/items/")
       ? "item"
@@ -627,13 +832,16 @@ async function refresh(manual = false) {
         connections();
       }
     } else if (page === "review") {
-      if (manual || !detail || (itemById(reviewId)?.stage !== detail.item.stage && !videoPlaying())) await review();
-      else refreshRecentControls();
+      await review(false);
     } else if (page === "item") {
-      if (manual || !detail || (itemById(detail.item.id)?.stage !== detail.item.stage && !videoPlaying())) await itemPage();
+      if (!content.querySelector(".inline-editor") && (manual || !detail || (itemById(detail.item.id)?.stage !== detail.item.stage && !videoPlaying()))) await itemPage();
       else refreshRecentControls();
+    } else if (page === "make") {
+      make();
+    } else if (page === "library" && (manual || !document.querySelector("#library-results"))) {
+      await library();
     } else if (
-      !dialog.open &&
+      !document.querySelector("dialog[open]") && !draggedItem && page !== "library" &&
       !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)
     )
       (({ overview, queue, analytics, failures, make, library })[page] || overview)();
@@ -642,35 +850,42 @@ async function refresh(manual = false) {
     toast(error.message);
   }
 }
-function openAction(action, id) {
+async function openAction(action, id, trigger) {
+  if (dialog.open || busyActions.has(id)) return;
   pendingAction = { action, item_id: id || null };
   confirmation = null;
   document.querySelector("#dialog-title").textContent = labels[action];
   const subtitle = document.querySelector("#dialog-item");
-  const destination = ["make", "clip_url"].includes(action) ? state.posting_destination : null;
-  subtitle.textContent = destination?.text || itemById(id)?.original_title || "";
-  subtitle.classList.toggle("warning-text", Boolean(destination?.warning));
+  subtitle.textContent = itemById(id)?.original_title || "";
   subtitle.hidden = !subtitle.textContent;
-  document.querySelector("#dialog-error").textContent = "";
-  document.querySelector("#confirm-content").hidden = true;
   const fields = document.querySelector("#action-fields");
-  fields.hidden = false;
-  if (action === "edit_hook")
-    fields.innerHTML = `<label for="hook-edit">New hook text</label><textarea id="hook-edit" maxlength="220" required>${escape(detail?.item?.hook_text || "")}</textarea><p class="reason">The runner checks the edited text against the cut, invalidates the old renders, and renders both variants again.</p>`;
-  else if (action === "edit_caption")
-    fields.innerHTML = `<label for="caption-body">Caption body</label><textarea id="caption-body" maxlength="2200">${escape(detail.item.caption_body ?? detail.item.hook_text)}</textarea>
-    <label for="caption-tags">Hashtags</label><input id="caption-tags" value="${escape(detail.caption_hashtags)}">
-    <p class="reason caption-preview">${escape(detail.caption_credit)}</p>`;
-  else if (action === "make")
-    fields.innerHTML = '<label for="make-count">Number of clips</label><input id="make-count" type="number" min="1" max="10" value="3" required>';
-  else if (action === "clip_url")
-    fields.innerHTML = '<label for="clip-url">YouTube or Twitch URL</label><input id="clip-url" type="url" required><div class="grid-half"><label>Start (optional)<input id="clip-start" placeholder="mm:ss"></label><label>End (optional)<input id="clip-end" placeholder="mm:ss"></label></div>';
-  else if (action === "reslot")
-    fields.innerHTML = `<label for="slot-after">Find a free slot after (UTC)</label><input id="slot-after" type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}"><p class="reason">The scheduler uses ${escape(state.timezone)}, the configured minimum gap and at most two items per local day. The next free slot is recalculated when applied.</p>`;
-  else
-    fields.innerHTML = `<p class="reason">${action === "pause" ? "This holds posting until you lift the dashboard pause. A request already in flight may finish." : action === "resume" ? "This lifts the dashboard pause. Any Meta cooldown stays in effect until it expires." : action === "hookok" ? "Confirm that the current hook fits the cut, or that the source-text layout is acceptable. The item returns to rendering before approval." : "This decision will be revalidated against the item’s current state before the runner applies it."}</p>`;
-  document.querySelector("#submit-action").textContent = "Review change";
+  const summary = document.querySelector("#confirm-content");
+  const error = document.querySelector("#dialog-error");
+  const submit = document.querySelector("#submit-action");
+  error.textContent = "";
+  fields.hidden = action !== "reslot";
+  fields.innerHTML = action === "reslot"
+    ? `<label for="slot-after">Find a free slot after (UTC)</label><input id="slot-after" type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}">`
+    : "";
+  summary.hidden = true;
+  submit.disabled = action !== "reslot";
+  submit.textContent = action === "reslot" ? "Review change" : "Confirm";
   dialog.showModal();
+  if (action === "reslot") return;
+  const request = pendingAction;
+  trigger.classList.add("working");
+  try {
+    const plan = await api("/api/prepare", request);
+    if (!dialog.open || request !== pendingAction) return;
+    confirmation = plan;
+    summary.textContent = plan.description;
+    summary.hidden = false;
+    submit.disabled = false;
+  } catch (failure) {
+    if (dialog.open && request === pendingAction) error.textContent = failure.message;
+  } finally {
+    trigger.classList.remove("working");
+  }
 }
 document.addEventListener("click", (event) => {
   const connectionButton = event.target.closest("[data-connection], [data-send-telegram]");
@@ -683,7 +898,7 @@ document.addEventListener("click", (event) => {
   const bulkButton = event.target.closest("[data-bulk]");
   if (bulkButton) { bulkAction(bulkButton.dataset.bulk); return; }
   const buttonNode = event.target.closest("[data-action]");
-  if (buttonNode) openAction(buttonNode.dataset.action, buttonNode.dataset.id);
+  if (buttonNode) triggerAction(buttonNode);
 });
 document.querySelector("#close-dialog").onclick = () => dialog.close();
 document.querySelector("#cancel-dialog").onclick = () => dialog.close();
@@ -696,22 +911,9 @@ document
     submit.disabled = true;
     try {
       if (!confirmation) {
-        const payload = {};
-        if (pendingAction.action === "edit_hook")
-          payload.hook_text = document.querySelector("#hook-edit").value;
-        if (pendingAction.action === "make")
-          payload.count = Number(document.querySelector("#make-count").value);
-        if (pendingAction.action === "clip_url") {
-          for (const field of ["url", "start", "end"]) payload[field] = document.querySelector("#clip-" + field).value;
-        }
-        if (pendingAction.action === "edit_caption") {
-          payload.body = document.querySelector("#caption-body").value;
-          payload.hashtags = document.querySelector("#caption-tags").value;
-        }
-        if (pendingAction.action === "reslot")
-          payload.after = new Date(
-            document.querySelector("#slot-after").value + "Z",
-          ).toISOString();
+        const payload = {
+          after: new Date(document.querySelector("#slot-after").value + "Z").toISOString(),
+        };
         confirmation = await api("/api/prepare", { ...pendingAction, payload });
         document.querySelector("#action-fields").hidden = true;
         document.querySelector("#dialog-error").textContent = "";
@@ -742,14 +944,8 @@ document
     }
   });
 document.addEventListener("change", (event) => {
-  if (event.target.id === "job-select") { jobId = event.target.value; make(); }
-  if (event.target.id === "review-select") { reviewId = event.target.value; review(); }
-  if (event.target.id === "library-stage") { libraryStage = event.target.value; library(); }
-  if (event.target.matches("[data-select-item]")) {
-    if (event.target.checked) selectedItems.add(event.target.value);
-    else selectedItems.delete(event.target.value);
-    document.querySelector("#selected-count").textContent = `${selectedItems.size} selected`;
-  }
+  if (event.target.id === "job-select") { jobId = event.target.value; updateMakeProgress(); document.querySelector("#job-select")?.focus({ preventScroll: true }); }
+  if (event.target.matches("[data-library-filter]")) updateLibraryFilter(event.target);
   if (event.target.id === "stage-filter") {
     filters.stage = event.target.value;
     history.replaceState(null, "", "/queue");
@@ -761,14 +957,7 @@ document.addEventListener("change", (event) => {
   }
 });
 document.addEventListener("input", (event) => {
-  if (event.target.id === "library-search") {
-    const position = event.target.selectionStart;
-    librarySearch = event.target.value;
-    library();
-    const field = document.querySelector("#library-search");
-    field.focus();
-    field.setSelectionRange(position, position);
-  }
+  if (event.target.name === "q" && event.target.matches("[data-library-filter]")) updateLibraryFilter(event.target);
   if (event.target.id === "queue-search") {
     const position = event.target.selectionStart;
     filters.queue = event.target.value;
@@ -787,56 +976,286 @@ window.addEventListener("resize", () => {
 refresh(true);
 setInterval(() => {
   if (!dialog.open && !document.hidden) refresh();
-}, 2500);
+}, 30000);
 
 function make() {
+  if (!document.querySelector("#make-form")) {
+    content.innerHTML = heading("Make", "") +
+      `<section class="panel"><p id="make-runner"></p><form id="make-form">
+        <div class="grid-half"><div><label>Clips <input name="count" type="number" min="1" max="10" value="2" required></label>
+        <button class="button primary" name="task" value="make" formnovalidate>Make</button></div>
+        <div><label>Source URL <input name="url" type="url" required></label>
+        <p id="source-type" role="status"></p>
+        <div class="grid-half"><label>Start <input name="start" placeholder="mm:ss"></label>
+        <label>End <input name="end" placeholder="mm:ss"></label></div>
+        <button class="button primary" name="task" value="clip_url">Clip it</button></div></div>
+        <p id="make-error" role="status"></p></form></section><section class="panel" id="make-progress"></section>`;
+    const form = document.querySelector("#make-form");
+    form.elements.url.oninput = () => {
+      const value = form.elements.url.value.trim();
+      const output = document.querySelector("#source-type");
+      document.querySelector("#make-error").textContent = "";
+      if (!value) { output.textContent = ""; return; }
+      let kind;
+      try {
+        const url = new URL(value);
+        const host = url.hostname.replace(/^(www|m)\./, "");
+        if (url.protocol === "https:" && !url.username && !url.password && !url.port) {
+          if (host === "youtu.be" && /^\/[\w-]{11}\/?$/.test(url.pathname)) kind = "YouTube video";
+          if (host === "youtube.com" && /^\/shorts\/[\w-]{11}\/?$/.test(url.pathname)) kind = "YouTube Short";
+          if (host === "youtube.com" && /^\/watch\/?$/.test(url.pathname) && /^[\w-]{11}$/.test(url.searchParams.get("v") || "")) kind = "YouTube video";
+          if ((host === "clips.twitch.tv" && /^\/[\w-]+\/?$/.test(url.pathname)) || (host === "twitch.tv" && /^\/\w+\/clip\/[\w-]+\/?$/.test(url.pathname))) kind = "Twitch clip";
+          if (host === "twitch.tv" && /^\/videos\/\d+\/?$/.test(url.pathname)) kind = "Twitch VOD";
+        }
+      } catch {}
+      output.textContent = kind || "Enter a valid YouTube or Twitch clip or VOD URL.";
+    };
+    form.onkeydown = (event) => {
+      if (event.key !== "Enter" || event.target.tagName !== "INPUT") return;
+      event.preventDefault();
+      form.requestSubmit(form.querySelector(`[value="${event.target.name === "count" ? "make" : "clip_url"}"]`));
+    };
+    form.onsubmit = (event) => {
+      event.preventDefault();
+      const action = event.submitter.value;
+      const { count, url, start, end } = form.elements;
+      const payload = action === "make" ? { count: Number(count.value) } :
+        { url: url.value.trim(), start: start.value, end: end.value };
+      const error = document.querySelector("#make-error");
+      error.textContent = "";
+      runAction(action, null, payload, event.submitter, error);
+    };
+  }
+  document.querySelector("#make-runner").textContent = state.lock.status === "alive"
+    ? `Runs at the next discover boundary. The runner checks about every ${state.interval}s, plus time for the current cycle.`
+    : "A background worker will run this job.";
+  updateMakeProgress();
+}
+
+function updateMakeProgress() {
   const jobs = state.commands.filter((c) => ["make", "clip_url", "remake_cut", "remake_hook"].includes(c.action));
   const current = jobs.find((c) => c.id === jobId) || jobs[0];
   const items = current ? state.items.filter((i) => i.creation_job === current.id) : [];
-  content.innerHTML = heading("Make", "Discover fresh clips or work from a specific source.") +
-    `<div class="grid-half">
-      <section class="panel">${panelHead("Discover clips", "Make up to 10 new clips from enabled discovery sources.")}${button("make")}</section>
-      <section class="panel">${panelHead("Clip from URL", "YouTube videos and Shorts, Twitch clips and VODs.")}${button("clip_url")}</section>
-    </div><section class="panel commands">${panelHead("Job progress", current ? (current.result || commandState(current)) : "Start a job to track each item.",
-      jobs.length > 1 ? `<select id="job-select" aria-label="Choose job">${jobs.map((job) =>
-        `<option value="${escape(job.id)}" ${job.id === current.id ? "selected" : ""}>${escape(labels[job.action])} · ${formatTime(job.created_at)} · ${commandState(job)}</option>`).join("")}</select>` : "")}
-    ${items.map((i) => `<div class="health-row"><a href="${itemLink(i.id)}">${escape(i.original_title)}</a>
-      <span>${pill(["awaiting_approval", "rendered"].includes(i.stage) ? "Ready for approval" : pretty(i.creation_phase || i.stage))}
-      ${escape(i.error_message || i.rejection_reason || "")}</span></div>`).join("")}
-    </section>${commandsPanel()}`;
+  const progress = document.querySelector("#make-progress");
+  if (progress.contains(document.activeElement) && document.activeElement.id !== "job-select") return;
+  progress.innerHTML = panelHead("Job progress", current ? (current.result || commandState(current)) : "Start a job to track each clip.",
+    jobs.length > 1 ? `<select id="job-select" aria-label="Choose job">${jobs.map((job) =>
+      `<option value="${escape(job.id)}" ${job.id === current.id ? "selected" : ""}>${escape(labels[job.action])} · ${formatTime(job.created_at)} · ${commandState(job)}</option>`).join("")}</select>` : "") +
+    items.map((item) => {
+      const elapsed = Math.max(0, Math.floor((Date.parse(current.completed_at || new Date().toISOString()) - Date.parse(current.created_at)) / 1000));
+      return `<div class="health-row"><a href="${itemLink(item.id)}">${escape(item.original_title)}</a>
+        <span>${isReviewItem(item) ? `<a href="${reviewLink(item.id)}">Ready for review</a>` : pill(pretty(item.creation_phase || item.stage))}
+        · ${elapsed}s ${escape(item.error_message || item.rejection_reason || "")}
+        ${item.actions.includes("retry") ? button("retry", item.id, "Retry") : ""}</span></div>`;
+    }).join("");
 }
 
-async function review() {
-  const items = state.items.filter((i) => ["awaiting_approval", "rendered", "needs_review"].includes(i.stage));
-  const item = items.find((i) => i.id === reviewId) || items[0];
-  if (!item) {
-    content.innerHTML = heading("Review", "Compare variants before approving.") + empty("No clips are waiting for review.") + commandsPanel();
+const isReviewItem = (item) => ["awaiting_approval", "rendered", "needs_review"].includes(item.stage);
+function relativeAge(time) {
+  const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(time)) / 60000));
+  if (!Number.isFinite(minutes)) return "";
+  if (minutes < 60) return minutes ? minutes + "m ago" : "Just now";
+  if (minutes < 1440) return Math.floor(minutes / 60) + "h ago";
+  return Math.floor(minutes / 1440) + "d ago";
+}
+function inboxItems() {
+  for (const [id, commandId] of inboxPending) {
+    const command = state.commands.find((entry) => entry.id === commandId);
+    if (command && !["pending", "running"].includes(command.status)) inboxPending.delete(id);
+  }
+  return state.items.filter((item) => isReviewItem(item) && !inboxPending.has(item.id));
+}
+
+async function review(force = false) {
+  const items = inboxItems();
+  if (!document.querySelector("#review-inbox")) {
+    content.innerHTML = heading("Review", "", '<button class="button secondary" id="review-help" aria-label="Keyboard shortcuts">?</button>') +
+      '<div class="review-layout"><aside id="review-inbox" aria-label="Review inbox"></aside><section id="review-selected"></section></div>' +
+      '<dialog id="review-shortcuts"><form method="dialog"><h2>Keyboard shortcuts</h2><p>J/K or arrows · Next / previous</p><p>Space · Play or pause previews</p><dl>' +
+      Object.entries(keys).map(([key, action]) => `<dt>${key.toUpperCase()}</dt><dd>${labels[action]}</dd>`).join("") +
+      '<dt>Z</dt><dd>Undo</dd></dl><button class="button secondary">Close</button></form></dialog>';
+    document.querySelector("#review-help").onclick = () => document.querySelector("#review-shortcuts").showModal();
+  }
+  const inbox = document.querySelector("#review-inbox");
+  const pane = document.querySelector("#review-selected");
+  const item = items.find((entry) => entry.id === reviewId) || (!reviewId ? items[0] : null);
+  if (item) reviewId = item.id;
+  const list = items.map((entry) => `<a class="inbox-entry" href="${reviewLink(entry.id)}" data-review-item="${escape(entry.id)}" ${entry.id === reviewId ? 'aria-current="true"' : ""}>
+    <img width="64" height="36" loading="lazy" alt="" src="/media/${encodeURIComponent(entry.id)}/thumb">
+    <span><strong>${escape(entry.hook_text || entry.original_title)}</strong>
+    <small title="${escape(formatTime(entry.created_at))}">${escape(relativeAge(entry.created_at))}</small>
+    <span class="chips">${pill(entry.authenticity || "unverified")}${entry.stage === "needs_review" ? pill("Needs review", "amber") : ""}${entry.cut_signal ? pill(pretty(entry.cut_signal)) : ""}</span></span></a>`).join("");
+  if (inbox.dataset.markup !== list && !inbox.contains(document.activeElement)) {
+    inbox.innerHTML = list;
+    inbox.dataset.markup = list;
+  }
+  if (!item && !reviewId) {
+    if (!pane.dataset.item && pane.childElementCount) return;
+    delete pane.dataset.item;
+    history.replaceState(null, "", "/review");
+    pane.innerHTML = empty('All caught up') + '<a href="/make">Make clips</a>';
     return;
   }
-  reviewId = item.id;
-  const chooser = heading("Review", `${items.length} waiting for a decision`,
-    `<label class="review-choice">Clip <select id="review-select">
-       ${items.map((i) => `<option value="${escape(i.id)}" ${i.id === reviewId ? "selected" : ""}>${escape(i.original_title)}</option>`).join("")}
-     </select></label>`);
-  await itemPage(item.id, chooser);
+  const actionSignature = itemById(reviewId)?.actions.join(",");
+  if (pane.dataset.item === reviewId && !force &&
+      (pane.dataset.actions === actionSignature || pane.contains(document.activeElement) ||
+       pane.querySelector(".inline-editor") || videoPlaying())) return;
+  const requested = reviewId;
+  const sequence = ++reviewRequest;
+  try {
+    const next = await api("/api/items/" + encodeURIComponent(requested));
+    if (sequence !== reviewRequest || requested !== reviewId) return;
+    detail = next;
+    const current = next.item;
+    history.replaceState(null, "", reviewLink(requested));
+    pane.dataset.item = requested;
+    pane.dataset.actions = next.actions.join(",");
+    const player = (variant, label) => `<div class="video-card"><h3>${label}</h3>${next.media[variant]
+      ? `<video controls preload="metadata" aria-label="${label}" src="/media/${encodeURIComponent(requested)}/${variant}"></video>`
+      : empty("Preview unavailable")}</div>`;
+    pane.innerHTML = `<div class="video-grid">${player("a", "Variant A")}${player("b", "Variant B")}</div>
+      <div class="detail-actions review-actions">${["approve", "aonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption", "delete"]
+        .filter((action) => next.actions.includes(action))
+        .map((action) => {
+          const shortcut = Object.keys(keys).find((key) => keys[key] === action);
+          return button(action, requested, labels[action] + (shortcut ? " [" + shortcut.toUpperCase() + "]" : ""));
+        }).join("")}</div>
+      <section class="panel"><h2>${escape(current.original_title)}</h2><div class="hook-display">${escape(current.hook_text)}</div>
+      <p>${escape(current.voiceover_script)}</p>
+      ${next.review.reason ? `<p class="reason">${escape(next.review.reason)}</p>` : ""}
+      ${next.media.cut ? `<details><summary>Watch the cut</summary><video controls preload="none" src="/media/${encodeURIComponent(requested)}/cut"></video></details>` : ""}
+      <h3>Posting caption</h3><div class="caption-preview">${escape(next.caption)}</div></section>`;
+  } catch (error) {
+    if (sequence === reviewRequest) pane.textContent = error.message;
+  }
 }
 
-function library() {
-  const items = state.items.filter((i) => (!libraryStage || i.stage === libraryStage) &&
-    (!librarySearch || `${i.original_title} ${i.author_name} ${i.source} ${i.id}`.toLowerCase().includes(librarySearch.toLowerCase())));
-  content.innerHTML = heading("Library", `${items.length} matching items`) +
-    `<div class="toolbar"><input type="search" id="library-search" placeholder="Search clips or creators" aria-label="Search library" value="${escape(librarySearch)}">
-    <select id="library-stage" aria-label="Filter by stage"><option value="">Every stage</option>
-    ${state.stages.map((s) => `<option value="${s.stage}" ${s.stage === libraryStage ? "selected" : ""}>${pretty(s.stage)}</option>`).join("")}
-    </select></div><section class="panel">
-    <div class="toolbar"><button class="button danger" data-bulk="delete">Delete selected</button>
-    <button class="button secondary" data-bulk="reject">Reject selected</button><span id="selected-count">${selectedItems.size} selected</span></div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Select</th><th scope="col">Clip</th><th scope="col">Source</th><th scope="col">Stage</th></tr></thead>
-    <tbody>${items.map((i) => `<tr><td>${i.actions.some((a) => ["delete", "reject"].includes(a)) ?
-      `<input type="checkbox" data-select-item value="${escape(i.id)}" aria-label="Select ${escape(i.original_title)}" ${selectedItems.has(i.id) ? "checked" : ""}>` : ""}
-    </td><td><a class="library-clip" href="${itemLink(i.id)}"><img class="library-thumb" src="/media/${encodeURIComponent(i.id)}/thumb" alt="" loading="lazy" width="64" height="36">${escape(i.original_title)}</a></td><td>${escape(i.author_name)} · ${escape(i.source)}</td>
-    <td>${pill(pretty(i.stage))}</td></tr>`).join("")}</tbody></table></div></section>${commandsPanel()}`;
+document.addEventListener("click", (event) => {
+  const entry = event.target.closest("[data-review-item]");
+  if (!entry || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  reviewId = entry.dataset.reviewItem;
+  review(true);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.ctrlKey || event.metaKey || event.altKey || event.repeat ||
+      event.target.closest?.("input, textarea, select, [contenteditable], .inline-editor") || document.querySelector("dialog[open]")) return;
+  const key = event.key.toLowerCase();
+  if (key === "z" && lastUndo) { event.preventDefault(); lastUndo(); return; }
+  if (location.pathname !== "/review") return;
+  if (["j", "k", "arrowdown", "arrowup", "arrowright", "arrowleft"].includes(key)) {
+    event.preventDefault();
+    const items = inboxItems();
+    const index = items.findIndex((item) => item.id === reviewId);
+    const step = ["j", "arrowdown", "arrowright"].includes(key) ? 1 : -1;
+    if (items[index + step]) { reviewId = items[index + step].id; review(true); }
+  } else if (key === " " && !event.target.closest?.("button, a, video")) {
+    event.preventDefault();
+    const players = [...document.querySelectorAll("#review-selected .video-grid video")];
+    const play = players.every((player) => player.paused);
+    for (const player of players) play ? player.play().catch(() => {}) : player.pause();
+  } else if (key === "?") {
+    document.querySelector("#review-shortcuts")?.showModal();
+  } else if (keys[key]) {
+    const control = document.querySelector(`#review-selected [data-action="${keys[key]}"]`);
+    if (control && !control.disabled) { event.preventDefault(); control.click(); }
+  }
+});
+
+function updateLibraryFilter(field) {
+  const query = new URLSearchParams(location.search);
+  if (field.value) query.set(field.name, field.value);
+  else query.delete(field.name);
+  query.delete("page");
+  history.replaceState(null, "", "/library?" + query);
+  library();
 }
+
+function updateBulkBar() {
+  const bar = document.querySelector("#library-bulk");
+  bar.hidden = !selectedItems.size;
+  document.querySelector("#selected-count").textContent = selectedItems.size + " selected";
+  for (const button of bar.querySelectorAll("[data-bulk]")) {
+    button.disabled = ![...selectedItems].some((id) => itemById(id)?.actions.includes(button.dataset.bulk));
+  }
+}
+
+async function library() {
+  const query = new URLSearchParams(location.search);
+  const value = (name) => query.get(name) || "";
+  const platform = (item) => item.source_platform || item.source;
+  const select = (name, label, options) => `<label>${label}<select data-library-filter name="${name}">
+    ${options.map(([key, text]) => `<option value="${escape(key)}" ${key === value(name) ? "selected" : ""}>${escape(text)}</option>`).join("")}</select></label>`;
+  const choices = (values) => [...new Set(values.filter(Boolean))].sort().map((entry) => [entry, pretty(entry)]);
+  if (!document.querySelector("#library-results")) {
+    content.innerHTML = heading("Library", "") + `<div class="toolbar library-filters">
+      <label>Search<input type="search" data-library-filter name="q" value="${escape(value("q"))}"></label>
+      ${select("stage", "Stage", [["", "Any"], ...choices(state.stages.map((stage) => stage.stage))])}
+      ${select("platform", "Platform", [["", "Any"], ...choices(state.items.map(platform))])}
+      ${select("authenticity", "Source status", [["", "Any"], ["official", "Official"], ["unverified", "Unverified"]])}
+      ${select("signal", "Cut signal", [["", "Any"], ...choices(state.items.map((item) => item.cut_signal))])}
+      ${select("posted", "Posted", [["", "Any"], ["yes", "Posted"], ["no", "Unposted"]])}
+      <label>From<input type="date" data-library-filter name="from" value="${escape(value("from"))}"></label>
+      <label>To<input type="date" data-library-filter name="to" value="${escape(value("to"))}"></label>
+      ${select("size", "Per page", [["", "25"], ["50", "50"], ["100", "100"]])}</div>
+      <section class="panel" id="library-results"></section>
+      <div id="library-bulk" class="library-bulk" hidden><span id="selected-count"></span>
+      <button class="button secondary" data-bulk="reject">Reject</button>
+      <button class="button danger" data-bulk="delete">Delete</button>
+      <button class="button secondary" id="clear-selection">Clear</button></div>`;
+    document.querySelector("#clear-selection").onclick = () => { selectedItems.clear(); libraryAnchor = null; library(); };
+  }
+  const sequence = ++libraryRequest;
+  let result;
+  try {
+    result = await api("/api/library?" + query);
+  } catch (error) {
+    if (sequence === libraryRequest) toast(error.message);
+    return;
+  }
+  if (sequence !== libraryRequest) return;
+  const { page, pages, total } = result;
+  const items = result.ids.map(itemById).filter(Boolean);
+  const pageLink = (target) => {
+    const params = new URLSearchParams(query);
+    params.set("page", target);
+    return "/library?" + escape(params.toString());
+  };
+  document.querySelector("#library-results").innerHTML = `<div class="toolbar">
+      <span>${total} matching · Page ${page} of ${pages}</span>
+      ${page > 1 ? `<a data-library-page href="${pageLink(page - 1)}">Previous</a>` : ""}
+      ${page < pages ? `<a data-library-page href="${pageLink(page + 1)}">Next</a>` : ""}</div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Select</th><th scope="col">Clip</th><th scope="col">Source</th><th scope="col">Stage</th></tr></thead>
+    <tbody>${items.map((item) => `<tr><td>${item.actions.some((action) => ["delete", "reject"].includes(action)) ?
+      `<input type="checkbox" data-select-item value="${escape(item.id)}" aria-label="Select ${escape(item.original_title)}" ${selectedItems.has(item.id) ? "checked" : ""}>` : ""}
+    </td><td><a class="library-clip" href="${itemLink(item.id)}"><img class="library-thumb" src="/media/${encodeURIComponent(item.id)}/thumb" alt="" loading="lazy" width="64" height="36">${escape(item.original_title)}</a></td>
+    <td>${escape(item.author_name)} · ${escape(platform(item))}</td><td>${pill(pretty(item.stage))}</td></tr>`).join("")}</tbody></table></div>`;
+  updateBulkBar();
+}
+
+document.addEventListener("click", (event) => {
+  if (event.target.matches("[data-select-item]")) {
+    const rows = [...document.querySelectorAll("[data-select-item]")];
+    const item = event.target;
+    const index = rows.indexOf(item);
+    const anchor = rows.findIndex((row) => row.value === libraryAnchor);
+    const range = event.shiftKey && anchor >= 0 ? rows.slice(Math.min(anchor, index), Math.max(anchor, index) + 1) : [item];
+    for (const row of range) {
+      row.checked = item.checked;
+      if (item.checked) selectedItems.add(row.value);
+      else selectedItems.delete(row.value);
+    }
+    libraryAnchor = item.value;
+    updateBulkBar();
+  }
+  const link = event.target.closest("[data-library-page]");
+  if (link && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey) {
+    event.preventDefault();
+    history.replaceState(null, "", link.href);
+    library();
+  }
+});
 
 async function bulkAction(action) {
   const ids = [...selectedItems].filter((id) => itemById(id)?.actions.includes(action));
@@ -870,13 +1289,18 @@ async function bulkAction(action) {
 
 async function changeRunner(operation) {
   const stage = state.lock.stage || "starting";
-  if (operation === "force" && !window.confirm(`Interrupt the ${stage} stage immediately?`)) return;
+  const messages = { start: "Start the runner?", stop: "Stop the runner at the next safe boundary?", force: `Interrupt the ${stage} stage immediately?` };
+  if (!window.confirm(messages[operation])) return;
+  if (busyActions.has("runner")) return;
+  busyActions.add("runner");
   try {
     const result = await api("/api/runner", { operation, stage });
     toast(result.message);
     await refresh(true);
   } catch (error) {
     toast(error.message);
+  } finally {
+    busyActions.delete("runner");
   }
 }
 
@@ -902,6 +1326,10 @@ document.addEventListener("submit", async (event) => {
   if (event.target.id !== "settings-form") return;
   event.preventDefault();
   const form = event.target;
+  const submit = event.submitter;
+  if (submit.disabled || !window.confirm("Save these dashboard settings?")) return;
+  submit.disabled = true;
+  submit.classList.add("working");
   const slots = Object.fromEntries([...form.querySelectorAll("[data-profile]")].map((field) =>
     [field.dataset.profile, field.value.split(",").map((s) => s.trim())]));
   const values = { slots };
@@ -913,5 +1341,18 @@ document.addEventListener("submit", async (event) => {
     await refresh(true);
   } catch (error) {
     toast(error.message);
+  } finally {
+    submit.disabled = false;
+    submit.classList.remove("working");
   }
 });
+
+setInterval(async () => {
+  if (location.pathname !== "/make" || document.hidden || !document.querySelector("#make-progress")) return;
+  try {
+    state = await api("/api/state");
+    if (!document.querySelector("#make-progress").contains(document.activeElement)) make();
+  } catch (error) {
+    document.querySelector("#make-runner").textContent = error.message;
+  }
+}, 2500);
