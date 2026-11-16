@@ -4,6 +4,7 @@ import sqlite3
 import sys
 
 import pytest
+from chat_downloader.errors import NoChatReplay, RetriesExceeded
 
 from dashboard import commands, store
 from pipeline import config, db
@@ -89,6 +90,37 @@ def test_main_prints_real_db_row_and_exits_nonzero_on_change(tmp_path, monkeypat
         assert code == 1 and "FAIL" in lines[0]
     else:
         assert code == 0 and "PASS    unchanged (sha256 " in lines[0]
+
+
+def twitch_row(tmp_path, monkeypatch, error):
+    def chat_replay(url, duration, cfg):
+        raise error
+
+    monkeypatch.setattr(windows_smoke.engagement, "chat_replay", chat_replay)
+    smoke = windows_smoke.Smoke(tmp_path, tmp_path / "smoke-copy.db")
+    smoke.cfg = config.get_config()
+    smoke.check("Twitch replay chat", lambda: smoke.twitch("https://www.twitch.tv/videos/2929142069"))
+    return smoke.results["Twitch replay chat"]
+
+
+@pytest.mark.parametrize("error", [
+    RetriesExceeded("Maximum number of retries has been reached (2)."),
+    KeyError("data"),
+])
+def test_known_twitch_chat_library_break_is_a_skip(tmp_path, monkeypatch, error):
+    assert twitch_row(tmp_path, monkeypatch, error) == (
+        "SKIP", "chat-downloader cannot read Twitch VOD chat (external break)")
+
+
+@pytest.mark.parametrize("error", [
+    NoChatReplay("Video does not have a chat replay."),
+    KeyError("video"),
+    ValueError("Twitch VOD duration is unavailable."),
+    ConnectionError("network down"),
+])
+def test_other_twitch_errors_stay_failures(tmp_path, monkeypatch, error):
+    status, reason = twitch_row(tmp_path, monkeypatch, error)
+    assert status == "FAIL" and type(error).__name__ in reason
 
 
 def test_seeded_clip_lives_only_in_the_sandbox_copy_and_passes_real_controls(tmp_path):

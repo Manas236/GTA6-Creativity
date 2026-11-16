@@ -91,6 +91,17 @@ def download_row_ready(row):
     return row
 
 
+TWITCH_CHAT_BREAK = "chat-downloader cannot read Twitch VOD chat (external break)"
+
+
+def known_twitch_chat_break(exc):
+    """True only for the failure seen since Twitch's VOD comment API stopped returning 'data' to
+    chat-downloader: its RetriesExceeded, or the bare KeyError('data'). Anything else stays a FAIL."""
+    from chat_downloader.errors import RetriesExceeded
+
+    return isinstance(exc, RetriesExceeded) or (type(exc) is KeyError and exc.args == ("data",))
+
+
 SEED_ID = "smoke-approval-check"
 
 
@@ -425,7 +436,12 @@ class Smoke:
             raise Skip("No Twitch VOD URL was supplied.")
         platform, source_id, canonical = creation.source_from_url(url)
         require(platform == "twitch" and source_id.startswith("vod:"), "Provide a Twitch VOD URL.")
-        count, spikes = engagement.chat_replay(canonical, None, self.cfg)
+        try:
+            count, spikes = engagement.chat_replay(canonical, None, self.cfg)
+        except Exception as exc:
+            if known_twitch_chat_break(exc):
+                raise Skip(TWITCH_CHAT_BREAK) from exc
+            raise
         require(count > 0, "chat-downloader returned 0 timed messages and 0 spikes.")
         return f"chat-downloader fetched {count} timed messages; found {len(spikes)} spikes."
 
