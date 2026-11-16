@@ -151,6 +151,16 @@ def unstarted(posts):
     )
 
 
+def publishing_block_reason(posts):
+    if any(post["status"] == "publishing" for post in posts):
+        return "It is already publishing."
+    if any(post["status"] == "live" for post in posts):
+        return "It has already been published."
+    if any(post["status"] == "failed" for post in posts):
+        return "A previous publishing attempt failed."
+    return "Publishing has already started."
+
+
 def validate(action, item, posts, payload, path):
     if action not in ACTIONS:
         raise ControlError("Unknown action.")
@@ -181,6 +191,8 @@ def validate(action, item, posts, payload, path):
             "Preview-only or synthetic items cannot be controlled or approved."
         )
     if not unstarted(posts):
+        if action in ("position", "up", "down"):
+            raise ControlError(publishing_block_reason(posts))
         raise ControlError(
             "Publishing has started or failed. This item is display-only to prevent duplicate posts."
         )

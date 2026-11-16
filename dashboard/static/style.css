@@ -560,7 +560,7 @@ textarea {
 }
 .queue-card {
   display: grid;
-  grid-template-columns: 100px 1fr auto;
+  grid-template-columns: 144px minmax(0, 1fr) auto;
   gap: 20px;
   align-items: center;
   background: var(--panel);
@@ -570,7 +570,7 @@ textarea {
   margin-bottom: 10px;
 }
 .queue-time {
-  font-size: 22px;
+  font-size: 16px;
   letter-spacing: -0.5px;
   color: var(--pink);
 }
@@ -850,19 +850,46 @@ dialog label {
   font-size: 12px;
   margin: 12px 0;
 }
+/* The header reserves a notification lane outside every page's controls. */
+.topbar {
+  height: 80px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 530px) auto;
+  gap: 12px;
+}
 .toast {
-  position: fixed;
-  bottom: 24px;
-  right: 24px;
-  max-width: 480px;
-  padding: 17px 22px;
-  border-radius: 10px;
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.toast-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 24px;
+  max-height: 36px;
+  padding: 2px 8px;
   border: 1px solid #526854;
+  border-radius: 6px;
   background: #1c302b;
-  box-shadow: 0 12px 50px #0007;
   color: #d8f4e6;
-  font-size: 13px;
-  z-index: 20;
+  font-size: 12px;
+}
+.toast-error {
+  border-color: #a55762;
+  background: #47242b;
+  color: #ffd6d9;
+}
+.toast-message { overflow: auto; max-height: 30px; line-height: 15px; overflow-wrap: anywhere; }
+.toast-undo {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: inherit;
+  cursor: pointer;
 }
 .back-link {
   font-size: 11px;
@@ -998,8 +1025,11 @@ dialog label {
     margin: 0;
   }
   .topbar {
-    height: 48px;
+    min-height: 70px;
+    height: auto;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
+  .topbar .toast { grid-column: 1 / -1; grid-row: 2; }
   .grid-main,
   .grid-half {
     grid-template-columns: 1fr;
@@ -1106,9 +1136,7 @@ dialog label {
 #review-shortcuts dl { display: grid; grid-template-columns: 2em 1fr; gap: 6px; }
 #review-shortcuts dd { margin: 0; }
 .inline-editor textarea { width: 100%; }
-#toast { display: grid; gap: 8px; }
-#toast[hidden], #library-bulk[hidden] { display: none; }
-.toast-entry { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+#library-bulk[hidden] { display: none; }
 .working { position: relative; opacity: .7; }
 .working::after {
   content: "";
@@ -1123,7 +1151,8 @@ dialog label {
   animation: rotate-control .65s linear infinite;
 }
 @keyframes rotate-control { to { transform: rotate(360deg); } }
-#nav-runner { display: inline-block; width: 8px; height: 8px; background: #df8e91; border-radius: 50%; margin: 8px; }
+#nav-runner { display: inline-block; width: 8px; height: 8px; background: #df8e91; border-radius: 50%; flex-shrink: 0; }
+.runner-status { display: flex; align-items: center; gap: 8px; padding: 6px 8px; color: var(--muted); font-size: 12px; }
 #nav-runner[data-status="alive"] { background: #70d8b2; }
 .queue-card[draggable=true] { cursor: grab; }
 .queue-card.dragging { opacity: .5; }

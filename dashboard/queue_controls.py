@@ -79,7 +79,7 @@ def scheduled(path):
 
 def reposition(item_id, target_id, expected, cfg, path):
     """Reuse the allocated slots after validating every item and reservation."""
-    from .commands import ControlError, unstarted
+    from .commands import ControlError, publishing_block_reason, unstarted
 
     rows = scheduled(path)
     if rows != expected:
@@ -91,10 +91,14 @@ def reposition(item_id, target_id, expected, cfg, path):
     reserved = scheduler.reserved_times(path)
     for index in range(left, right + 1):
         previous = rows[index]
-        if not db.is_releasable(db.get_item(previous["id"], path)) or not unstarted(
-            posting.get_posts_for_item(previous["id"], path)
-        ):
-            raise ControlError("A clip in the affected positions can no longer be moved.")
+        item = db.get_item(previous["id"], path)
+        title = item.get("original_title") or previous["id"]
+        if not db.is_releasable(item):
+            raise ControlError(f"“{title}” is preview-only.")
+        posts = posting.get_posts_for_item(previous["id"], path)
+        if not unstarted(posts):
+            reason = publishing_block_reason(posts)
+            raise ControlError(f"“{title}” cannot move. {reason}")
         reserved.remove(clock.parse(previous["slot"]))
     for index in range(left, right + 1):
         slot = clock.parse(rows[index]["slot"])

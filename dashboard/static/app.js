@@ -4,7 +4,11 @@ let preferences, reviewId = new URLSearchParams(location.search).get("item"), jo
 const busyActions = new Set();
 const inboxPending = new Map();
 const waitingCommands = new Map();
-let lastUndo, inlineDecision, reviewRequest = 0;
+let inlineDecision, reviewRequest = 0;
+let undoQueue = Promise.resolve();
+const undoHistory = [];
+const notices = new Map();
+const actionVerbs = { position: "move", up: "move", down: "move", aonly: "approve", clip_url: "queue clip from URL", restore_approval: "restore approval for" };
 const quickActions = new Set(["approve", "aonly", "hookok", "up", "down", "unapprove", "pause", "resume", "edit_hook", "edit_caption", "make", "clip_url", "retry", "position"]);
 const inlineConfirm = new Set(["reject", "remake_cut", "remake_hook"]);
 const keys = { a: "approve", "1": "aonly", h: "hookok", r: "reject", e: "edit_hook", c: "edit_caption", m: "remake_cut", g: "remake_hook" };
@@ -30,7 +34,7 @@ const labels = {
   retry: "Retry stage",
   pause: "Pause all posting",
   resume: "Resume posting",
-  make: "Make N now",
+  make: "Make clips",
   clip_url: "Clip from URL",
   remake_cut: "Remake cut",
   remake_hook: "Regenerate hook",
@@ -79,6 +83,18 @@ const dayKey = (value) =>
         day: "2-digit",
       }).format(new Date(value))
     : "unscheduled";
+function queueTime(value) {
+  const current = dayKey(new Date().toISOString());
+  const next = new Date(current + "T12:00:00Z");
+  next.setUTCDate(next.getUTCDate() + 1);
+  const day = dayKey(value);
+  const label = day === current ? "Today" : day === next.toISOString().slice(0, 10) ? "Tomorrow" :
+    formatTime(value, { weekday: "short", hour: undefined, minute: undefined }).replace(",", "");
+  const time = new Intl.DateTimeFormat("en-GB", {
+    timeZone: state.timezone, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(new Date(value));
+  return label + " " + time;
+}
 function pill(text, tone = "") {
   return `<span class="pill ${tone}">${escape(text)}</span>`;
 }
@@ -252,7 +268,7 @@ function queue() {
       `<button class="button secondary" id="queue-view" aria-pressed="${queueCompact}">${queueCompact ? "Calendar" : "Compact list"}</button>`,
     ) +
     `<div class="toolbar"><input type="search" id="queue-search" aria-label="Search items" placeholder="Search clips, creators or item IDs" value="${escape(filters.queue)}"><select id="stage-filter" aria-label="Filter stage"><option value="all">Approved & queued</option>${state.stages.map((s) => `<option value="${s.stage}" ${filters.stage === s.stage ? "selected" : ""}>${pretty(s.stage)} (${s.count})</option>`).join("")}</select></div>
-  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "compact" ? "QUEUE ORDER" : day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card ${queueCompact ? "queue-compact" : ""}" data-queue-item="${escape(item.id)}" draggable="${item.actions.includes("up")}"><div class="queue-time">${posts[0] ? escape(formatTime(posts[0].slot_datetime, { day: undefined, month: undefined })) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${reviewLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.includes("post_now") ? button("post_now", item.id) : ""}
+  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "compact" ? "QUEUE ORDER" : day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card ${queueCompact ? "queue-compact" : ""}" data-queue-item="${escape(item.id)}" draggable="${item.actions.includes("up")}"><div class="queue-time">${posts[0] ? escape(queueTime(posts[0].slot_datetime)) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${reviewLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.includes("post_now") ? button("post_now", item.id) : ""}
       <details class="queue-menu"><summary class="button secondary" aria-label="More actions">…</summary>
       <div>${item.actions.filter((action) => ["unapprove", "up", "down"].includes(action)).map((action) => button(action, item.id)).join("")}
       <a href="${reviewLink(item.id)}">Open in Review</a></div></details></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
@@ -567,44 +583,93 @@ async function api(url, body) {
     throw new Error(data.error || `Request failed (${response.status}).`);
   return data;
 }
-function toast(message, inverse, original) {
+function toast(message, { error = false, group, inverse, command, title } = {}) {
+  const tone = error ? "error" : "success";
   const stack = document.querySelector("#toast");
-  const entry = document.createElement("div");
-  entry.className = "toast-entry";
-  entry.append(document.createTextNode(message));
-  stack.append(entry);
-  stack.hidden = false;
-  if (inverse) {
+  if (inverse) undoHistory.push({ inverse, command, title });
+
+  let notice = notices.get(tone);
+  if (!notice) {
+    const entry = document.createElement("div");
+    entry.className = "toast-entry toast-" + tone;
+    entry.setAttribute("role", error ? "alert" : "status");
+    const text = document.createElement("span");
+    text.className = "toast-message";
     const undo = document.createElement("button");
-    undo.textContent = "Undo";
-    undo.className = "button secondary";
-    const run = async () => {
-      if (!undo.isConnected) return;
-      undo.remove();
-      if (lastUndo === run) lastUndo = null;
-      if (original?.status === "pending") {
-        toast("Undo requested. Waiting for the first change to apply.");
-        try {
-          await waitForCommand(original.id);
-        } catch (error) {
-          toast(error.message);
-          return;
-        }
-      }
-      await runAction(...inverse);
+    undo.type = "button";
+    undo.className = "toast-undo";
+    undo.textContent = "Undo last";
+    undo.onclick = undoLast;
+    entry.append(text, undo);
+    stack.append(entry);
+    notice = { entry, text, undo, paused: false };
+    notice.dismiss = () => { entry.remove(); notices.delete(tone); };
+    notice.start = () => {
+      notice.started = performance.now();
+      notice.timer = setTimeout(notice.dismiss, notice.remaining);
     };
-    lastUndo = run;
-    undo.onclick = run;
-    entry.append(undo);
-    setTimeout(() => {
-      undo.remove();
-      if (lastUndo === run) lastUndo = null;
-    }, 6000);
+    const pause = () => {
+      if (notice.paused) return;
+      notice.paused = true;
+      clearTimeout(notice.timer);
+      notice.remaining = Math.max(0, notice.remaining - (performance.now() - notice.started));
+    };
+    const resume = () => {
+      if (!notice.paused || entry.matches(":hover, :focus-within")) return;
+      notice.paused = false;
+      notice.start();
+    };
+    entry.addEventListener("mouseenter", pause);
+    entry.addEventListener("mouseleave", resume);
+    entry.addEventListener("focusin", pause);
+    entry.addEventListener("focusout", () => queueMicrotask(resume));
+    notices.set(tone, notice);
   }
-  setTimeout(() => {
-    entry.remove();
-    stack.hidden = !stack.childElementCount;
-  }, 7000);
+  clearTimeout(notice.timer);
+  notice.count = group && group === notice.group ? notice.count + 1 : 1;
+  notice.group = group;
+  notice.text.textContent = notice.count > 1 ? `${notice.count} ${group}` : message;
+  notice.undo.hidden = error || !undoHistory.length;
+  notice.remaining = error ? 10000 : 6000;
+  if (!notice.paused) notice.start();
+}
+
+function actionError(action, title, reason) {
+  const verb = actionVerbs[action] || pretty(action);
+  return `Can’t ${verb}${title ? " “" + title + "”" : ""}: ${reason}`;
+}
+
+function undoLast() {
+  undoQueue = undoQueue.then(async () => {
+    const previous = undoHistory.pop();
+    if (!previous) return;
+    const { inverse, command, title } = previous;
+    try {
+      if (command?.status === "pending") await waitForCommand(command.id);
+      await runAction(inverse[0], inverse[1], inverse[2] || {}, null, null, null, true);
+    } catch (error) {
+      toast(actionError("undo", title, error.message), { error: true });
+    }
+  });
+}
+
+function commandNotice(action, command, title, payload = {}, inverse, warning) {
+  if (warning || ["refused", "failed"].includes(command.status)) {
+    toast(actionError(action, title, warning || command.result), { error: true });
+    return;
+  }
+  const pending = command.status === "pending";
+  const isApproval = ["approve", "aonly"].includes(action);
+  const group = isApproval ? (pending ? "approvals queued" : "approved") : undefined;
+  const count = payload.count;
+  const messages = {
+    make: `${count} ${count === 1 ? "clip" : "clips"} queued`,
+    clip_url: "Clip queued",
+    approve: pending ? "Approval queued" : "1 approved",
+    aonly: pending ? "Approval queued" : "1 approved",
+  };
+  toast(messages[action] || [title, command.result || "Change queued"].filter(Boolean).join(" · "),
+    { group, inverse, command, title });
 }
 
 async function waitForCommand(id) {
@@ -620,15 +685,15 @@ async function waitForCommand(id) {
 }
 
 function showCompletedControls() {
-  for (const [id, title] of waitingCommands) {
+  for (const [id, { title, action }] of waitingCommands) {
     const entry = state.commands.find((command) => command.id === id);
     if (!entry || ["pending", "running"].includes(entry.status)) continue;
     waitingCommands.delete(id);
-    toast(title + " · " + (entry.result || entry.status));
+    if (["refused", "failed"].includes(entry.status)) commandNotice(action, entry, title);
   }
 }
 
-async function runAction(action, id, payload = {}, trigger, inlineError, reverseEdit) {
+async function runAction(action, id, payload = {}, trigger, inlineError, reverseEdit, undoing = false) {
   const key = id || action;
   if (busyActions.has(key)) return false;
   busyActions.add(key);
@@ -636,7 +701,7 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
     trigger.disabled = true;
     trigger.classList.add("working");
   }
-  const title = itemById(id)?.original_title || labels[action] || "Queue";
+  const title = itemById(id)?.original_title || (action === "clip_url" ? payload.url : null);
   try {
     const plan = await api("/api/prepare", { action, item_id: id || null, payload });
     const { command, warning } = await api("/api/confirm", { ticket: plan.ticket });
@@ -648,8 +713,8 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
       position: ["position", id, { target: plan.payload.undo_target }],
       unapprove: ["restore_approval", id, { command_id: command.id }],
     }[action] || reverseEdit;
-    if (command.status === "pending" && !["make", "clip_url"].includes(action)) waitingCommands.set(command.id, title);
-    toast(title + " · " + (warning || command.result || "Queued"), inverse, command);
+    if (command.status === "pending") waitingCommands.set(command.id, { title, action });
+    commandNotice(action, command, title, payload, undoing ? null : inverse, warning);
     if (location.pathname === "/review" && id === reviewId &&
         ["approve", "aonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook"].includes(action)) {
       advanceReview(id, command.id);
@@ -659,7 +724,7 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
     return true;
   } catch (error) {
     if (inlineError) inlineError.innerHTML = resultMessage(error.message);
-    else toast(title + " · " + error.message);
+    toast(actionError(action, title, error.message), { error: true });
     return false;
   } finally {
     busyActions.delete(key);
@@ -777,13 +842,13 @@ async function testConnection(service, sendMessage = false) {
     const data = await api(sendMessage ? "/api/connections/send-telegram-test" : "/api/connections/test", sendMessage ? {} : { service });
     if (sendMessage) {
       const text = `${data.result.status}: ${data.result.reason}`;
-      toast(text);
+      toast(text, { error: data.result.status !== "ok" });
       connectionsBusy = false;
       connections();
       document.querySelector("#telegram-test-result").textContent = text;
     } else { connectionRows = data.connections; toast("Connection checks finished."); }
   } catch (error) {
-    toast(error.message);
+    toast(error.message, { error: true });
   } finally {
     connectionsBusy = false;
     if (!sendMessage) connections();
@@ -800,6 +865,14 @@ function refreshRecentControls() {
   else content.insertAdjacentHTML("beforeend", commandsPanel());
 }
 
+function updateRunnerLabel() {
+  const runnerDot = document.querySelector("#nav-runner");
+  const running = state.lock.status === "alive" && state.lock.kind !== "dashboard";
+  runnerDot.dataset.status = running ? "alive" : "stopped";
+  document.querySelector("#nav-runner-label").textContent = !running ? "Runner stopped" :
+    state.lock.kind === "make" ? "Make job running" : "Runner running";
+}
+
 async function refresh(manual = false) {
   try {
     state = await api("/api/state");
@@ -813,9 +886,7 @@ async function refresh(manual = false) {
     banner.classList.toggle("live", !state.dry_run);
     banner.innerHTML = `<span><strong>${state.dry_run ? "DRY RUN IS ON" : "LIVE POSTING IS ON"}</strong> &nbsp; ${state.dry_run ? "The runner simulates publishing." : "Approved clips can be published by the runner."}</span><span class="${state.demo ? "demo" : ""}">${state.demo ? "DEMO DATABASE · seeded example data" : state.config_changed ? "CONFIG CHANGED · applies next cycle" : state.runtime_known ? "RUNNER SETTINGS" : state.meta_paused ? "META POSTING PAUSED" : "CONFIG SETTINGS · runner not observed"}</span>`;
     document.querySelector("#nav-review").textContent = inboxItems().length;
-    const runnerDot = document.querySelector("#nav-runner");
-    runnerDot.dataset.status = state.lock.status;
-    runnerDot.setAttribute("aria-label", state.lock.status === "alive" ? "Runner active" : "Runner stopped");
+    updateRunnerLabel();
     document.querySelector("#nav-queued").textContent = state.items.filter(
       (i) => i.stage === "queued",
     ).length;
@@ -872,7 +943,7 @@ async function refresh(manual = false) {
       (({ overview, queue, analytics, failures, make, library })[page] || overview)();
   } catch (error) {
     document.querySelector("#refresh-status").textContent = "Update failed";
-    toast(error.message);
+    toast(error.message, { error: true });
   }
 }
 async function openAction(action, id, trigger) {
@@ -935,14 +1006,13 @@ document
       if (!confirmation) return;
       const result = await api("/api/confirm", { ticket: confirmation.ticket });
       dialog.close();
-      if (result.command.status === "pending") waitingCommands.set(result.command.id, confirmation.title);
+      if (result.command.status === "pending") waitingCommands.set(result.command.id, { title: confirmation.title, action: pendingAction.action });
       if (pendingAction.action === "delete" && result.command.status !== "refused" &&
           result.command.status !== "failed" && location.pathname === "/review") {
         advanceReview(pendingAction.item_id, result.command.id);
         await review();
       }
-      toast(confirmation.title + " · " + (result.warning || result.command.result ||
-        `Queued. Applies at the next runner boundary, typically within about ${state.interval}s.`));
+      commandNotice(pendingAction.action, result.command, confirmation.title, {}, null, result.warning);
       await refresh(true);
     } catch (error) {
       document.querySelector("#dialog-error").innerHTML = resultMessage(error.message);
@@ -1156,7 +1226,7 @@ document.addEventListener("keydown", (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey || event.repeat ||
       event.target.closest?.("input, textarea, select, [contenteditable], .inline-editor") || document.querySelector("dialog[open]")) return;
   const key = event.key.toLowerCase();
-  if (key === "z" && lastUndo) { event.preventDefault(); lastUndo(); return; }
+  if (key === "z" && undoHistory.length) { event.preventDefault(); undoLast(); return; }
   if (location.pathname !== "/review") return;
   if (["j", "k", "arrowdown", "arrowup", "arrowright", "arrowleft"].includes(key)) {
     event.preventDefault();
@@ -1270,7 +1340,7 @@ async function library() {
   try {
     result = await api("/api/library?" + query);
   } catch (error) {
-    if (sequence === libraryRequest) toast(error.message);
+    if (sequence === libraryRequest) toast(error.message, { error: true });
     return;
   }
   if (sequence !== libraryRequest) return;
@@ -1318,7 +1388,7 @@ document.addEventListener("click", (event) => {
 
 async function bulkAction(action) {
   const ids = [...selectedItems].filter((id) => itemById(id)?.actions.includes(action));
-  if (!ids.length) { toast("Select items eligible for that action."); return; }
+  if (!ids.length) { toast("Select items eligible for that action.", { error: true }); return; }
   const count = `${ids.length} ${ids.length === 1 ? "clip" : "clips"}`;
   const question = action === "delete"
     ? `Deletes the video files for ${count} for good. The ${ids.length === 1 ? "item stays" : "items stay"} in history so discovery never picks ${ids.length === 1 ? "this clip" : "these clips"} again. This can't be undone.`
@@ -1336,13 +1406,17 @@ async function bulkAction(action) {
       const { ticket } = await api("/api/prepare", { action, item_id });
       const { command } = await api("/api/confirm", { ticket });
       const status = commandState(command);
+      const title = itemById(item_id)?.original_title || item_id;
+      if (["refused", "failed"].includes(status)) commandNotice(action, command, title);
+      if (status === "queued") waitingCommands.set(command.id, { title, action });
       counts[status] = (counts[status] || 0) + 1;
       if (["applied", "queued"].includes(status)) selectedItems.delete(item_id);
-    } catch {
-      counts.refused = (counts.refused || 0) + 1;
+    } catch (error) {
+      toast(actionError(action, itemById(item_id)?.original_title || item_id, error.message), { error: true });
     }
   }
-  toast(Object.entries(counts).map(([status, n]) => `${n} ${status}`).join(" · "));
+  const successes = Object.entries(counts).filter(([status]) => ["applied", "queued"].includes(status));
+  if (successes.length) toast(successes.map(([status, n]) => `${n} ${status === "applied" ? (action === "delete" ? "deleted" : "rejected") : "queued"}`).join(" · "));
   await refresh(true);
 }
 
@@ -1357,7 +1431,7 @@ async function changeRunner(operation) {
     toast(result.message);
     await refresh(true);
   } catch (error) {
-    toast(error.message);
+    toast(error.message, { error: true });
   } finally {
     busyActions.delete("runner");
   }
@@ -1399,7 +1473,7 @@ document.addEventListener("submit", async (event) => {
     toast(result.message);
     await refresh(true);
   } catch (error) {
-    toast(error.message);
+    toast(error.message, { error: true });
   } finally {
     submit.disabled = false;
     submit.classList.remove("working");
@@ -1410,6 +1484,8 @@ setInterval(async () => {
   if (location.pathname !== "/make" || document.hidden || !document.querySelector("#make-progress")) return;
   try {
     state = await api("/api/state");
+    showCompletedControls();
+    updateRunnerLabel();
     if (!document.querySelector("#make-progress").contains(document.activeElement)) make();
   } catch (error) {
     document.querySelector("#make-runner").textContent = error.message;
