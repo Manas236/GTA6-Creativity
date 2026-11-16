@@ -652,10 +652,7 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
     toast(title + " · " + (warning || command.result || "Queued"), inverse, command);
     if (location.pathname === "/review" && id === reviewId &&
         ["approve", "aonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook"].includes(action)) {
-      const items = inboxItems();
-      const index = items.findIndex((item) => item.id === id);
-      reviewId = (items[index + 1] || items[index - 1])?.id;
-      inboxPending.set(id, command.id);
+      advanceReview(id, command.id);
       await review();
     }
     await refresh(true);
@@ -930,6 +927,12 @@ document
           ticket: confirmation.ticket,
         });
         dialog.close();
+        if (result.command.status === "pending") waitingCommands.set(result.command.id, confirmation.title);
+        if (pendingAction.action === "delete" && result.command.status !== "refused" &&
+            result.command.status !== "failed" && location.pathname === "/review") {
+          advanceReview(pendingAction.item_id, result.command.id);
+          await review();
+        }
         if (["make", "clip_url", "remake_cut", "remake_hook"].includes(result.command.action)) jobId = result.command.id;
         const word = ["make", "clip_url", "remake_cut", "remake_hook"].includes(result.command.action) &&
           state.lock.status !== "alive" ? "Worker starting. Follow progress on Make." :
@@ -1026,9 +1029,9 @@ function make() {
       runAction(action, null, payload, event.submitter, error);
     };
   }
-  document.querySelector("#make-runner").textContent = state.lock.status === "alive"
-    ? `Runs at the next discover boundary. The runner checks about every ${state.interval}s, plus time for the current cycle.`
-    : "A background worker will run this job.";
+  document.querySelector("#make-runner").textContent = state.lock.status === "alive" && state.lock.kind === "loop"
+    ? `Runs at the next discover boundary. Estimated wait: about ${state.interval}s, plus any remaining time in the current cycle.`
+    : "A background worker will run this job."
   updateMakeProgress();
 }
 
@@ -1064,6 +1067,13 @@ function inboxItems() {
     if (command && !["pending", "running"].includes(command.status)) inboxPending.delete(id);
   }
   return state.items.filter((item) => isReviewItem(item) && !inboxPending.has(item.id));
+}
+
+function advanceReview(id, commandId) {
+  const items = inboxItems();
+  const index = items.findIndex((item) => item.id === id);
+  reviewId = (items[index + 1] || items[index - 1])?.id;
+  inboxPending.set(id, commandId);
 }
 
 async function review(force = false) {
@@ -1165,6 +1175,7 @@ document.addEventListener("keydown", (event) => {
 
 function updateLibraryFilter(field) {
   const query = new URLSearchParams(location.search);
+  if (["from", "to"].includes(field.name)) document.querySelector("#library-range").value = "";
   if (field.value) query.set(field.name, field.value);
   else query.delete(field.name);
   query.delete("page");
@@ -1191,20 +1202,63 @@ async function library() {
   if (!document.querySelector("#library-results")) {
     content.innerHTML = heading("Library", "") + `<div class="toolbar library-filters">
       <label>Search<input type="search" data-library-filter name="q" value="${escape(value("q"))}"></label>
-      ${select("stage", "Stage", [["", "Any"], ...choices(state.stages.map((stage) => stage.stage))])}
-      ${select("platform", "Platform", [["", "Any"], ...choices(state.items.map(platform))])}
+      ${select("stage", "Stage", [["", "Any"], ...choices(["rejected", ...state.stages.map((stage) => stage.stage)])])}
+      ${select("platform", "Platform", [["", "Any"], ...choices(["twitch", "youtube", ...state.items.map(platform)])])}
       ${select("authenticity", "Source status", [["", "Any"], ["official", "Official"], ["unverified", "Unverified"]])}
       ${select("signal", "Cut signal", [["", "Any"], ...choices(state.items.map((item) => item.cut_signal))])}
       ${select("posted", "Posted", [["", "Any"], ["yes", "Posted"], ["no", "Unposted"]])}
+      <label>Date range<select id="library-range"><option value="">Custom dates</option>
+      <option value="last-week">Last week</option><option value="all">All dates</option></select></label>
       <label>From<input type="date" data-library-filter name="from" value="${escape(value("from"))}"></label>
       <label>To<input type="date" data-library-filter name="to" value="${escape(value("to"))}"></label>
       ${select("size", "Per page", [["", "25"], ["50", "50"], ["100", "100"]])}</div>
+      <div class="chips library-quick-filters" aria-label="Quick filters">
+      <button class="button secondary" data-library-chip="stage" data-value="rejected">Rejected</button>
+      <button class="button secondary" data-library-chip="platform" data-value="twitch">Twitch</button>
+      <button class="button secondary" data-library-chip="range" data-value="last-week">Last week</button></div>
       <section class="panel" id="library-results"></section>
       <div id="library-bulk" class="library-bulk" hidden><span id="selected-count"></span>
       <button class="button secondary" data-bulk="reject">Reject</button>
       <button class="button danger" data-bulk="delete">Delete</button>
       <button class="button secondary" id="clear-selection">Clear</button></div>`;
+    document.querySelector("#library-range").onchange = (event) => {
+      const range = event.target.value;
+      if (!range) return;
+      const params = new URLSearchParams(location.search);
+      const from = document.querySelector('[name="from"]');
+      const to = document.querySelector('[name="to"]');
+      if (range === "last-week") {
+        const end = new Date(dayKey(new Date().toISOString()) + "T12:00:00Z");
+        end.setUTCDate(end.getUTCDate() - (end.getUTCDay() || 7));
+        const start = new Date(end);
+        start.setUTCDate(start.getUTCDate() - 6);
+        from.value = start.toISOString().slice(0, 10);
+        to.value = end.toISOString().slice(0, 10);
+        params.set("from", from.value);
+        params.set("to", to.value);
+      } else {
+        from.value = to.value = "";
+        params.delete("from");
+        params.delete("to");
+      }
+      params.delete("page");
+      history.replaceState(null, "", "/library?" + params);
+      library();
+    };
+    for (const chip of document.querySelectorAll("[data-library-chip]")) {
+      chip.onclick = () => {
+        const name = chip.dataset.libraryChip;
+        const field = name === "range" ? document.querySelector("#library-range") : document.querySelector(`[name="${name}"]`);
+        field.value = chip.getAttribute("aria-pressed") === "true" ? (name === "range" ? "all" : "") : chip.dataset.value;
+        field.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+    }
     document.querySelector("#clear-selection").onclick = () => { selectedItems.clear(); libraryAnchor = null; library(); };
+  }
+  for (const chip of document.querySelectorAll("[data-library-chip]")) {
+    const name = chip.dataset.libraryChip;
+    const value = name === "range" ? document.querySelector("#library-range").value : query.get(name);
+    chip.setAttribute("aria-pressed", String(value === chip.dataset.value));
   }
   const sequence = ++libraryRequest;
   let result;

@@ -43,6 +43,7 @@ def lock_status(path, cfg):
             "remote": lock.get("host") != socket.gethostname(),
             "started_at": lock.get("started_at", 0),
             "token": lock.get("token"),
+            "kind": lock.get("kind"),
         }
     except (KeyError, ValueError, TypeError):
         return {"status": "stale", "age": None, "host": None}

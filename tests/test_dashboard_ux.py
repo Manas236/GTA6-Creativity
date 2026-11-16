@@ -103,3 +103,18 @@ def test_library_filtered_pages_and_manual_platform(local, tmp_db):
     assert one["total"] == 27 and one["pages"] == 2 and len(one["ids"]) == 25
     assert two["ids"] == ["manual-25", "manual-26"]
     assert client.get("/api/library" + filters + "&size=50", base_url=BASE).json["pages"] == 1
+
+
+def test_another_make_worker_is_started_for_jobs_queued_during_a_one_shot_make(local, tmp_db, monkeypatch):
+    from dashboard import workers
+
+    started = []
+    monkeypatch.setattr(workers, "spawn", lambda *args: started.append(args))
+    assert runner.acquire_lock(tmp_db, kind="make")
+    try:
+        _, command_id = confirmed(local, "make", payload={"count": 2})
+        assert result(tmp_db, command_id)["status"] == "pending"
+        assert len(started) == 1
+        assert started[0][2:] == ("make", "--job", command_id)
+    finally:
+        runner.release_lock(tmp_db)

@@ -181,6 +181,8 @@ def build_demo(path, media=True):
                 path,
             )
             age = rng.randint(1, 22)
+            if stage in ("rendered", "awaiting_approval"):
+                age = 0
             if stage == "rejected" and source == "twitch":
                 age = now.weekday() + 3
             created = clock.iso(now - timedelta(days=age))

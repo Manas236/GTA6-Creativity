@@ -1158,3 +1158,5 @@ dialog label {
   .review-layout { grid-template-columns: 1fr; }
   #review-inbox { position: static; max-height: 200px; }
 }
+.library-quick-filters { margin: 8px 0 12px; }
+.library-quick-filters [aria-pressed=true] { border-color: #f49abb; color: #f49abb; }

@@ -224,7 +224,7 @@ def create_app(db_path=None, cfg=None, media_root=None):
         if not seen and result["status"] in ("pending", "applied"):
             try:
                 active = runner.active_lock(path, runner._lock_settings(effective)[0])
-                if action in creation.ACTIONS and (not active or active.get("kind") == "dashboard"):
+                if action in creation.ACTIONS and (not active or active.get("kind") in ("dashboard", "make")):
                     workers.spawn(path, root, "make", "--job", command_id)
                 if action == "post_now" and not active:
                     workers.control("start", path, effective, root)
