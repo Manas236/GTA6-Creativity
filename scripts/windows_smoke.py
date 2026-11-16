@@ -5,6 +5,7 @@ from contextlib import closing
 import ctypes
 from ctypes import wintypes
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,67 @@ def copy_database(original, target, sandbox, cfg):
     with closing(sqlite3.connect(original.resolve().as_uri() + "?mode=ro", uri=True)) as source:
         with closing(sqlite3.connect(target)) as destination:
             source.backup(destination, pages=256)
+
+
+def database_fingerprint(path):
+    """sha256 of the DB file and its -wal when present. -shm is SQLite's shared-memory index, not data."""
+    path = Path(path)
+    hashes = {}
+    for candidate in (path, path.with_name(path.name + "-wal")):
+        if candidate.is_file():
+            with candidate.open("rb") as stream:
+                hashes[candidate.name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    return hashes
+
+
+def database_check(path, before, after):
+    """The summary row proving the source DB was not modified by the smoke run."""
+    name = Path(path).name
+    if name not in before:
+        return "FAIL", f"{name} was not found before the run."
+    if before != after:
+        changed = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+        return "FAIL", (f"changed: {', '.join(changed)} "
+                        f"(sha256 {before[name][:12]} -> {after.get(name, 'missing')[:12]})")
+    return "PASS", f"unchanged (sha256 {before[name][:12]})"
+
+
+def download_row_ready(row):
+    """The finished download row, None while yt-dlp is still running, or an error for any other status."""
+    if row is None or row["status"] == "start":
+        return None
+    require(row["status"] == "success", row["message"])
+    return row
+
+
+SEED_ID = "smoke-approval-check"
+
+
+def seed_approved_item(sandbox, path):
+    """Add one placeholder approved clip to the sandbox copy so approve/unapprove run for real."""
+    require(path.name == "smoke-copy.db" and not path.is_symlink()
+            and path.resolve().parent == Path(sandbox).resolve(),
+            "Refusing to seed anything outside the sandbox copy.")
+    folder = Path(sandbox) / "media" / "smoke-seed"
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = {}
+    for key in ("download_path", "cut_path", "voiceover_audio_path", "render_a_path", "render_b_path"):
+        placeholder = folder / f"{key}.mp4"
+        placeholder.write_bytes(b"smoke placeholder")
+        paths[key] = str(placeholder)
+    db.insert_discovered_item({
+        "id": SEED_ID, "source": "youtube", "source_id": SEED_ID,
+        "source_url": "https://example.invalid/smoke-approval-check",
+        "author_name": "Smoke test", "original_title": "Smoke approval check", "raw_velocity": 0,
+    }, path)
+    script = "Smoke test approval check"
+    fields = {**paths, "cut_start": 0.0, "cut_end": 10.0, "cut_duration": 10.0, "hook_text": "SMOKE TEST?",
+              "voiceover_script": script, "hook_style": "question", "hook_grounded": 1}
+    item = {"id": SEED_ID, **fields}
+    fields["hook_binding"] = binding.hook_record(item, fields["hook_text"], script, script, "segment_check")
+    fields["voiceover_binding"] = binding.voiceover_record(item, script, paths["voiceover_audio_path"])
+    db.transition_stage(SEED_ID, "approved", {**fields, "approval_type": "approved"}, path)
+    return SEED_ID
 
 
 def wait_for(check, seconds, reason, progress=None):
@@ -268,6 +330,13 @@ class Smoke:
                  120, f"Lock not released or a started worker still exists (PIDs {pids}).")
         return f"Lock released and all started runner PIDs are gone: {pids}."
 
+    def apply_quick(self, action, item_id):
+        result = self.submit(action, item_id)
+        expected = "awaiting_approval" if action == "unapprove" else "approved"
+        require(result["status"] == "applied" and db.get_item(item_id, self.path)["stage"] == expected,
+                f"{action} did not apply synchronously: {result['status']}.")
+        require(not db.kv_get(runner.LOCK_KEY, db_path=self.path), "Quick action left its lock behind.")
+
     def quick_control(self):
         state = self.api("state")
         for action in ("unapprove", "approve"):
@@ -278,13 +347,14 @@ class Smoke:
                     commands.prepare(action, item["id"], {}, self.path, self.cfg)
                 except (commands.ControlError, binding.CaptionMismatchError):
                     continue
-                result = self.submit(action, item["id"])
-                expected = {"awaiting_approval"} if action == "unapprove" else {"approved"}
-                require(result["status"] == "applied" and db.get_item(item["id"], self.path)["stage"] in expected,
-                        f"{action} did not apply synchronously: {result['status']}.")
-                require(not db.kv_get(runner.LOCK_KEY, db_path=self.path), "Quick action left its lock behind.")
+                self.apply_quick(action, item["id"])
                 return f"{action} applied to {item['id']} during the API request and released its lock."
-        raise Skip("No suitable clip is available for unapprove or approve.")
+        # No real clip qualifies: exercise both controls on a placeholder in the temp copy only.
+        item_id = seed_approved_item(self.sandbox, self.path)
+        for action in ("unapprove", "approve"):
+            self.apply_quick(action, item_id)
+        return (f"Seeded {item_id} in the temp copy; unapprove then approve applied during "
+                "the API request and released the lock.")
 
     def make_logs(self):
         log = self.sandbox / "media" / "logs" / "dashboard-make.log"
@@ -327,14 +397,15 @@ class Smoke:
         job_id = self.submit("clip_url", url=url)["id"]
 
         def downloaded():
+            # Read the job first so a job that ends between the two queries still shows its final row.
+            status, result = self.job_status(job_id)
             with db.db(self.path) as connection:
                 row = connection.execute(
                     "SELECT items.heatmap, stage_log.status, stage_log.message FROM items "
                     "JOIN stage_log ON stage_log.item_id=items.id WHERE items.creation_job=? "
                     "AND stage_log.stage='download' ORDER BY stage_log.id DESC LIMIT 1", (job_id,)
                 ).fetchone()
-            if row:
-                require(row["status"] == "success", row["message"])
+            if download_row_ready(row):
                 return row
             with db.db(self.path) as connection:
                 item = connection.execute(
@@ -342,7 +413,6 @@ class Smoke:
                 ).fetchone()
             if item and item["stage"] == "failed" and item["error_stage"] == "download":
                 raise RuntimeError(item["error_message"])
-            status, result = self.job_status(job_id)
             require(status in ("pending", "running"), f"Clip from URL ended before download: {status}: {result}")
 
         row = wait_for(downloaded, 900, "Clip from URL did not finish downloading within 15 minutes.")
@@ -427,6 +497,7 @@ def main():
     args = parser.parse_args()
     result = {}
     problem = None
+    before = database_fingerprint(args.database)
     with tempfile.TemporaryDirectory(prefix="gta6-smoke-") as folder:
         sandbox = Path(folder).resolve()
         try:
@@ -440,10 +511,13 @@ def main():
                 log = sandbox / name
                 if log.is_file():
                     print(f"{name}:\n" + "\n".join(log.read_text(errors="replace").splitlines()[-8:]))
+    # After cleanup: the sandbox is deleted and the kill-on-close job has ended every process it owned.
+    db_status, db_reason = database_check(args.database, before, database_fingerprint(args.database))
     rows = ["Check                  Result  Reason", "-" * 72]
     for name in CHECKS:
         status, reason = result.get(name, ("SKIP", "Blocked by an earlier check."))
         rows.append(f"{name:<23}{status:<8}{reason}")
+    rows.append(f"{'Real DB':<23}{db_status:<8}{db_reason}")
     if problem:
         rows.append(f"Harness                 FAIL    {problem}")
     report = PROJECT / "media" / "smoke" / f"windows_smoke_{datetime.now():%Y%m%d_%H%M%S_%f}.txt"
@@ -451,7 +525,7 @@ def main():
     summary = "\n".join(rows) + "\n"
     report.write_text(summary, encoding="utf-8")
     print(f"\n{summary}Report: {report}", flush=True)
-    return int(bool(problem) or any(status == "FAIL" for status, _ in result.values()))
+    return int(bool(problem) or db_status == "FAIL" or any(status == "FAIL" for status, _ in result.values()))
 
 
 if __name__ == "__main__":
