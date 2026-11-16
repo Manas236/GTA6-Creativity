@@ -38,9 +38,9 @@ def _plan(preset="P3", duration=12.0, words=None, **kw):
 
 # ============================================================ presets and flags
 
-def test_presets_are_nested_and_default_is_p0():
+def test_presets_are_nested_and_default_is_p2():
     flags = {p: style.resolve_preset(p) for p in ("P0", "P1", "P2", "P3")}
-    assert style.default_preset() == "P0", "the pipeline default preset must stay P0"
+    assert style.default_preset() == "P2", "the pipeline default preset is P2 (owner decision 16 Nov 2026); change only on a new decision"
     # P0 is the control: current renders + F1 only.
     assert [f for f, on in flags["P0"].items() if on] == ["zoom_fill"]
     for lo, hi in (("P0", "P1"), ("P1", "P2"), ("P2", "P3")):

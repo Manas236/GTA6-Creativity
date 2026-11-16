@@ -74,7 +74,7 @@ buffer:
 cut:
   target_duration: 20.0
   min_duration: 18.0
-  max_duration: 22.0
+  max_duration: 30.0 # owner 16 Nov: let the speaker finish; up to +10 s over target is fine. The end still lands on the clean break nearest target_duration.
   short_clip_threshold: 30.0
   scene_threshold: 0.3
   audio_weight: 0.75
@@ -83,7 +83,7 @@ cut:
   min_scene_change_density: 0.05 # Minimum scene cut density to reject static videos
   # A cut may only END after a completed sentence (pipeline/endings.py). The cut stage
   # transcribes each candidate window (faster-whisper, same model as hooks) plus a tail;
-  # a window whose 18-22 s end range has no sentence break is skipped for the next-best
+  # a window whose 18-30 s end range has no sentence break is skipped for the next-best
   # window, and an item with none fails at cut with `no_clean_ending`.
   ending:
     punct_gap_s: 0.15 # a word ending in . ? ! followed by this much silence ends a sentence
@@ -307,7 +307,7 @@ render:
 #   A1 sfx | A2 music_bed | A3 dead_air | A4 loop_end
 # ======================================================================================
 style:
-  preset: "P0" # pipeline default; do not change without a decision
+  preset: "P2" # owner 16 Nov: P2 Punchy, the preset of the 11 Nov previews he approved
   presets:
     P0: # Control: the CP2 renders plus zoom-to-fill framing
       base: null
@@ -467,7 +467,7 @@ approval:
     require_both_renders: true
     require_ffprobe_pass: true
     require_grounded_hook: true
-    max_duration_seconds: 22.0 # applies to Variant A (the cut-length render)
+    max_duration_seconds: 30.0 # applies to Variant A (the cut-length render)
     # Variant B is a freeze-frame plus the cut, so it is longer by design (PLAN.md section 7).
     # It is checked against this much headroom over A instead of max_duration_seconds.
     max_b_extra_seconds: 8.0
