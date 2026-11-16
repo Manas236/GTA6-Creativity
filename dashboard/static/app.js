@@ -676,6 +676,10 @@ function triggerAction(node) {
     openInlineEditor(action, id);
     return;
   }
+  if (action === "reslot") {
+    openInlineReslot(node, id);
+    return;
+  }
   if (inlineConfirm.has(action)) {
     if (inlineDecision === node) {
       inlineDecision = null;
@@ -695,6 +699,30 @@ function triggerAction(node) {
     return;
   }
   runAction(action, id, {}, node);
+}
+
+function openInlineReslot(trigger, id) {
+  if (document.querySelector("#inline-reslot")) return;
+  const form = document.createElement("form");
+  form.id = "inline-reslot";
+  form.className = "inline-editor";
+  form.innerHTML = `<label>Find a free slot after (UTC)<input type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}"></label>
+    <button class="button primary">Move to next free slot</button>
+    <button class="button secondary" type="button">Cancel</button><p role="status"></p>`;
+  trigger.closest(".detail-actions").after(form);
+  const field = form.querySelector("input");
+  const cancel = () => { form.remove(); trigger.focus({ preventScroll: true }); };
+  form.querySelector('[type="button"]').onclick = cancel;
+  form.onkeydown = (event) => { if (event.key === "Escape") cancel(); };
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const after = new Date(field.value + "Z").toISOString();
+    if (await runAction("reslot", id, { after }, event.submitter, form.querySelector("p"))) {
+      cancel();
+      await itemPage(id);
+    }
+  };
+  field.focus();
 }
 
 function openInlineEditor(action, id) {
@@ -860,15 +888,12 @@ async function openAction(action, id, trigger) {
   const error = document.querySelector("#dialog-error");
   const submit = document.querySelector("#submit-action");
   error.textContent = "";
-  fields.hidden = action !== "reslot";
-  fields.innerHTML = action === "reslot"
-    ? `<label for="slot-after">Find a free slot after (UTC)</label><input id="slot-after" type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}">`
-    : "";
+  fields.hidden = true;
+  fields.replaceChildren();
   summary.hidden = true;
-  submit.disabled = action !== "reslot";
-  submit.textContent = action === "reslot" ? "Review change" : "Confirm";
+  submit.disabled = true;
+  submit.textContent = "Confirm";
   dialog.showModal();
-  if (action === "reslot") return;
   const request = pendingAction;
   trigger.classList.add("working");
   try {
@@ -907,39 +932,18 @@ document
     const submit = document.querySelector("#submit-action");
     submit.disabled = true;
     try {
-      if (!confirmation) {
-        const payload = {
-          after: new Date(document.querySelector("#slot-after").value + "Z").toISOString(),
-        };
-        confirmation = await api("/api/prepare", { ...pendingAction, payload });
-        document.querySelector("#action-fields").hidden = true;
-        document.querySelector("#dialog-error").textContent = "";
-        const node = document.querySelector("#confirm-content");
-        node.hidden = false;
-        const target = ["make", "clip_url"].includes(pendingAction.action)
-          ? "" : `<p class="muted">Confirm this change to ${escape(confirmation.title)}?</p>`;
-        node.innerHTML = `<p><strong>${escape(confirmation.description)}</strong></p>${payload.hook_text ? `<p>“${escape(payload.hook_text)}”</p>` : ""}<p class="muted">${state.lock.status === "alive" ? `Queued changes typically apply within about ${state.interval}s. Active stages can take longer.` : "This starts as soon as you confirm."}</p>${target}`;
-        document.querySelector("#dialog-title").textContent =
-          "Confirm your change";
-        submit.textContent = pendingAction.action === "post_now" && state.lock.status !== "alive" ? "Start runner and post" : "Confirm";
-      } else {
-        const result = await api("/api/confirm", {
-          ticket: confirmation.ticket,
-        });
-        dialog.close();
-        if (result.command.status === "pending") waitingCommands.set(result.command.id, confirmation.title);
-        if (pendingAction.action === "delete" && result.command.status !== "refused" &&
-            result.command.status !== "failed" && location.pathname === "/review") {
-          advanceReview(pendingAction.item_id, result.command.id);
-          await review();
-        }
-        if (["make", "clip_url", "remake_cut", "remake_hook"].includes(result.command.action)) jobId = result.command.id;
-        const word = ["make", "clip_url", "remake_cut", "remake_hook"].includes(result.command.action) &&
-          state.lock.status !== "alive" ? "Worker starting. Follow progress on Make." :
-          `Queued. Applies within about ${state.interval}s when the runner reaches the boundary.`;
-        toast(result.warning || result.command.result || word);
-        await refresh(true);
+      if (!confirmation) return;
+      const result = await api("/api/confirm", { ticket: confirmation.ticket });
+      dialog.close();
+      if (result.command.status === "pending") waitingCommands.set(result.command.id, confirmation.title);
+      if (pendingAction.action === "delete" && result.command.status !== "refused" &&
+          result.command.status !== "failed" && location.pathname === "/review") {
+        advanceReview(pendingAction.item_id, result.command.id);
+        await review();
       }
+      toast(confirmation.title + " · " + (result.warning || result.command.result ||
+        `Queued. Applies at the next runner boundary, typically within about ${state.interval}s.`));
+      await refresh(true);
     } catch (error) {
       document.querySelector("#dialog-error").innerHTML = resultMessage(error.message);
     } finally {
@@ -1160,7 +1164,7 @@ document.addEventListener("keydown", (event) => {
     const index = items.findIndex((item) => item.id === reviewId);
     const step = ["j", "arrowdown", "arrowright"].includes(key) ? 1 : -1;
     if (items[index + step]) { reviewId = items[index + step].id; review(true); }
-  } else if (key === " " && !event.target.closest?.("button, a, video")) {
+  } else if (key === " " && !event.target.closest?.("button, a")) {
     event.preventDefault();
     const players = [...document.querySelectorAll("#review-selected .video-grid video")];
     const play = players.every((player) => player.paused);
