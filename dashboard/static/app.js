@@ -8,10 +8,10 @@ let inlineDecision, reviewRequest = 0;
 let undoQueue = Promise.resolve();
 const undoHistory = [];
 const notices = new Map();
-const actionVerbs = { position: "move", up: "move", down: "move", aonly: "approve", clip_url: "queue clip from URL", restore_approval: "restore approval for" };
-const quickActions = new Set(["approve", "aonly", "hookok", "up", "down", "unapprove", "pause", "resume", "edit_hook", "edit_caption", "make", "clip_url", "retry", "position"]);
+const actionVerbs = { position: "move", up: "move", down: "move", aonly: "approve", bonly: "approve", clip_url: "queue clip from URL", restore_approval: "restore approval for" };
+const quickActions = new Set(["approve", "aonly", "bonly", "hookok", "up", "down", "unapprove", "pause", "resume", "edit_hook", "edit_caption", "make", "clip_url", "retry", "position"]);
 const inlineConfirm = new Set(["reject", "remake_cut", "remake_hook"]);
-const keys = { a: "approve", "1": "aonly", h: "hookok", r: "reject", e: "edit_hook", c: "edit_caption", m: "remake_cut", g: "remake_hook" };
+const keys = { a: "approve", "1": "aonly", "2": "bonly", h: "hookok", r: "reject", e: "edit_hook", c: "edit_caption", m: "remake_cut", g: "remake_hook" };
 const reviewLink = (id) => "/review?item=" + encodeURIComponent(id);
 let libraryAnchor, libraryRequest = 0, draggedItem, queueCompact = false;
 const selectedItems = new Set();
@@ -27,6 +27,7 @@ const colors = {
 const labels = {
   approve: "Approve both variants",
   aonly: "Approve A only",
+  bonly: "Approve B only",
   reject: "Reject item",
   hookok: "Hook is right",
   edit_hook: "Edit hook",
@@ -412,7 +413,7 @@ async function itemPage(id = decodeURIComponent(location.pathname.split("/")[2])
     `<div class="grid-main"><section class="panel">${panelHead("Render comparison", renderHelp)}
  <div class="video-grid">${video("a", "Captions only")}${video("b", "Voiceover + clip")}</div>
  <div class="detail-actions">${detail.actions
-   .filter((a) => ["approve", "aonly", "reject", "hookok"].includes(a))
+   .filter((a) => ["approve", "aonly", "bonly", "reject", "hookok"].includes(a))
    .map((a) =>
      button(
        a,
@@ -433,7 +434,7 @@ async function itemPage(id = decodeURIComponent(location.pathname.split("/")[2])
    .join("")}
  <div class="label-value"><div class="eyebrow">CUT SIGNAL</div><p>${escape(pretty(i.cut_signal))}</p></div>
  <div class="detail-actions">${detail.actions
-   .filter((a) => !["approve", "aonly", "reject", "hookok"].includes(a) && a !== "edit_caption")
+   .filter((a) => !["approve", "aonly", "bonly", "reject", "hookok"].includes(a) && a !== "edit_caption")
    .map((a) => button(a, i.id))
    .join("")}</div></section></div>
  <section class="panel commands">${panelHead("Posting caption", "Creator credit and disclosure are appended when an override is saved.")}
@@ -659,7 +660,7 @@ function commandNotice(action, command, title, payload = {}, inverse, warning) {
     return;
   }
   const pending = command.status === "pending";
-  const isApproval = ["approve", "aonly"].includes(action);
+  const isApproval = ["approve", "aonly", "bonly"].includes(action);
   const group = isApproval ? (pending ? "approvals queued" : "approved") : undefined;
   const count = payload.count;
   const messages = {
@@ -667,6 +668,7 @@ function commandNotice(action, command, title, payload = {}, inverse, warning) {
     clip_url: "Clip queued",
     approve: pending ? "Approval queued" : "1 approved",
     aonly: pending ? "Approval queued" : "1 approved",
+    bonly: pending ? "Approval queued" : "1 approved",
   };
   toast(messages[action] || [title, command.result || "Change queued"].filter(Boolean).join(" · "),
     { group, inverse, command, title });
@@ -708,7 +710,7 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
     if (["refused", "failed"].includes(command.status)) throw new Error(warning || command.result);
     if (["make", "clip_url", "remake_cut", "remake_hook"].includes(action)) jobId = command.id;
     const inverse = {
-      approve: ["unapprove", id], aonly: ["unapprove", id],
+      approve: ["unapprove", id], aonly: ["unapprove", id], bonly: ["unapprove", id],
       pause: ["resume"], resume: ["pause"], up: ["down", id], down: ["up", id],
       position: ["position", id, { target: plan.payload.undo_target }],
       unapprove: ["restore_approval", id, { command_id: command.id }],
@@ -716,7 +718,7 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
     if (command.status === "pending") waitingCommands.set(command.id, { title, action });
     commandNotice(action, command, title, payload, undoing ? null : inverse, warning);
     if (location.pathname === "/review" && id === reviewId &&
-        ["approve", "aonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook"].includes(action)) {
+        ["approve", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook"].includes(action)) {
       advanceReview(id, command.id);
       await review();
     }
@@ -1199,7 +1201,7 @@ async function review(force = false) {
       ? `<video controls preload="metadata" aria-label="${label}" src="/media/${encodeURIComponent(requested)}/${variant}"></video>`
       : empty("Preview unavailable")}</div>`;
     pane.innerHTML = `<div class="video-grid">${player("a", "Variant A")}${player("b", "Variant B")}</div>
-      <div class="detail-actions review-actions">${["approve", "aonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption", "delete"]
+      <div class="detail-actions review-actions">${["approve", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption", "delete"]
         .filter((action) => next.actions.includes(action))
         .map((action) => {
           const shortcut = Object.keys(keys).find((key) => keys[key] === action);

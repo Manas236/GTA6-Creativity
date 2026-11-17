@@ -19,7 +19,7 @@ LEARNING
   so a 72h number never competes with a 24h one) before the platforms are averaged per item; that
   keeps Instagram's larger raw numbers from drowning Facebook. Dimensions: variant, hook_style,
   source, authenticity (official vs unverified) and style_preset. ab_excluded items ("Approve A
-  only") are left out of the variant dimension only.
+  only" / "Approve B only") are left out of the variant dimension only.
 
 All requests go through posting.MetaClient (pacing, retries, the shared 429 pause) and are GETs,
 so they are allowed in a dry run - but a dry run has no live posts, so nothing is fetched.
@@ -308,7 +308,7 @@ def rebuild_ab_learning(cfg: dict[str, Any] | None = None, db_path: Any = None) 
     for entry in items.values():
         for dim in DIMENSIONS:
             if dim == "variant" and entry["ab_excluded"]:
-                continue   # "Approve A only" was not a fair A/B draw: out of the variant comparison only
+                continue   # "Approve A/B only" was not a fair A/B draw: out of the variant comparison only
             table[dim][str(entry[dim] or "unknown")].append(entry["score"])
 
     out: dict[str, dict[str, dict[str, float]]] = {}

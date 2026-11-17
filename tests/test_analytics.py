@@ -289,6 +289,29 @@ def test_all_five_dimensions_are_built_and_ab_excluded_is_left_out_of_variant_on
     assert out["variant"]["B"]["n"] == 2
 
 
+def test_approve_b_only_is_left_out_of_the_variant_comparison_like_a_only(tmp_db, cfg, fake_clock):
+    specs = [
+        ("i1", "A", "question", "P0", 0, 100),
+        ("i2", "B", "curiosity", "P1", 0, 200),
+        ("i3", "B", "curiosity", "P1", 1, 300),     # "Approve B only"
+        ("i4", "A", "hype_analysis", "P2", 1, 400),  # "Approve A only"
+    ]
+    for item_id, variant, hook, preset, excluded, views in specs:
+        ids = live_post(tmp_db, item_id, "2026-11-19T07:30:00Z", variant=variant, hook_style=hook,
+                        preset=preset, ab_excluded=excluded, platforms=("instagram",))
+        snapshot(tmp_db, ids["instagram"], 24, views)
+
+    out = analytics.rebuild_ab_learning(cfg, tmp_db)
+    got = learning(tmp_db)
+
+    # ranks: i1 .125, i2 .375, i3 .625, i4 .875 - only i1 and i2 were fair draws
+    assert got[("variant", "A")] == (1, 0.125)
+    assert got[("variant", "B")] == (1, 0.375)
+    assert out["variant"]["B"]["n"] == 1
+    assert got[("hook_style", "curiosity")] == (2, 0.5)          # the B-only item still counts elsewhere
+    assert got[("style_preset", "P1")] == (2, 0.5)
+
+
 def test_ab_learning_is_rebuilt_from_metrics_every_run_never_incremented(tmp_db, cfg, fake_clock):
     a = live_post(tmp_db, "item-a", "2026-11-19T07:30:00Z", variant="A", platforms=("instagram",))
     b = live_post(tmp_db, "item-b", "2026-11-19T12:30:00Z", variant="B", platforms=("instagram",))

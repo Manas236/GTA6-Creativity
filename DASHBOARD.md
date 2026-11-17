@@ -104,7 +104,7 @@ runner cannot record an outcome, and the unprocessed command stays pending.
 
 | Control | Behavior |
 | --- | --- |
-| Approve both / A only / Reject | Calls `telegram_bot.decide()` under the runner lock. Revalidates stage, bindings, files and publishing history. Releases the matching Telegram card state in the same transaction. |
+| Approve both / A only / B only / Reject | Calls `telegram_bot.decide()` under the runner lock. Revalidates stage, bindings, files and publishing history. Releases the matching Telegram card state in the same transaction. |
 | Hook is right | Calls `decide(..., "hookok")`, preserving the existing human-review semantics. Returns the item to rendering; this is not publication approval. |
 | Pause posting | Sets an indefinite dashboard hold. The runner's settlement stage also respects it. A request already in flight may finish. |
 | Resume posting | Lifts an active dashboard hold. Any remaining Meta cooldown stays in effect. Normal slot rules still apply. |

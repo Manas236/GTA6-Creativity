@@ -214,7 +214,7 @@ def test_prepare_is_readonly_confirm_is_idempotent_and_releases_card(
 
 
 @pytest.mark.parametrize(
-    "action,expected", [("aonly", "approved"), ("reject", "rejected")]
+    "action,expected", [("aonly", "approved"), ("bonly", "approved"), ("reject", "rejected")]
 )
 def test_other_decisions_go_through_existing_api(
     control, clip, tmp_db, action, expected
@@ -226,6 +226,25 @@ def test_other_decisions_go_through_existing_api(
     assert item["stage"] == expected
     if action == "aonly":
         assert item["chosen_variant"] == "A" and item["ab_excluded"] == 1
+    if action == "bonly":
+        assert item["approval_type"] == "approved_b_only"
+        assert item["chosen_variant"] == "B" and item["ab_excluded"] == 1
+
+
+@pytest.mark.parametrize("missing,allowed", [("a", {"bonly"}), ("b", {"aonly"})])
+def test_each_approval_needs_the_renders_it_will_post(control, clip, tmp_db, missing, allowed):
+    _, client, _, csrf = control
+    actions = client.get("/api/items/" + clip["id"], base_url=BASE).get_json()["actions"]
+    assert actions[actions.index("aonly") + 1] == "bonly"
+    Path(clip[f"render_{missing}_path"]).unlink()
+    for action in ("approve", "aonly", "bonly"):
+        response = post(client, csrf, "/api/prepare", {"action": action, "item_id": clip["id"]})
+        if action in allowed:
+            assert response.status_code == 200, response.get_data(as_text=True)
+        else:
+            assert response.status_code == 409
+            assert f"Render {missing.upper()} is missing" in response.get_json()["error"]
+    assert db.get_item(clip["id"], tmp_db)["stage"] == "rendered"
 
 
 def test_review_returns_to_render_and_releases_same_card(control, clip, tmp_db):
@@ -269,7 +288,7 @@ def test_preview_never_approved_or_mutated(control, clip, tmp_db):
     _, client, _, csrf = control
     db.transition_stage(clip["id"], "cut", db_path=tmp_db)
     db.set_preview_only(clip["id"], True, tmp_db)
-    for action in ("approve", "aonly", "hookok", "edit_hook"):
+    for action in ("approve", "aonly", "bonly", "hookok", "edit_hook"):
         response = post(
             client,
             csrf,

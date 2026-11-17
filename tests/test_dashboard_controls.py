@@ -77,7 +77,7 @@ def test_new_actions_refuse_items_that_started_posting(local, clip, tmp_db, acti
 def test_preview_only_cannot_be_approved_queued_or_posted(local, clip, tmp_db):
     _, client, _, csrf = local
     db.transition_stage(clip["id"], "cut", {"preview_only": 1}, tmp_db)
-    for action in ("approve", "aonly", "post_now"):
+    for action in ("approve", "aonly", "bonly", "post_now"):
         response = post(client, csrf, "/api/prepare", {"action": action, "item_id": clip["id"]})
         assert response.status_code == 409
     assert client.get("/api/items/" + clip["id"], base_url=BASE).json["actions"] == []

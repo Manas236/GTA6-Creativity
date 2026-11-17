@@ -431,7 +431,7 @@ def ensure_post_rows(
 
     The variant is NOT drawn here: rows start as UNDECIDED_VARIANT and `decide_variant` draws
     it when the slot comes due, from the learning as it is then. Only a variant already fixed
-    on the item (Approve A only) is written at once.
+    on the item (Approve A only / Approve B only) is written at once.
     """
     cfg = cfg or config.get_config()
     refusal = refusal_reason(item, cfg)

@@ -16,7 +16,10 @@ MISSED SLOTS (the laptop was asleep)
   finishes or settles it, which is what rules out a double post.
 
 VARIANT (drawn when the slot comes due, not when the item is queued: posting.decide_variant)
-  * "Approve A only" stays A and stays ab_excluded (fixed at once).
+  * "Approve A only" / "Approve B only" (ab_excluded, or approval_type approved_a_only /
+    approved_b_only) keep the item's chosen_variant and stay ab_excluded (fixed at once). Only
+    a pinned item with no chosen_variant recorded falls back: to its approval_type's variant,
+    else A.
   * Week 1 (the first `autopilot.week_one_days` days counted from the FIRST LIVE POST, and all the
     time before any post is live): 50/50 random.
   * After week 1: epsilon-greedy over `ab_learning` with a floor - the better variant gets
@@ -44,6 +47,8 @@ DEFAULT_PROFILES = {
     "local": {"timezone": "Asia/Kolkata", "slots": ["13:00", "18:00"]},
     "server": {"timezone": "America/New_York", "slots": ["18:00", "21:00"]},
 }
+#: approval_type of a single-variant approval -> the variant the reviewer pinned.
+PINNED_APPROVAL_TYPES = {"approved_a_only": "A", "approved_b_only": "B"}
 
 
 # ---------------------------------------------------------------------------
@@ -174,15 +179,32 @@ def variant_probabilities(cfg: dict[str, Any] | None = None, db_path: Any = None
     )
 
 
+def pinned_variant(item: dict[str, Any]) -> str | None:
+    """The variant a reviewer pinned with "Approve A only" / "Approve B only", or None when the
+    variant is left to the draw.
+
+    A pinned item (ab_excluded, or a single-variant approval_type) keeps its own chosen_variant.
+    If that was never recorded it falls back to the approval_type's variant, and only then to A.
+    """
+    approval = item.get("approval_type")
+    if not (int(item.get("ab_excluded") or 0) or approval in PINNED_APPROVAL_TYPES):
+        return None
+    chosen = str(item.get("chosen_variant") or "").strip().upper()
+    if chosen in ("A", "B"):
+        return chosen
+    return PINNED_APPROVAL_TYPES.get(approval, "A")
+
+
 def choose_variant(
     item: dict[str, Any],
     cfg: dict[str, Any] | None = None,
     db_path: Any = None,
     rng: random.Random | None = None,
 ) -> tuple[str, str]:
-    """(variant, why) for one approved item."""
-    if int(item.get("ab_excluded") or 0) or item.get("approval_type") == "approved_a_only":
-        return "A", "approved A only: stays A, excluded from the A/B comparison"
+    """(variant, why) for one approved item. A pinned item (A only / B only) keeps its variant."""
+    pinned = pinned_variant(item)
+    if pinned:
+        return pinned, f"approved {pinned} only: stays {pinned}, excluded from the A/B comparison"
     probs, why = variant_probabilities(cfg, db_path)
     roll = (rng or random).random()
     variant = "A" if roll < probs["A"] else "B"
@@ -245,8 +267,9 @@ def schedule_approved(
 ) -> list[dict[str, Any]]:
     """Give every approved item the next free slot and move it to `queued`.
 
-    The variant is left undecided (posting.UNDECIDED_VARIANT) unless the item is A-only; it is
-    drawn when the slot comes due, so it always uses the latest learning."""
+    The variant is left undecided (posting.UNDECIDED_VARIANT) unless the item is pinned (A only /
+    B only), which keeps its chosen_variant; it is drawn when the slot comes due, so it always
+    uses the latest learning."""
     cfg = cfg or config.get_config()
     out: list[dict[str, Any]] = []
     for item in db.get_items_by_stage("approved", db_path=db_path):   # highest discovery score first
@@ -259,9 +282,9 @@ def schedule_approved(
             db.log_stage(item_id, "scheduler", "failure", message=refusal or "synthetic dry-run item", db_path=db_path)
             continue
         try:
-            a_only = int(item.get("ab_excluded") or 0) or item.get("approval_type") == "approved_a_only"
-            item["chosen_variant"] = "A" if a_only else None
-            why = ("approved A only: stays A" if a_only
+            pinned = pinned_variant(item)
+            item["chosen_variant"] = pinned
+            why = (f"approved {pinned} only: stays {pinned}" if pinned
                    else "drawn when the slot comes due, from the learning at that time")
             slot = clock.iso(next_free_slot(now, cfg, db_path, exclude_item_id=item_id))
             # Order matters for crash safety: the rows are created (idempotently) first and the

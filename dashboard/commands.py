@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 ACTIONS = {
     "approve": "Approve both variants",
     "aonly": "Approve A only",
+    "bonly": "Approve B only",
     "reject": "Reject item",
     "hookok": "Hook is right / render anyway",
     "edit_hook": "Edit hook and re-render",
@@ -53,7 +54,11 @@ ACTIONS = {
     "post_now": "Post at the earliest allowed time",
     "edit_caption": "Save caption",
 }
-DECISIONS = {"approve": "ok", "aonly": "aonly", "reject": "no", "hookok": "hookok"}
+DECISIONS = {"approve": "ok", "aonly": "aonly", "bonly": "bonly", "reject": "no", "hookok": "hookok"}
+#: Approval decision -> the renders that must exist on disk before it is accepted.
+APPROVAL_RENDERS = {"approve": ("a", "b"), "aonly": ("a",), "bonly": ("b",)}
+#: approval_type -> the decision that restores it after "Return to review" (default: approve).
+RESTORE_DECISIONS = {"approved_a_only": "aonly", "approved_b_only": "bonly"}
 EDITABLE = {
     "cut",
     "needs_review",
@@ -234,12 +239,11 @@ def validate(action, item, posts, payload, path):
             expected.add("needs_review")
         if stage not in expected:
             raise ControlError("This decision no longer applies. Refresh the item.")
-        if action in ("approve", "aonly"):
+        if action in APPROVAL_RENDERS:
             binding.assert_caption_binding(
                 item, item.get("hook_text"), vo_path=item.get("voiceover_audio_path")
             )
-            variants = ("a", "b") if action == "approve" else ("a",)
-            for variant in variants:
+            for variant in APPROVAL_RENDERS[action]:
                 if not Path(item.get(f"render_{variant}_path") or "").is_file():
                     raise ControlError(
                         f"Render {variant.upper()} is missing. Re-render before approval."
@@ -320,7 +324,7 @@ def available_actions(item, posts):
     if actions and item.get("cut_path") and Path(item["cut_path"]).is_file():
         actions.append("remake_hook")
     if stage in ("rendered", "awaiting_approval"):
-        actions += ["approve", "aonly", "reject"]
+        actions += ["approve", "aonly", "bonly", "reject"]
     if stage == "needs_review":
         actions += ["hookok", "reject"]
     if stage in EDITABLE and item.get("hook_text") and item.get("voiceover_script"):
@@ -352,7 +356,7 @@ def prepare(action, item_id, payload, path, cfg):
                    "schedule": rows}
     if action == "unapprove":
         payload = {"previous_slot": posting.item_slot(posts), "stage": item["stage"],
-                   "a_only": item["approval_type"] == "approved_a_only"}
+                   "decision": RESTORE_DECISIONS.get(item["approval_type"], "approve")}
     if action == "restore_approval":
         payload = {"command_id": str(payload.get("command_id", ""))}
     if action == "delete":
@@ -473,7 +477,10 @@ def apply(command, cfg, path):
                 raise ControlError("The previous slot is no longer available.")
             if not posting.enabled_platforms(cfg):
                 raise ControlError("No publishing platforms are enabled.")
-        decision = "aonly" if original.get("a_only") else "approve"
+        # "a_only" is the flag unapprovals recorded before B-only existed.
+        decision = original.get("decision") or ("aonly" if original.get("a_only") else "approve")
+        if decision not in APPROVAL_RENDERS:
+            raise ControlError("The original approval cannot be restored.")
         validate(decision, item, posts, {}, path)
         outcome, message = telegram_bot.decide(item_id, DECISIONS[decision], path)
         if not outcome or outcome == telegram_bot.NOT_APPLICABLE:

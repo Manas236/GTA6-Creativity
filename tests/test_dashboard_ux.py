@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 
 import pytest
@@ -86,6 +87,43 @@ def test_restore_unapproval_preserves_a_only_and_refuses_taken_slot(local, clip,
         assert result(tmp_db, command_id)["status"] == "applied"
         assert item["stage"] == "queued" and item["chosen_variant"] == "A"
         assert {row["slot_datetime"] for row in posts} == {clock.iso(slot)}
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_restore_unapproval_preserves_b_only(local, clip, tmp_db, queued):
+    _, _, cfg, _ = local
+    item_id = clip["id"]
+    confirmed(local, "bonly", item_id)
+    slot = clock.utcnow() + timedelta(hours=8)
+    if queued:
+        schedule(tmp_db, cfg, db.get_item(item_id, tmp_db), slot)
+        assert {row["variant"] for row in posting.get_posts_for_item(item_id, tmp_db)} == {"B"}
+    _, original = confirmed(local, "unapprove", item_id)
+    returned = db.get_item(item_id, tmp_db)
+    assert (returned["stage"], returned["approval_type"], returned["chosen_variant"]) == ("awaiting_approval", None, None)
+    _, command_id = confirmed(local, "restore_approval", item_id, {"command_id": original})
+    assert result(tmp_db, command_id)["status"] == "applied"
+    item = db.get_item(item_id, tmp_db)
+    assert item["stage"] == ("queued" if queued else "approved")
+    assert (item["approval_type"], item["chosen_variant"], item["ab_excluded"]) == ("approved_b_only", "B", 1)
+    posts = posting.get_posts_for_item(item_id, tmp_db)
+    if queued:
+        assert {(row["variant"], row["ab_excluded"], row["slot_datetime"]) for row in posts} == {("B", 1, clock.iso(slot))}
+    else:
+        assert not posts
+
+
+def test_restore_reads_the_a_only_flag_of_an_unapproval_recorded_before_b_only(local, clip, tmp_db):
+    item_id = clip["id"]
+    confirmed(local, "aonly", item_id)
+    _, original = confirmed(local, "unapprove", item_id)
+    with db.db(tmp_db) as conn:   # the payload shape older dashboards wrote
+        conn.execute("UPDATE dashboard_commands SET payload=? WHERE id=?",
+                     (json.dumps({"previous_slot": None, "stage": "approved", "a_only": True}), original))
+    _, command_id = confirmed(local, "restore_approval", item_id, {"command_id": original})
+    assert result(tmp_db, command_id)["status"] == "applied"
+    item = db.get_item(item_id, tmp_db)
+    assert (item["stage"], item["approval_type"], item["chosen_variant"]) == ("approved", "approved_a_only", "A")
 
 
 def test_library_filtered_pages_and_manual_platform(local, tmp_db):

@@ -153,9 +153,9 @@ def test_card_send_carries_video_hook_authenticity_source_and_score(tmp_db, tmp_
     assert "GamingBolt" in caption                            # creator
     assert "0.500" in caption                                 # discovery score
     assert "🅰 Variant A" in videos[1]["caption"]
-    # Three buttons, only on the card itself.
+    # Four buttons, only on the card itself; B only sits right after A only.
     buttons = [b["callback_data"] for row in videos[0]["reply_markup"]["inline_keyboard"] for b in row]
-    assert buttons == ["a:ok:item-1", "a:no:item-1", "a:aonly:item-1"]
+    assert buttons == ["a:ok:item-1", "a:no:item-1", "a:aonly:item-1", "a:bonly:item-1"]
     assert "reply_markup" not in videos[1]
     # The item moved to awaiting_approval and the card is recorded.
     assert db.get_item("item-1", db_path=tmp_db)["stage"] == "awaiting_approval"
@@ -223,6 +223,45 @@ def test_approve_a_only_pins_variant_a_and_excludes_it_from_the_ab_comparison(tm
             "SELECT message FROM stage_log WHERE item_id = 'item-1' AND stage = 'approval'"
         ).fetchall()]
     assert any("excluded from the A/B comparison" in m for m in logged)
+
+
+def test_approve_b_only_pins_variant_b_and_excludes_it_from_the_ab_comparison(tmp_db, tmp_path, cfg):
+    make_item(tmp_db, tmp_path)
+    transport = FakeTransport()
+    bot = make_bot(tmp_db, cfg, transport)
+    bot.ensure_card()
+    mid = telegram_bot.card_state(tmp_db)["mid"]
+
+    bot.handle_update(tap("item-1", "bonly", mid))
+
+    item = db.get_item("item-1", db_path=tmp_db)
+    assert item["stage"] == "approved"
+    assert item["approval_type"] == "approved_b_only"
+    assert item["chosen_variant"] == "B"
+    assert item["ab_excluded"] == 1
+    edits = transport.of("editMessageCaption")
+    assert len(edits) == 1 and edits[0]["message_id"] == mid
+    assert edits[0]["reply_markup"] == {"inline_keyboard": []}
+    assert "🅱 Approved, Variant B only" in edits[0]["caption"]
+    assert telegram_bot.card_state(tmp_db) is None
+    with db.db(tmp_db) as conn:
+        logged = [r["message"] for r in conn.execute(
+            "SELECT message FROM stage_log WHERE item_id = 'item-1' AND stage = 'approval'"
+        ).fetchall()]
+    assert any("approved B only" in m and "excluded from the A/B comparison" in m for m in logged)
+
+
+@pytest.mark.parametrize("action", ["aonly", "bonly"])
+def test_single_variant_approvals_refuse_a_preview_only_item(tmp_db, tmp_path, cfg, action):
+    make_item(tmp_db, tmp_path)
+    _drop_preview_triggers(tmp_db)                      # decide() must refuse on its own
+    db.set_preview_only("item-1", True, db_path=tmp_db)
+
+    outcome, answer = telegram_bot.decide("item-1", action, db_path=tmp_db)
+
+    assert outcome == "" and "preview-only" in answer
+    item = db.get_item("item-1", db_path=tmp_db)
+    assert item["stage"] != "approved" and item["approval_type"] is None and item["chosen_variant"] is None
 
 
 def test_a_click_on_an_old_card_does_nothing_and_says_so(tmp_db, tmp_path, cfg):

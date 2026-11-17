@@ -4,11 +4,13 @@ ONE self-editing status card per item, strictly one item at a time: the next ite
 after the current one is decided. The card carries Variant B as the video message (plus Variant A
 as a second message), the hook, the authenticity tag, the source + creator and the discovery score.
 
-Buttons: Approve / Reject / Approve A only.
+Buttons: Approve / Reject / Approve A only / Approve B only.
   * Approve         -> stage 'approved', approval_type 'approved'. chosen_variant stays NULL:
                        the CP4 scheduler assigns A/B later, not the reviewer.
   * Reject          -> stage 'rejected', rejection_reason 'user_rejected'.
   * Approve A only  -> stage 'approved', approval_type 'approved_a_only', chosen_variant 'A',
+                       ab_excluded 1. Logged and excluded from the A/B comparison.
+  * Approve B only  -> stage 'approved', approval_type 'approved_b_only', chosen_variant 'B',
                        ab_excluded 1. Logged and excluded from the A/B comparison.
 
 Stale-button protection: a click only counts when it comes from the message id and item id the open
@@ -55,7 +57,10 @@ STALE = "This card is out of date - it was already decided. The current card is 
 ALERT_REPEAT_GAP_S = 3600.0       # the same failure is not re-alerted more often than this
 MAX_VIDEO_BYTES = 50 * 1024 * 1024  # Bot API upload limit for a bot-sent video
 
-ACTIONS = {"ok": "approved", "no": "rejected", "aonly": "approved_a_only", "hookok": "hook_approved"}
+ACTIONS = {"ok": "approved", "no": "rejected", "aonly": "approved_a_only", "bonly": "approved_b_only",
+           "hookok": "hook_approved"}
+#: Single-variant approvals: button -> the variant it pins. The item is ab_excluded.
+PINNED_VARIANT_ACTIONS = {"aonly": "A", "bonly": "B"}
 #: Stages an open card can still be decided in (a review card is for an item in needs_review).
 DECIDABLE_STAGES = ("awaiting_approval", "rendered", "needs_review")
 #: decide() outcome for a button that does not fit the item's card: nothing changes, the card stays open.
@@ -267,6 +272,7 @@ def card_markup(item_id: str) -> dict[str, Any]:
             [
                 {"text": "❌ Reject", "callback_data": f"a:no:{item_id}"},
                 {"text": "🅰 Approve A only", "callback_data": f"a:aonly:{item_id}"},
+                {"text": "🅱 Approve B only", "callback_data": f"a:bonly:{item_id}"},
             ],
         ]
     }
@@ -276,6 +282,7 @@ DECIDED_TEXT = {
     "approved": "✅ Approved. It is in the posting queue; the scheduler assigns A or B.",
     "rejected": "❌ Rejected. It will not be posted.",
     "approved_a_only": "🅰 Approved, Variant A only. Excluded from the A/B comparison.",
+    "approved_b_only": "🅱 Approved, Variant B only. Excluded from the A/B comparison.",
     "hook_approved": "✅ Hook approved. The clip is rendered with it and comes back here for the normal review.",
 }
 
@@ -407,7 +414,7 @@ def decide(item_id: str, action: str, db_path: Any = None) -> tuple[str, str]:
     # A review card (needs_review) only takes hookok / no; a render card never takes hookok.
     if (item.get("stage") == "needs_review") != (action == "hookok") and action != "no":
         return NOT_APPLICABLE, f"That button does not apply to this item ({item.get('stage')})."
-    if action in ("ok", "aonly") and int(item.get("preview_only") or 0):
+    if (action == "ok" or action in PINNED_VARIANT_ACTIONS) and int(item.get("preview_only") or 0):
         refuse_item(item_id, "approval", RuntimeError("preview_only item cannot be approved"), db_path)
         return "", "This item is preview-only and cannot be approved."
     try:
@@ -436,18 +443,19 @@ def _apply_decision(item_id: str, action: str, db_path: Any = None) -> tuple[str
         )
         return "approved", DECIDED_TEXT["approved"]
 
-    if action == "aonly":
+    if action in PINNED_VARIANT_ACTIONS:   # Approve A only / Approve B only
+        variant, outcome = PINNED_VARIANT_ACTIONS[action], ACTIONS[action]
         db.transition_stage(
             item_id,
             "approved",
-            extra_fields={"approval_type": "approved_a_only", "chosen_variant": "A", "ab_excluded": 1},
+            extra_fields={"approval_type": outcome, "chosen_variant": variant, "ab_excluded": 1},
             db_path=db_path,
         )
         db.log_stage(
             item_id, "approval", "success",
-            message="approved A only via telegram; excluded from the A/B comparison", db_path=db_path,
+            message=f"approved {variant} only via telegram; excluded from the A/B comparison", db_path=db_path,
         )
-        return "approved_a_only", DECIDED_TEXT["approved_a_only"]
+        return outcome, DECIDED_TEXT[outcome]
 
     if action == "hookok":
         # A human vouched for the hook against the clip: mark it renderable for this same segment

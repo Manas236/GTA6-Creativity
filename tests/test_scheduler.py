@@ -44,7 +44,9 @@ def cfg() -> dict[str, Any]:
     }
 
 
-def approved_item(tmp_db: Path, tmp_path: Path, item_id: str, score: float = 0.5, a_only: bool = False) -> dict:
+def approved_item(tmp_db: Path, tmp_path: Path, item_id: str, score: float = 0.5, a_only: bool = False,
+                  b_only: bool = False) -> dict:
+    pinned = "A" if a_only else "B" if b_only else None
     db.insert_discovered_item(
         {"id": item_id, "source": "youtube", "source_id": item_id, "source_url": f"https://youtu.be/{item_id}",
          "author_name": "GamingBolt", "discovery_score": score, "raw_velocity": 5.0, "percentile_rank": 0.8},
@@ -58,8 +60,8 @@ def approved_item(tmp_db: Path, tmp_path: Path, item_id: str, score: float = 0.5
         extra_fields={
             "hook_text": f"HOOK {item_id}", "hook_style": "question", "authenticity": "unverified",
             "render_a_path": str(a), "render_b_path": str(b), "style_preset": "P0",
-            "approval_type": "approved_a_only" if a_only else "approved",
-            "chosen_variant": "A" if a_only else None, "ab_excluded": 1 if a_only else 0,
+            "approval_type": {"A": "approved_a_only", "B": "approved_b_only"}.get(pinned, "approved"),
+            "chosen_variant": pinned, "ab_excluded": 1 if pinned else 0,
         },
         db_path=tmp_db,
     )
@@ -271,6 +273,31 @@ def test_approve_a_only_stays_a_and_stays_ab_excluded(tmp_db, tmp_path, cfg, fak
     row = posting.get_posts_for_item("item-a", db_path=tmp_db)[0]
     assert (row["variant"], row["ab_excluded"]) == ("A", 1)
     assert db.get_item("item-a", db_path=tmp_db)["ab_excluded"] == 1
+
+
+def test_approve_b_only_stays_b_and_stays_ab_excluded(tmp_db, tmp_path, cfg, fake_clock):
+    item = approved_item(tmp_db, tmp_path, "item-b", b_only=True)
+    set_learning(tmp_db, (10, 0.9), (10, 0.1))                    # even with A far ahead
+    first_live(tmp_db, "2026-10-01T00:00:00Z")
+    assert all(scheduler.choose_variant(item, cfg, tmp_db, random.Random(s))[0] == "B" for s in range(50))
+
+    scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db)
+    row = posting.get_posts_for_item("item-b", db_path=tmp_db)[0]
+    assert (row["variant"], row["ab_excluded"]) == ("B", 1)
+    stored = db.get_item("item-b", db_path=tmp_db)
+    assert (stored["chosen_variant"], stored["ab_excluded"]) == ("B", 1)
+
+
+@pytest.mark.parametrize("fields,expected", [
+    ({"approval_type": "approved_a_only", "chosen_variant": "A", "ab_excluded": 1}, "A"),
+    ({"approval_type": "approved_b_only", "chosen_variant": "B", "ab_excluded": 1}, "B"),
+    ({"approval_type": None, "chosen_variant": "b", "ab_excluded": 1}, "B"),                 # ab_excluded alone
+    ({"approval_type": "approved_b_only", "chosen_variant": None, "ab_excluded": 1}, "B"),   # variant lost
+    ({"approval_type": None, "chosen_variant": None, "ab_excluded": 1}, "A"),                # nothing recorded
+    ({"approval_type": "approved", "chosen_variant": "B", "ab_excluded": 0}, None),          # a normal approval
+])
+def test_a_pinned_item_keeps_its_own_chosen_variant(fields, expected):
+    assert scheduler.pinned_variant({"id": "x", **fields}) == expected
 
 
 def test_week_one_is_fifty_fifty_and_is_counted_from_the_first_live_post(tmp_db, tmp_path, cfg, fake_clock):
@@ -612,3 +639,39 @@ def test_a_only_is_fixed_at_queue_time(tmp_db, tmp_path, cfg, fake_clock):
     row = posting.get_posts_for_item("item-a", db_path=tmp_db)[0]
     assert row["variant"] == "A" and row["variant_decided_at"]
     assert posting.decide_variant("item-a", cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.99)) == "A"
+
+
+def test_b_only_is_fixed_at_queue_time_and_not_overwritten_to_a(tmp_db, tmp_path, cfg, fake_clock):
+    approved_item(tmp_db, tmp_path, "item-b", b_only=True)
+    out = scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.0))   # 0.0 would draw A
+    assert (out["scheduled"][0]["variant"], out["scheduled"][0]["why"]) == ("B", "approved B only: stays B")
+    row = posting.get_posts_for_item("item-b", db_path=tmp_db)[0]
+    assert row["variant"] == "B" and row["variant_decided_at"]
+    assert posting.decide_variant("item-b", cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.0)) == "B"
+    assert db.get_item("item-b", db_path=tmp_db)["chosen_variant"] == "B"
+
+
+def test_b_only_survives_a_missed_slot_posts_the_b_render_and_stays_out_of_the_ab_learning(
+        tmp_db, tmp_path, cfg, secrets, fake_clock):
+    from pipeline import analytics
+
+    approved_item(tmp_db, tmp_path, "item-b", b_only=True)
+    scheduler.run_scheduler_stage(cfg=cfg, db_path=tmp_db, rng=FixedRoll(0.0))
+    # Asleep through the slot: the re-slot clears the decision, so it is drawn again at the new slot.
+    fake_clock.set(clock.iso(clock.parse(slot_of(tmp_db, "item-b")) + timedelta(hours=3)))
+    assert [m[0] for m in scheduler.reschedule_missed(clock.utcnow(), cfg, tmp_db)] == ["item-b"]
+    assert posting.get_posts_for_item("item-b", db_path=tmp_db)[0]["variant_decided_at"] is None
+
+    fake_clock.set(slot_of(tmp_db, "item-b"))
+    transport = FakeTransport(routes_for_many())
+    publisher, _ = make_publisher(tmp_db, cfg, transport)
+    posting.run_posting_stage(cfg=cfg, db_path=tmp_db, publisher=publisher, rng=FixedRoll(0.0))   # 0.0 would draw A
+    rows = posting.get_posts_for_item("item-b", db_path=tmp_db)
+    assert {(r["variant"], r["ab_excluded"], r["status"]) for r in rows} == {("B", 1, "live")}
+    assert db.get_item("item-b", db_path=tmp_db)["chosen_variant"] == "B"
+    assert transport.sent("/ig-api-upload/")[0][2]["headers"]["file_size"] == "2048"   # variant B's bytes
+
+    analytics.record_snapshot(rows[0]["id"], 24, {"views": 900, "likes": 0, "comments": 0, "shares": 0}, {}, tmp_db)
+    learning = analytics.rebuild_ab_learning(cfg, tmp_db)
+    assert learning["variant"] == {}                         # not in the A/B comparison...
+    assert learning["style_preset"]["P0"]["n"] == 1          # ...but still in every other dimension
