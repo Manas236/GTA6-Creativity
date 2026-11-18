@@ -213,3 +213,19 @@ def test_each_model_is_loaded_once_and_a_second_model_really_is_a_second_model(m
     monkeypatch.setattr(transcribe, "download_root", lambda: None)
     a1, a2, b = transcribe.get_model("base.en"), transcribe.get_model("base.en"), transcribe.get_model("small.en")
     assert a1 is a2 and a1 is not b and loaded == ["base.en", "small.en"]
+
+
+def test_faster_whisper_decodes_wav(tmp_path):
+    import wave
+
+    pytest.importorskip("faster_whisper")
+    from faster_whisper.audio import decode_audio
+
+    sample_rate = 16000
+    wav_path = tmp_path / "one-second.wav"
+    with wave.open(str(wav_path), "wb") as output:
+        output.setparams((1, 2, sample_rate, 0, "NONE", ""))
+        output.writeframes(b"\x00\x00" * sample_rate)
+    samples = decode_audio(str(wav_path))
+    assert samples.shape == (sample_rate,)
+    assert not samples.any()
