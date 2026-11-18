@@ -49,7 +49,7 @@ def lock_status(path, cfg):
         return {"status": "stale", "age": None, "host": None}
 
 
-def state(path, cfg):
+def state(path, cfg, media_root=None):
     with snapshot(path) as conn:
         counts = {
             r["stage"]: r["n"]
@@ -69,7 +69,7 @@ def state(path, cfg):
             dict(r)
             for r in conn.execute(
                 """SELECT id, item_id, platform, variant, slot_datetime, status,
-            remote_id, posted_at, hook_style, source, error_message, remote_container_id,
+            remote_id, remote_url, posted_at, hook_style, source, error_message, remote_container_id,
             attempt_count, publish_started_at FROM posts ORDER BY slot_datetime"""
             )
         ]
@@ -92,7 +92,7 @@ def state(path, cfg):
         for post in posts:
             grouped.setdefault(post["item_id"], []).append(post)
         for item in items:
-            item["actions"] = available_actions(item, grouped.get(item["id"], []))
+            item["actions"] = available_actions(item, grouped.get(item["id"], []), path)
             item.pop("cut_path")
         runtime = decode(db.kv_get("dashboard:runtime", db_path=path))
         lock = lock_status(path, cfg)
@@ -128,7 +128,29 @@ def state(path, cfg):
             limits.append(record)
         dashboard_paused = rate_limit.dashboard_meta_paused(path)
         meta_until, meta_reason = rate_limit.active_cooldown(posting.META_SOURCE, path)
+        warnings = analytics_warnings(posts, metrics, cfg)
+        next_at = min((p["slot_datetime"] for p in posts if p["slot_datetime"]
+                       and p["status"] in ("pending", "uploading", "processing", "publishing")
+                       and clock.parse(p["slot_datetime"]) >= clock.utcnow()), default=None)
+        disk_bytes = 0
+        if media_root:
+            for file in media_root.rglob("*"):
+                try:
+                    if not file.is_symlink() and file.is_file():
+                        disk_bytes += file.stat().st_size
+                except OSError:
+                    continue
         return {
+            "status_line": {"dry_run": posting.is_dry_run(cfg),
+                            "dry_run_mode": cfg.get("posting", {}).get("dry_run_mode"),
+                            "runner": {"alive": "running", "stale": "stale"}.get(lock["status"], "stopped"),
+                            "next_post_at": next_at,
+                            "problems": counts.get("failed", 0) + len(warnings) + int(bool(meta_until))},
+            "todo": {"to_review": counts.get("rendered", 0) + counts.get("awaiting_approval", 0),
+                     "needs_decision": counts.get("needs_review", 0),
+                     "failed": counts.get("failed", 0), "next_post_at": next_at},
+            "analytics_warnings": warnings,
+            "disk": {"media_bytes": disk_bytes},
             "runtime_known": runtime_known,
             "config_changed": config_changed,
             "at": db.now(),
@@ -183,7 +205,27 @@ def item_detail(path, item_id, cfg=None):
                 ("cut", "cut_path"),
             )
         }
+        version_rows = versions_for(item_id, path)
+        media.update({version["variant"]: True for version in version_rows})
+        voice = {**(cfg or {}).get("voiceover", {}), **decode(item.get("voiceover_override"))}
+        for post in posts:
+            metrics = [dict(row) for row in conn.execute(
+                "SELECT * FROM metrics WHERE post_id=? ORDER BY fetched_at, id", (post["id"],)
+            )]
+            post["post_id"] = post["id"]
+            post["metrics"] = [
+                {"hours": m["age_hours"] if m["late"] else m["snapshot_hours"],
+                 "window_h": m["snapshot_hours"] if m["snapshot_hours"] > 0 else None,
+                 "late": bool(m["late"]), "age_hours": m["age_hours"],
+                 **{key: m[key] for key in ("views", "likes", "comments", "shares")},
+                 "saves": m["saves"] if m["saves"] is not None else decode(m["raw_json"]).get("saved"),
+                 "reach": m["reach"] if m["reach"] is not None else decode(m["raw_json"]).get("reach")}
+                for m in metrics]
+            post["missed_windows"] = [warning["window_h"] for warning in analytics_warnings([post], metrics, cfg)]
         return {
+            "versions": version_rows,
+            "voiceover": {"script": item.get("voiceover_script") or "", "voice": voice.get("voice", "am_adam"),
+                          "speed": float(voice.get("speed", 1.1))},
             "item": {
                 k: v
                 for k, v in item.items()
@@ -197,7 +239,7 @@ def item_detail(path, item_id, cfg=None):
             "logs": logs,
             "media": media,
             "review": decode(item.get("hook_review")),
-            "actions": available_actions(item, posts),
+            "actions": available_actions(item, posts, path),
             "binding": {
                 "hook": binding.hook_binding_problem(item),
                 "voiceover": binding.voiceover_binding_problem(item),
@@ -253,3 +295,70 @@ def library_page(path, cfg, filters):
     pages = max(1, (len(matched) + size - 1) // size)
     page = min(pages, positive_int(filters.get("page"), 1))
     return {"ids": matched[(page - 1) * size:page * size], "total": len(matched), "page": page, "pages": pages}
+
+
+def analytics_warnings(posts, metrics, cfg, now=None):
+    from datetime import timedelta
+    from pipeline import analytics
+
+    now = now or clock.utcnow()
+    conf = analytics.settings(cfg)
+    recorded = {(m["post_id"], m["snapshot_hours"]): m for m in metrics}
+    warnings = []
+    for post in posts:
+        if post["status"] != "live" or not post.get("posted_at"):
+            continue
+        for hours in conf["snapshot_hours"]:
+            missed_at = clock.parse(post["posted_at"]) + timedelta(
+                hours=hours + conf["max_snapshot_late_hours"])
+            metric = recorded.get((post["id"], hours))
+            if now > missed_at and (metric is None or metric["late"]):
+                warnings.append({"item_id": post["item_id"], "post_id": post["id"], "window_h": hours,
+                                 "missed_at": clock.iso(missed_at), "late_snapshot_taken": metric is not None})
+    return warnings
+
+
+def versions_for(item_id, path):
+    labels = {"P1": "Clean", "P2": "Punchy", "P3": "Full hype"}
+    versions = []
+    for render in db.renders_for_item(item_id, path):
+        try:
+            with Path(render["meta_path"]).open(encoding="utf-8") as stream:
+                meta = json.load(stream)
+        except (OSError, ValueError, TypeError):
+            meta = {}
+        preset = render["preset"]
+        variant = render["variant"]
+        versions.append({"variant": variant, "preset": preset, "label": labels.get(preset, preset),
+                         "url": f"/media/{item_id}/{variant}", "meta": meta if isinstance(meta, dict) else {}})
+    return versions
+
+
+def schedule(path, cfg, first, days):
+    from datetime import datetime, timedelta
+    profile, zone, slots = scheduler.active_profile(cfg)
+    with snapshot(path) as conn:
+        scheduled = {clock.iso(clock.parse(row["slot_datetime"])): dict(row)
+                     for row in conn.execute("""
+                         SELECT p.slot_datetime, i.id AS item_id, i.original_title AS title
+                         FROM posts p JOIN items i ON p.item_id = i.id
+                         WHERE i.stage = 'queued' AND p.slot_datetime IS NOT NULL
+                     """)}
+        return {"slots": [{"at": at, "profile": profile,
+                           "item_id": scheduled.get(at, {}).get("item_id"),
+                           "title": scheduled.get(at, {}).get("title")}
+                          for offset in range(days)
+                          for slot in slots
+                          for at in [clock.iso(datetime.combine(first + timedelta(days=offset), slot, zone))]]}
+
+
+def discovered(path):
+    now = clock.utcnow()
+    with snapshot(path):
+        return [{"item_id": item["id"], "title": item["original_title"], "source": item["source"],
+                 "score": item["discovery_score"],
+                 "age_h": max(0, (now - clock.parse(item.get("upload_time") or item["created_at"]))
+                              .total_seconds() / 3600),
+                 "url": item["source_url"]}
+                for item in db.get_items_by_stage("discovered", db_path=path)
+                if not item.get("creation_job") and db.is_releasable(item)]
