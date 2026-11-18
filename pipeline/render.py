@@ -19,21 +19,26 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import math
 import sqlite3
 import subprocess
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from . import audio_mix, binding, config, db, edits, hooks, keywords as kwmod, overlay, plan as planning, posting, style, textdetect, voiceover
 from .binding import CaptionMismatchError
 from .cut import audio_envelope, extract_audio_loudness_profile, snap_end_to_pause
-from . import endings, transcribe
+from . import endings, render_meta, transcribe
 from .download import verify_video_file
 from .rendercore import (  # re-exported for callers and tests
     RENDER_DEFAULTS,
+    HookTooLong,
+    caption_chunk_size,
     _abs_project_path,
     _clean_caption_word,
     _clean_text,
@@ -65,7 +70,7 @@ __all__ = [
     "build_variant_b_words", "estimate_words_from_script", "has_audio_stream", "probe_streams",
     "verify_render", "media_duration", "freeze_duration", "render_variant_a", "render_variant_b",
     "snap_render_end", "render_item_variants", "run_render_item", "get_whisper_model",
-    "CaptionMismatchError", "assert_item_caption_binding",
+    "CaptionMismatchError", "HookTooLong", "assert_item_caption_binding",
 ]
 
 
@@ -276,6 +281,7 @@ def build_ass_subtitles(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     events: list[str] = []
+    caption_words = []
 
     # --- hook (whole clip), with the M2 pop + shake when enabled --------------------
     t0 = format_ass_timestamp(0.0)
@@ -293,13 +299,18 @@ def build_ass_subtitles(
         words = normalize_caption_words(words)
         timeline = [w for w in words if float(w["start"]) < video_duration - 0.05]
         chunks = chunk_caption_words(timeline, rs)
-        hl = cap["highlight_color"]
         base = cap["color"]
         kw_list = list(sp.keyword_list) if sp is not None else []
         kw_on = _flag(sp, "keyword_color")
-        pop_tags = overlay.caption_pop_tags(ss) if _flag(sp, "caption_pop") else ""
         for ci, chunk in enumerate(chunks):
             raw = [_clean_caption_word(cw["word"]) for cw in chunk]
+            size_tag = ""
+            if len(raw) == 1:
+                size = caption_chunk_size(raw[0], rs)
+                if size < float(cap["font_size"]):
+                    size_tag = f"\\fs{size:g}"
+            pop_tags = overlay.caption_pop_tags(ss, max_scale=100 if size_tag else None) \
+                if _flag(sp, "caption_pop") else ""
             next_chunk_start = chunks[ci + 1][0]["start"] if ci + 1 < len(chunks) else video_duration
             for i, active in enumerate(chunk):
                 start = float(active["start"])
@@ -312,7 +323,10 @@ def build_ass_subtitles(
                 for j, w in enumerate(raw):
                     colour = overlay.word_colour(w, j == i, kw_list, rs, ss, kw_on)
                     parts.append(f"{{\\c{colour}&}}{w}{{\\c{base}&}}" if colour != base else w)
-                text = f"{{\\an5\\pos({cx:.0f},{cap_y:.0f})" + (pop_tags if i == 0 else "") + "}" + " ".join(parts)
+                text = f"{{\\an5\\pos({cx:.0f},{cap_y:.0f}){size_tag}" + (pop_tags if i == 0 else "") + "}" + " ".join(parts)
+                caption_words.append({"i": len(caption_words), "text": raw[i],
+                                      "start": round(max(start, 0.0), 3),
+                                      "end": round(max(start, min(float(active["end"]), video_duration)), 3)})
                 events.append(
                     f"Dialogue: 1,{format_ass_timestamp(start)},{format_ass_timestamp(end)},Caption,,0,0,0,,{text}"
                 )
@@ -324,6 +338,9 @@ def build_ass_subtitles(
         events.append(overlay.progress_bar_event(video_duration, rs, ss, format_ass_timestamp,
                                                  y=int(getattr(sp.layout, "progress_y", 0) or 0)))
 
+    meta = {"hook_text": hook_text, "hook_font_px": hook_size, "hook_lines": hook_lines,
+            "hook_below_floor": False, "caption_words": caption_words}
+    header = header.replace("[Script Info]\n", "[Script Info]\n; render_meta " + json.dumps(meta) + "\n", 1)
     return header + "\n".join(events) + "\n"
 
 
@@ -483,7 +500,7 @@ def _video_chain(
     if _flag(sp, "dead_air") and len(sp.timeline.kept) > 1:
         parts.append(_spans_chain(sp.timeline.kept, cur, "vkept", audio=False))
         cur = "vkept"
-    freeze = f",tpad=start={freeze_frames}:start_mode=clone" if freeze_frames > 0 else ""
+    freeze = f",tpad=start={freeze_frames}:start_mode=clone,setpts=N/({fps}*TB)" if freeze_frames > 0 else ""
     parts.append(
         f"[{cur}]tpad=stop=-1:stop_mode=clone:stop_duration=2,trim=end_frame={n_cut_frames},"
         f"setpts=PTS-STARTPTS{freeze},split=2[vs1][vs2]"
@@ -600,6 +617,68 @@ def _frames(duration_s: float, fps: int) -> int:
 # Variant renders
 # --------------------------------------------------------------------------------------
 
+def _render_subtitle_meta(path: Path | str, rs: dict[str, Any]) -> dict[str, Any]:
+    """Read the caption data captured as the ASS dialogue was built."""
+    lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    for line in lines:
+        if line.startswith("; render_meta "):
+            meta = json.loads(line.removeprefix("; render_meta "))
+            break
+    else:
+        hook_lines = [
+            re.sub(r"{[^}]*}", "", line.split(",", 9)[-1])
+            for line in lines if line.startswith("Dialogue:") and line.split(",", 9)[3] == "Hook"
+        ]
+        hook_size = next((float(line.split(",")[2]) for line in lines
+                          if line.startswith("Style: Hook,")), rs["hook"]["font_size"])
+        meta = {"hook_text": " ".join(hook_lines), "hook_lines": hook_lines,
+                "hook_font_px": hook_size, "hook_below_floor": False, "caption_words": []}
+    if meta["hook_lines"]:
+        layout_hook(meta["hook_text"], rs)
+        if meta["hook_font_px"] < int(rs["hook"]["min_font_size"]):
+            raise HookTooLong("hook too long")
+    return meta
+
+
+def _render_audio_plan(sp, out_path, item_id, meta, total_s, cut_path):
+    if sp is None:
+        return None
+    # The version filename is <item_id>_<PRESET>; legacy filenames end in A or B.
+    seed = item_id or re.sub(r"_(?:P[0-3]|[AB])$", "", out_path.stem, flags=re.I)
+    changes = {}
+    if _flag(sp, "sfx"):
+        words = meta["caption_words"]
+        cues = audio_mix.plan_sfx_cues(
+            sp.punches, sp.ss, hook_at=0.0 if meta["hook_lines"] else None,
+            duration=total_s, item_id=seed, preset=sp.preset, emoji_cues=sp.emoji_cues,
+            caption_at=words[0]["start"] if words and _flag(sp, "caption_pop") else None,
+        )
+        gains = {}
+        if cues:
+            speech = audio_mix.file_peak_db(cut_path)
+            gains = {c.path: audio_mix.sfx_gain_db(speech, audio_mix.file_peak_db(c.path), sp.ss)
+                     for c in cues}
+        changes.update(sfx_cues=cues, sfx_gains=gains)
+    if _flag(sp, "music_bed"):
+        selected = audio_mix.pick_music(sp.ss, seed)
+        changes["music_file"] = str(selected) if selected else None
+    return replace(sp, **changes)
+
+
+def _write_render_meta(out_path, meta, sp, cfg, duration_s):
+    cues = sp.sfx_cues if _flag(sp, "sfx") else ()
+    music = sp.music_file if _flag(sp, "music_bed") else None
+    render_meta.write(out_path, {
+        **meta,
+        "preset": sp.preset if sp is not None else style.default_preset(cfg),
+        "sfx_cues": [{"t": c.at, "category": c.category, "file": Path(c.path).name, "trigger": c.trigger}
+                     for c in cues],
+        "music_track": Path(music).name if music else None,
+        "duration_s": duration_s,
+        "rendered_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 def render_variant_a(
     cut_path: Path | str,
     ass_path: Path | str,
@@ -609,6 +688,7 @@ def render_variant_a(
     duration_s: float | None = None,
     cfg: dict[str, Any] | None = None,
     sp: Any = None,
+    item_id: str | None = None,
 ) -> tuple[bool, float]:
     """Render Variant A (1080x1920, 30 fps, 48 kHz stereo AAC, -14 LUFS, end fade).
 
@@ -619,10 +699,12 @@ def render_variant_a(
     rs = render_settings(cfg)
     cut_p, out_p = Path(cut_path), Path(output_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
+    meta = _render_subtitle_meta(ass_path, rs)
     fps, sr = int(rs["fps"]), int(rs["audio_sample_rate"])
     dur = float(duration_s) if duration_s else (sp.content_s if sp is not None else media_duration(cut_p))
     n = _frames(dur, fps)
     total_s = n / fps
+    sp = _render_audio_plan(sp, out_p, item_id, meta, total_s, cut_p)
     fade = sp.audio_fade_s if sp is not None else None
 
     em_inputs, emoji_chain, next_idx = _emoji_chain(sp, rs, 1)
@@ -663,6 +745,7 @@ def render_variant_a(
     if not v_ok:
         log.error("Variant A verification FAILED for %s: %s (%s)", out_p, "; ".join(errors), info)
         return False, elapsed
+    _write_render_meta(out_p, meta, sp, cfg, info["video_duration"])
     return True, elapsed
 
 
@@ -678,6 +761,7 @@ def render_variant_b(
     freeze_s: float | None = None,
     cfg: dict[str, Any] | None = None,
     sp: Any = None,
+    item_id: str | None = None,
 ) -> tuple[bool, float]:
     """Render Variant B in the freeze-frame format.
 
@@ -690,6 +774,7 @@ def render_variant_b(
     rs = render_settings(cfg)
     cut_p, vo_p, out_p = Path(cut_path), Path(voiceover_wav_path), Path(output_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
+    meta = _render_subtitle_meta(ass_path, rs)
     fps, sr = int(rs["fps"]), int(rs["audio_sample_rate"])
     dur = float(duration_s) if duration_s else (sp.content_s if sp is not None else media_duration(cut_p))
     n_cut = _frames(dur, fps)
@@ -700,6 +785,7 @@ def render_variant_b(
     freeze_s = n_freeze / fps
     total_s = (n_freeze + n_cut) / fps
     freeze_samples = int(round(freeze_s * sr))
+    sp = _render_audio_plan(sp, out_p, item_id, meta, total_s, cut_p)
     fade = sp.audio_fade_s if sp is not None else None
 
     em_inputs, emoji_chain, next_idx = _emoji_chain(sp, rs, 2)
@@ -742,6 +828,7 @@ def render_variant_b(
     if not v_ok:
         log.error("Variant B verification FAILED for %s: %s (%s)", out_p, "; ".join(errors), info)
         return False, elapsed
+    _write_render_meta(out_p, meta, sp, cfg, info["video_duration"])
     return True, elapsed
 
 
@@ -793,11 +880,17 @@ def source_text_override(item: dict[str, Any] | None) -> bool:
     return review.get("kind") == "source_text_collision" and review.get("decision") == "render_anyway"
 
 
+class _HookLayoutReview(HookTooLong, style.SourceTextCollision):
+    """Route a bound item's layout failure through the render review handler."""
+
+
 def send_collision_to_review(item: dict[str, Any], err: Exception, db_path: Any = None) -> str:
-    """No clear place for our captions/credit: the item goes to needs_review (reason
-    source_text_collision) instead of rendering text over the source's own text."""
+    """Send a bound item with a render layout failure to needs_review."""
     reason = str(err) if str(err).startswith("source_text_collision") else f"source_text_collision: {err}"
-    review = {"kind": "source_text_collision", "reason": reason, "details": getattr(err, "details", {}),
+    kind = "source_text_collision"
+    if isinstance(err, HookTooLong):
+        kind, reason = "hook_too_long", "hook too long"
+    review = {"kind": kind, "reason": reason, "details": getattr(err, "details", {}),
               "segment": [item.get("cut_start"), item.get("cut_end")], "at": db.now()}
     db.transition_stage(item["id"], "needs_review", extra_fields={"hook_review": json.dumps(review, default=str)},
                         db_path=db_path)
@@ -825,6 +918,10 @@ def assert_item_caption_binding(
     except CaptionMismatchError as e:
         log.error("REFUSING TO RENDER: %s", e)
         raise
+    try:
+        layout_hook(hook_text, render_settings(cfg))
+    except HookTooLong as e:
+        raise _HookLayoutReview(str(e)) from e
 
 
 def render_item_variants(

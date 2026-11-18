@@ -78,7 +78,7 @@ def _cut_item(tmp_db: Path, tmp_path: Path, channel_id: str = "UC9CKhua6_qMznuhE
 def test_tridzo_case_is_regenerated_once_with_the_reason_then_needs_review(tmp_db, tmp_path):
     iid = _cut_item(tmp_db, tmp_path)
     prompts: list[str] = []
-    answer = json.dumps(_data(TRIDZO_HOOK, TRIDZO_VO))
+    answer = json.dumps(_data("ONLINE BETA LEAKED?", TRIDZO_VO))
 
     def fake(prompt, images=None, **kw):
         prompts.append(prompt)

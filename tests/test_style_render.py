@@ -170,7 +170,7 @@ def test_safe_area_placement_after_f1_in_real_libass(tmp_path: Path):
         {"word": "UNBELIEVABLE", "start": 0.0, "end": 0.4},
         {"word": "WORLDBUILDING", "start": 0.45, "end": 0.9},
     ]
-    long_hook = "Nobody noticed this tiny detail hidden in the GTA 6 trailer"
+    long_hook = "Nobody noticed this GTA 6 detail"
     segs = [edits.Segment(0.0, 2.0, "fit"), edits.Segment(2.0, 4.0, "fill")]
     sp = planning.plan_from_words(long_hook, 4.0, words, preset="P1", segments=segs,
                                   channel_name="GamingBolt")
@@ -192,7 +192,7 @@ def test_safe_area_placement_after_f1_in_real_libass(tmp_path: Path):
 
 def test_hook_two_line_outlines_do_not_touch(tmp_path: Path):
     """There must be a clear background gap between the two hook lines."""
-    long_hook = "Nobody noticed this tiny detail hidden in the GTA 6 trailer"
+    long_hook = "Nobody noticed this GTA 6 detail"
     sp = planning.plan_from_words(long_hook, 3.0, [], preset="P0")
     assert len(sp.hook_lines) == 2
     img = _render_ass_frame(render.build_ass_subtitles(long_hook, 3.0, [], sp=sp), tmp_path)
@@ -292,9 +292,9 @@ def test_a1_sfx_peaks_sit_at_least_6db_under_the_speech(tmp_path: Path):
             "-ac", "2", "-c:a", "pcm_s16le", str(speech))
     speech_peak = audio_mix.file_peak_db(speech)
     cues = audio_mix.plan_sfx_cues([edits.Punch(6.3, 0.8, 0.12, 0.12)], SS, hook_at=0.0, duration=8.0)
-    assert [c.kind for c in cues] == ["boom", "whoosh"]
-    gains = {k: audio_mix.sfx_gain_db(speech_peak, audio_mix.file_peak_db(p, -1.0), SS)
-             for k, p in audio_mix.sfx_files(SS).items()}
+    assert [c.category for c in cues] == ["impact", "whoosh"]
+    gains = {cue.path: audio_mix.sfx_gain_db(speech_peak, audio_mix.file_peak_db(cue.path), SS)
+             for cue in cues}
     inputs, chain = audio_mix.sfx_chain(cues, gains, sr, "a_main", "a_sfx")
     chain = render._splice_inputs(chain, len(inputs) // 2, 1, "a")
     out = tmp_path / "mix.wav"

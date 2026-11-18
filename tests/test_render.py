@@ -165,7 +165,7 @@ def test_config_sizes_flow_through(monkeypatch):
 
 
 def test_layout_hook_max_two_lines_inside_safe_width():
-    long_hook = "Nobody noticed this tiny detail hidden in the new GTA 6 trailer"
+    long_hook = "Nobody noticed this GTA 6 detail"
     lines, size = render.layout_hook(long_hook, RS)
     assert 1 <= len(lines) <= 2
     max_w = (SA["x_max"] - SA["x_min"]) - 2 * (RS["hook"]["outline"] + RS["hook"]["shadow"])
@@ -173,6 +173,28 @@ def test_layout_hook_max_two_lines_inside_safe_width():
     assert size < RS["hook"]["font_size"]  # had to shrink
     lines, size = render.layout_hook("IS THIS REAL?", RS)
     assert lines == ["IS THIS REAL?"] and size == RS["hook"]["font_size"]
+    _, size = render.layout_hook("WHO IS LUCIA CAMINOS?", RS)
+    assert size == 150
+    _, size = render.layout_hook("QUALITY OF LIFE IMPROVEMENTS COMING?", RS)
+    assert size == 96
+    with pytest.raises(render.HookTooLong, match="hook too long"):
+        render.layout_hook("TAKE-TWO CONFIRMS GTA 6 RELEASE DATE AGAIN?", RS)
+
+
+def test_long_caption_shrinks_only_its_chunk(tmp_path, caplog):
+    words = [{"word": "INTERNATIONALLY", "start": 0.0, "end": 0.5},
+             {"word": "GTA", "start": 0.5, "end": 1.0},
+             {"word": "W" * 50, "start": 1.0, "end": 1.5}]
+    ass = render.build_ass_subtitles("HOOK", 2.0, words)
+    caption_events = [line for line in ass.splitlines() if line.startswith("Dialogue: 1,")]
+    size = float(re.search(r"\\fs([\d.]+)", caption_events[0]).group(1))
+    assert RS["caption"]["font_size"] * 0.7 < size < RS["caption"]["font_size"]
+    assert r"\fs" not in caption_events[1]
+    assert r"\fs96.6" in caption_events[2]
+    assert "exceeds safe width" in caplog.text
+    img = _render_ass_frame(ass, tmp_path)
+    x0, _, x1, _ = _ink_bbox(img, rows=slice(1170, 1440))
+    assert SA["x_min"] <= x0 < x1 <= SA["x_max"]
 
 
 def test_variant_b_words_offset_by_freeze():
@@ -240,7 +262,7 @@ def test_caption_and_hook_inside_instagram_safe_area(tmp_path: Path):
         {"word": "WORLDBUILDING", "start": 0.45, "end": 0.9},
         {"word": "EVERYWHERE", "start": 0.95, "end": 1.5},
     ]
-    long_hook = "Nobody noticed this tiny detail hidden in the GTA 6 trailer"
+    long_hook = "Nobody noticed this GTA 6 detail"
     ass_text = render.build_ass_subtitles(long_hook, 2.0, words)
     img = _render_ass_frame(ass_text, tmp_path)
 
@@ -343,6 +365,25 @@ def test_variant_b_freeze_then_cut_with_audio_after_freeze(renders):
     assert _rms_window(renders["B"], freeze + 0.3, freeze + 2.5) > 0.01
     # VO audible during the freeze.
     assert _rms_window(renders["B"], 0.1, 0.9) > 0.01
+
+
+def test_render_sidecar_matches_verified_a_and_b(renders):
+    from pipeline import render_meta
+
+    for variant, hook in (("A", "TEST HOOK"), ("B", "TEST HOOK B")):
+        video = renders[variant]
+        assert video.with_suffix(".meta.json").is_file()
+        meta = render_meta.read(video)
+        assert meta["preset"] == "P2"
+        assert meta["hook_text"] == hook
+        assert meta["hook_font_px"] == 150 and meta["hook_lines"] == [hook]
+        assert not meta["hook_below_floor"]
+        assert meta["duration_s"] == pytest.approx(render.media_duration(video), abs=0.05)
+        assert meta["caption_words"]
+        assert [word["i"] for word in meta["caption_words"]] == list(range(len(meta["caption_words"])))
+        assert meta["music_track"] is None and meta["sfx_cues"] == []
+        assert meta["rendered_at"].endswith("+00:00")
+    assert render_meta.read(renders["dir"] / "missing.mp4") == {}
 
 
 def test_variant_b_first_frame_is_frozen(renders):

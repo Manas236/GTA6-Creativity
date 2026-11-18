@@ -24,7 +24,7 @@ GTA_TERMS: tuple[str, ...] = (
     "VICE", "LEONIDA", "AMBROSIA", "MIAMI", "KEYS", "EVERGLADES",
     "PORT", "GATOR", "MOUNT", "KALAGA", "GRASSRIVERS", "HAMLET",
     "TRAILER", "GAMEPLAY", "LEAK", "LEAKED", "MAP", "HEIST", "POLICE",
-    "CHASE", "MONEY", "CASH", "CAR", "CARS", "BIKE", "BEACH", "ONLINE",
+    "CHASE", "MONEY", "CASH", "RICH", "$", "COPS", "WANTED", "ARRESTED", "CAR", "CARS", "BIKE", "BEACH", "ONLINE",
     "MULTIPLAYER", "LAUNCH", "RELEASE", "PS5", "XBOX", "RTX", "FPS",
 )
 
@@ -33,7 +33,10 @@ _WORD_RE = re.compile(r"[A-Z0-9][A-Z0-9'&-]*")
 
 def normalize(token: str) -> str:
     """Upper-case a caption token and drop punctuation, matching caption rendering."""
-    return "".join(ch for ch in str(token).upper() if ch.isalnum() or ch in "'&-").strip("'&-")
+    token = str(token).strip()
+    if token == "$":
+        return token
+    return "".join(ch for ch in token.upper() if ch.isalnum() or ch in "'&-").strip("'&-")
 
 
 def _candidate_terms(ss: dict[str, Any]) -> set[str]:

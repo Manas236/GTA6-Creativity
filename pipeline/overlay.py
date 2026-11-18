@@ -50,10 +50,12 @@ def word_colour(
 # M1 / M2 motion tags
 # --------------------------------------------------------------------------------------
 
-def caption_pop_tags(ss: dict[str, Any]) -> str:
+def caption_pop_tags(ss: dict[str, Any], max_scale: int | None = None) -> str:
     """M1: scale 80% -> 115% -> 100% over ~160 ms (times are ms from the event start)."""
     cp = ss["caption_pop"]
     f, pk = int(cp["from_scale"]), int(cp["peak_scale"])
+    if max_scale is not None:
+        f, pk = min(f, max_scale), min(pk, max_scale)
     t1, t2 = int(cp["peak_ms"]), int(cp["settle_ms"])
     return (
         f"\\fscx{f}\\fscy{f}"

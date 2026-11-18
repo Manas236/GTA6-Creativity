@@ -4,14 +4,25 @@ the Variant B freeze). Pure planning: no ffmpeg, no network."""
 from __future__ import annotations
 
 import copy
+import shutil
+from types import SimpleNamespace
 
 import pytest
 
-from pipeline import audio_mix, config, edits, plan as planning, style
+from pipeline import audio_mix, config, edits, overlay, plan as planning, style
 
 CFG = config.get_config()
 SS = style.style_settings(CFG)
 LEAD = SS["sfx"]["whoosh_lead_s"]
+
+
+@pytest.fixture(autouse=True)
+def sfx_dir(tmp_path, monkeypatch):
+    root = audio_mix.sfx_dir(SS)
+    for name in ("boom.wav", "whoosh.wav"):
+        shutil.copyfile(root / name, tmp_path / name)
+    monkeypatch.setitem(SS["sfx"], "dir", str(tmp_path))
+    return tmp_path
 
 
 def _punch(at: float, rank: int = 0) -> edits.Punch:
@@ -33,6 +44,8 @@ def _analysis(dead_air: edits.Timeline | None = None) -> planning.ClipAnalysis:
 
 
 def _plans(analysis: planning.ClipAnalysis, cfg=CFG, freeze_s: float = 2.0):
+    cfg = copy.deepcopy(cfg)
+    cfg["style"]["sfx"]["dir"] = SS["sfx"]["dir"]
     a = planning.build_style_plan(analysis, "HOOK", variant="A", freeze_s=0.0, cfg=cfg, preset="P2")
     b = planning.build_style_plan(analysis, "HOOK", variant="B", freeze_s=freeze_s, cfg=cfg, preset="P2",
                                   vo_words=[{"word": "VO", "start": 0.0, "end": 1.5}])
@@ -89,7 +102,7 @@ def test_the_cap_and_the_gap_are_config():
     ss4 = copy.deepcopy(SS)
     ss4["sfx"].update(max_per_clip=4, min_gap_s=5.0)
     cues = audio_mix.plan_sfx_cues(punches, ss4, duration=20.0)
-    assert [c.kind for c in cues] == ["boom", "whoosh", "whoosh", "whoosh"]
+    assert [c.kind for c in cues] == ["boom", "whoosh"]  # the only whoosh file cannot be reused
     assert audio_mix.sfx_spacing_problems(cues, ss4) == []
 
     ss_gap = copy.deepcopy(SS)
@@ -108,3 +121,37 @@ def test_sfx_spacing_problems_reports_violations():
         return audio_mix.SfxCue(at, "whoosh", "x")
     assert audio_mix.sfx_spacing_problems([cue(0.0), cue(3.0)], SS) == ["cues at 0.000s and 3.000s are 3.000s apart (< 5.0s)"]
     assert "3 cues > max_per_clip 2" in audio_mix.sfx_spacing_problems([cue(0.0), cue(6.0), cue(12.0)], SS)
+
+
+def _install_cue(root, category, name):
+    directory = root / category
+    directory.mkdir(exist_ok=True)
+    (directory / name).touch()
+
+
+def test_picker_seed_priority_no_repeats_and_fallback(sfx_dir):
+    for name in ("cash_01.wav", "cash_02.wav"):
+        _install_cue(sfx_dir, "cash", name)
+    _install_cue(sfx_dir, "pop", "pop_01.wav")
+    _install_cue(sfx_dir, "whoosh", "whoosh_01.wav")
+    kwargs = dict(item_id="item_x", preset="P2", duration=25,
+                  emoji_cues=[SimpleNamespace(keyword="$", at=6.0), SimpleNamespace(keyword="MONEY", at=12.0)],
+                  caption_at=19.0)
+    punches = [_punch(18)]
+    cues = audio_mix.plan_sfx_cues(punches, SS, **kwargs)
+    assert cues == audio_mix.plan_sfx_cues(punches, SS, **kwargs)
+    assert [(c.category, c.trigger) for c in cues] == [("impact", "hook"), ("cash", "emoji")]
+    assert cues[0].path == str(sfx_dir / "boom.wav")
+
+    settings = copy.deepcopy(SS)
+    settings["sfx"].update(max_per_clip=5, min_gap_s=0, enabled_categories=["cash", "whoosh", "pop"])
+    cues = audio_mix.plan_sfx_cues(punches * 2, settings, **kwargs)
+    assert [c.trigger for c in cues] == ["emoji", "emoji", "punch_in", "caption"]
+    assert len({c.path for c in cues}) == len(cues)
+    assert cues[-1].gain_offset_db == -6
+
+
+def test_themed_emoji_aliases_work_on_caption_timeline():
+    words = [{"word": "$", "start": 0.0}, {"word": "COPS", "start": 5.0}]
+    cues = overlay.plan_emoji_cues(words, ["$", "COPS"], SS, 12)
+    assert [(cue.keyword, cue.codepoint) for cue in cues] == [("$", "1f4b0"), ("COPS", "1f693")]

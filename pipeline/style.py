@@ -64,6 +64,7 @@ PRESET_DEFAULTS: dict[str, dict[str, Any]] = {
 
 STYLE_DEFAULTS: dict[str, Any] = {
     "preset": "P0",
+    "versions": ["P1", "P2", "P3"],
     "presets": PRESET_DEFAULTS,
     # F1 ------------------------------------------------------------------
     "zoom_fill": {
