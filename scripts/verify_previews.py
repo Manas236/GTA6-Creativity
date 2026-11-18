@@ -33,7 +33,7 @@ from typing import Any, Sequence
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline import audio_mix, config, cut as cutmod, endings, render, style  # noqa: E402
+from pipeline import audio_mix, config, cut as cutmod, endings, render, render_meta, style  # noqa: E402
 
 TABLE_START = "Endings and SFX check (scripts/verify_previews.py)"
 TAIL_S = 3.0
@@ -167,12 +167,17 @@ def check(out_root: Path, items: Sequence[str] | None = None, cfg: dict[str, Any
                 row.source_ok, row.source_note = source_check(plan, es, cfg, cache) if plan else (None, "no plan")
             except Exception as e:  # noqa: BLE001 - reported per row
                 row.error = f"{type(e).__name__}: {e}"
-            cues = (plan.get("sfx") or {}).get(variant, [])
+            meta = render_meta.read(mp4)
+            if meta:
+                print(render_meta.summary(mp4))
+                cues = [(cue["t"], cue["category"]) for cue in meta["sfx_cues"]]
+            else:
+                cues = (plan.get("sfx") or {}).get(variant, [])
             row.sfx = sorted(round(float(c[0]), 2) for c in cues)
             row.gaps = [round(b - a, 2) for a, b in zip(row.sfx, row.sfx[1:])]
             problems = audio_mix.sfx_spacing_problems(
                 [audio_mix.SfxCue(float(c[0]), str(c[1]), "") for c in cues], ss)
-            row.sfx_ok = not problems and plan_file.exists()
+            row.sfx_ok = not problems and (bool(meta) or plan_file.exists())
             rows.append(row)
     return rows
 
@@ -211,13 +216,38 @@ def write_into_readme(out_root: Path, lines: Sequence[str]) -> Path:
     return readme
 
 
+def check_synthetic(out_root: Path, cfg: dict[str, Any]) -> int:
+    """Check sidecars and streams for generated fixtures without downloading speech models."""
+    videos = sorted(out_root.glob("synthetic_P*.mp4"))
+    if not videos:
+        videos = sorted(out_root.glob("P*_[AB].mp4"))
+    passed = 0
+    for video in videos:
+        print(render_meta.summary(video))
+        meta = render_meta.read(video)
+        if not meta:
+            continue
+        cues = [audio_mix.SfxCue(cue["t"], cue["category"], cue["file"]) for cue in meta["sfx_cues"]]
+        problems = audio_mix.sfx_spacing_problems(cues, style.style_settings(cfg))
+        ok, _, errors = render.verify_render(video, cfg, expected_duration=meta["duration_s"])
+        if ok and not problems and not meta["hook_below_floor"]:
+            passed += 1
+        else:
+            print(f"  FAIL: {'; '.join([*errors, *problems])}")
+    print(f"{passed}/{len(videos)} renders pass.")
+    return 0 if videos and passed == len(videos) else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Check preview renders for mid-sentence endings and SFX spacing.")
-    ap.add_argument("--out", default=None, help="previews root (default media/previews)")
+    ap.add_argument("--out", default=None, help="previews root (default samples/synthetic/presets)")
     ap.add_argument("--items", nargs="*", default=None)
     args = ap.parse_args(argv)
     cfg = config.get_config()
-    out_root = Path(args.out) if args.out else config.media_dir("previews")
+    out_root = Path(args.out) if args.out else ROOT / "samples" / "synthetic" / "presets"
+    if not args.items and (not args.out or any(out_root.glob("synthetic_P*.mp4"))
+                           or any(out_root.glob("P*_[AB].mp4"))):
+        return check_synthetic(out_root, cfg)
     rows = check(out_root, args.items, cfg)
     lines = table(rows, style.style_settings(cfg))
     readme = write_into_readme(out_root, lines)

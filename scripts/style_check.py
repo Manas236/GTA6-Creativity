@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
-from pipeline import audio_mix, config, edits, plan as planning, render, style  # noqa: E402
+from pipeline import audio_mix, config, edits, plan as planning, render, render_meta, style  # noqa: E402
 
 HOOK = "Nobody noticed this GTA 6 detail"
 CHANNEL = "GamingBolt"
@@ -279,6 +279,7 @@ def main() -> int:
             res = render.render_item_variants(
                 cut, vo, HOOK, words, vo_words, a, b, work / ".subs", cfg=cfg,
                 name=preset, preset=preset, channel_name=CHANNEL, keyword_list=keyword_list,
+                clean_cut_end=True,
             )
         except render.RenderVerificationError as e:
             print(f"FAIL {preset}: {e}")
@@ -294,6 +295,8 @@ def main() -> int:
         for name, p, path in (("A", res["probe_a"], a), ("B", res["probe_b"], b)):
             rows.append((preset, name, p["video_duration"], p["audio_duration"], p["fps"],
                          p["sample_rate"], p["channels"], f"{p['width']}x{p['height']}"))
+        print(render_meta.summary(a))
+        print(render_meta.summary(b))
         sa = res["style_a"]
         print(
             f"{preset}: {time.time() - t0:5.1f}s  A={res['probe_a']['video_duration']:.3f}s "
