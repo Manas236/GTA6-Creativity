@@ -23,43 +23,38 @@ regardless of its current directory. Stop the dashboard with Ctrl-C in its windo
 
 Flask provides small Python routes, signed sessions and confirmation tickets.
 Waitress serves them on Windows and Linux, bound explicitly to 127.0.0.1.
-Plain HTML/CSS/JavaScript and Canvas charts need no Node/npm build or CDN.
+Plain HTML, CSS and JavaScript need no Node/npm build or CDN.
 SQLite remains the source of truth; existing pipeline functions own decisions,
 checks, scheduling and publishing.
 
 ## Pages
 
-- **Overview:** all `db.STAGES`, ready buffer/target, approval mode and first-live
-  age, next five queued items, A/B allocation, runner heartbeat, source/Meta
-  cooldowns, and a prominent dry-run banner. Times use the active posting
-  profile's timezone, shown beside every calendar. With a running instrumented
-  runner, its observed scheduling settings stay visible until the next cycle
-  reloads the updated configuration.
-- **Make:** discover a batch or paste a source URL with optional time hints.
-  Job progress lists the stage and result for each requested item.
-- **Review:** compare A/B renders and apply decisions, remake a clip, or edit
-  its hook or caption.
-- **Library:** search or filter all items and select eligible clips for bulk
-  deletion or rejection.
-- **Queue & calendar:** chronological local-day timeline, A/B variant or pending
-  draw, per-platform status, search and a filter for every stage. Approved items
-  without a slot appear separately. The scheduler owns actual slot allocation.
-- **Item detail:** both render players, cut player, hook, voiceover script,
-  cut window, source authenticity, binding diagnostics and full stage history.
-  Missing/purged files are marked unavailable. Media requests support seeking
-  and are restricted to registered paths inside the configured media root.
-- **Analytics:** platform views by publish date, a selectable post's snapshots
-  over observation time, scheduler variant statistics and allocation reason,
-  plus hook-style/source bars. Totals use the latest snapshot per platform post;
-  they never add cumulative 24h and 72h snapshots together. These are descriptive
-  totals, not age-normalized causal comparisons.
-- **Failures & review:** failed/rejected items with stage/reason, needs-review
-  items, and the existing 24h `cut_outcome_stats` no-clean-ending rate.
-- **Settings:** local scheduling, publishing, Telegram, buffer and discovery
-  preferences. Includes per-service connection Test buttons and a parallel Test all, using the
-  current local `.env` without sending its values to the browser. Loading,
-  refreshing and polling never run probes. Results show masked API errors,
-  status and last-check time; they remain in memory until the dashboard stops.
+- **Overview** shows clips that need review, the next post, runner controls
+  and problems. The compact health row includes the ready buffer and Gemini quota.
+- **Make** supports a batch or a source URL with optional time hints. Job
+  progress lists each clip. **Discovered** shows candidates, their scores and ages.
+- **Review** has To approve, Needs a decision, Failed and Rejected tabs.
+  The old `/failures` URL opens Failed, which includes the no-clean-ending
+  rate over the last 24 hours. New clips have P1 Clean, P2 Punchy and P3 Full
+  hype. The version switcher keeps the player's position. Use 1–3 to switch
+  presets on new clips. On legacy clips, 1 and 2 approve the Captions version
+  or Voiceover version respectively. The question-mark button lists the
+  other shortcuts. Use Z to undo reversible changes.
+- **Library** supports search, filters, and bulk deletion or rejection.
+- **Queue** shows a seven-day calendar with open times. Drag an approved
+  clip onto an empty slot, or switch to List view. Scheduled times use the
+  active profile's timezone.
+- **Item detail** shows previews, cut context, binding diagnostics and stage
+  history. Published posts link to their Reels and show recorded metrics.
+- **Analytics** shows views, likes, comments and shares. Totals use the latest
+  snapshot per platform post. Missed windows and late snapshots are labeled.
+- **Logs** shows redacted runner output. Pause holds the view in place.
+  Actions can start analytics or cleanup.
+- **Settings** groups Posting, Look and sound, Sources, Approval, Voiceover,
+  Retention and Connections. Each editable group saves independently. The
+  Posting tab includes the switch between dry run and live posting.
+  Connections checks run on request using the current local `.env`. Results
+  show masked API errors, status and last-check time.
   Green means OK, red failed, amber a Meta expiry/scope warning, grey unset or
   not checked. Each check has a 10-second deadline. Empty credentials skip HTTP.
   Gemini only lists models, Telegram only reads bot/chat details, Meta reads
@@ -73,17 +68,32 @@ checks, scheduling and publishing.
   a separate, explicit Telegram action and is never part of Test all. Connection
   checks and this send action are immediate and do not need a running runner.
 
-The UI polls every 2.5 seconds and pauses polling while a confirmation is open.
-Item players keep playing while status refreshes.
-Gemini's remaining daily allowance is not available locally: the panel displays
-only a cooldown observed by the runner, or **Unknown**. A heartbeat on a different
-host proves recent activity, not a local PID check. No secrets are requested.
+The dashboard polls every 30 seconds. Make also polls job progress every
+2.5 seconds. Polling pauses while a confirmation dialog is open. Theme defaults
+to Light. Dark and System are available in the top bar. Gemini quota shows
+**not reported** when the runner has no active cooldown to report.
+
+## Mock mode
+
+Start the dashboard with a temporary database and media directory:
+
+```bash
+demo_dir=$(mktemp -d)
+mkdir -p "$demo_dir/media"
+python -m dashboard --db "$demo_dir/pipeline.db" --media-root "$demo_dir/media"
+```
+
+Open [Overview in mock mode](http://127.0.0.1:8765/?mock=1). Add `?mock=1`
+to any dashboard page, or `&mock=1` when it already has a query. The browser
+uses fixtures and a local sample video. Mock changes apply in memory for the
+current page session, including the simulated publishing-mode switch. Regular
+pages use the active backend and omit controls when their APIs are unavailable.
 
 ## How controls work
 
-Every control first prepares a read-only preview via POST, then needs a second
-**Confirm** POST. Confirmations expire after 15 minutes and are bound to
-that browser session. CSRF tokens, strict same-site cookies, Origin/Host checks
+Ticketed actions send a prepare POST and a confirm POST. The UI asks for
+confirmation when changing publishing mode, posting now or deleting. Tickets
+expire after 15 minutes and are bound to that browser session. CSRF tokens, strict same-site cookies, Origin/Host checks
 and a local-only content security policy protect the loopback UI. This is a
 single-user local tool, not an authenticated multi-user server: do not expose it
 through a proxy or tunnel.
