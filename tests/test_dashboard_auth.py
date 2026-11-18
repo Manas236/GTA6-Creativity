@@ -293,6 +293,16 @@ def test_only_this_runs_tunnel_host_is_allowed(tmp_db, cfg, tmp_path, env_file):
     assert good.status_code == 400  # passed Host, Origin, login and CSRF; the body is invalid
 
 
+def test_tunnel_refused_when_password_is_cleared_while_tunnel_runs(tmp_db, cfg, tmp_path, env_file):
+    app, _ = make_app(tmp_db, cfg, tmp_path, env_file)
+    client = app.test_client()
+    assert client.get("/login", base_url=TUNNEL).status_code == 200
+    auth.write_hash(env_file, None)  # clear-password with the dashboard (and tunnel) still running
+    for path in ("/", "/login", "/api/state", "/media/x/a"):
+        assert client.get(path, base_url=TUNNEL).status_code == 403, path
+    assert client.get("/api/state", base_url=BASE).status_code == 200  # local stays usable
+
+
 def test_tunnel_host_refused_when_remote_is_off(tmp_db, cfg, tmp_path, env_file):
     app, _ = make_app(tmp_db, cfg, tmp_path, env_file, remote_host=None)
     assert app.test_client().get("/login", base_url=TUNNEL).status_code == 403

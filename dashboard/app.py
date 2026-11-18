@@ -151,6 +151,9 @@ def create_app(db_path=None, cfg=None, media_root=None, env_path=None, remote=No
         if not g.tunnel and host.split(":")[0] not in ("127.0.0.1", "localhost"):
             abort(403, "Use the loopback address printed when the dashboard starts.")
         password_hash = auth.read_hash(env_file)
+        if g.tunnel and not password_hash:
+            # clear-password while the tunnel is still up must not leave a public, open dashboard.
+            abort(403, "Remote access needs a dashboard password. Run python -m dashboard set-password.")
         g.password_hash = password_hash
         g.signed_in = signed_in(password_hash)
         if request.method == "POST":
