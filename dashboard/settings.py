@@ -8,7 +8,7 @@ from threading import Lock
 
 import yaml
 
-from pipeline import config, scheduler, twitch
+from pipeline import config, posting, scheduler, twitch
 from .commands import ControlError
 
 _write_lock = Lock()
@@ -117,7 +117,7 @@ FIELDS = {
             "max_per_clip": ("style.sfx.max_per_clip", 2),
             "min_gap_s": ("style.sfx.min_gap_s", 3.0),
         },
-        "music": {"enabled": ("style.music.enabled", False)},
+        "music": {"enabled": ("style.music_bed.enabled", True)},
         "hook": {
             "font_size": ("render.hook.font_size", 150),
             "min_font_size": ("render.hook.min_font_size", 96),
@@ -177,6 +177,8 @@ def grouped(cfg):
             value = _get(cfg, key, default)
             if field == "slots":
                 value = {name: profile["slots"] for name, profile in (value or scheduler.DEFAULT_PROFILES).items()}
+            elif field == "caption_templates":
+                value = {**posting.CAPTION_TEMPLATES, **(value or {})}
             elif field == "platforms":
                 value = {platform: bool(value.get(platform)) for platform in ("instagram", "facebook")}
             elif field == "hashtags" and isinstance(value, str):
@@ -227,6 +229,8 @@ def _validate_field(field, value, default, cfg):
         from string import Formatter
         if not isinstance(value, dict) or any(not isinstance(v, str) or len(v) > 2200 for v in value.values()):
             raise ControlError("caption_templates must map sources to text of at most 2,200 characters.")
+        if any(not template.strip() for template in value.values()):
+            raise ControlError("Caption templates cannot be blank.")
         try:
             for template in value.values():
                 for _, name, spec, conversion in Formatter().parse(template):
