@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import connection_checks
+
 from dashboard import workers
 from dashboard.app import create_app
 from pipeline import clock, config, creation, db, plan, posting, runner, scheduler
@@ -159,6 +161,23 @@ def test_snapshot_and_go_live_guard(demo, monkeypatch):
     response = post("/api/prepare", {"action": "go_live"})
     assert response.status_code == 409
     assert "successful Meta connection test" in response.get_json()["error"]
+
+    checked_at = clock.utcnow()
+    services = ("instagram_token", "instagram_user", "facebook_page")
+    monkeypatch.setattr(connection_checks, "current_environment", lambda: {})
+    monkeypatch.setattr(connection_checks, "run_checks", lambda *_args, **_kwargs: {
+        service: {"status": "ok", "checked_at": clock.iso(checked_at), "reason": "fixture"}
+        for service in services
+    })
+    assert post("/api/connections/test", {"service": "all"}).status_code == 200
+    prepared = post("/api/prepare", {"action": "go_live"})
+    assert prepared.status_code == 200
+    monkeypatch.setattr(clock, "utcnow", lambda: checked_at + timedelta(minutes=16))
+    response = post("/api/confirm", {"ticket": prepared.get_json()["ticket"]})
+    assert response.status_code == 202
+    refused = response.get_json()["command"]
+    assert refused["status"] == "refused"
+    assert "successful Meta connection test" in refused["result"]
     assert client.get("/api/settings").get_json()["golive"]["dry_run"] is True
 
 
