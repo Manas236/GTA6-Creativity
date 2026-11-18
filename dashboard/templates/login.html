@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Sign in · Pipeline Control</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="login-body">
+    <main class="login-card">
+      <div class="brand"><span class="brand-mark">VI</span><span>Felony Flamingo<span class="brand-sub">Creator studio</span></span></div>
+      <h1>Sign in</h1>
+      <p class="muted">This control panel is password protected.</p>
+      {% if error %}<p class="error login-error" role="alert">{{ error }}</p>{% endif %}
+      <form method="post" action="/login" class="login-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <input type="hidden" name="next" value="{{ next }}" />
+        <label>Password
+          <input type="password" name="password" autocomplete="current-password" required autofocus />
+        </label>
+        <label class="login-remember"><input type="checkbox" name="remember" /> Keep me signed in on this device</label>
+        <button class="button primary" type="submit">Sign in</button>
+      </form>
+    </main>
+  </body>
+</html>

@@ -1315,3 +1315,15 @@ main:has(> .review-toolbar) { padding-top: 10px; }
 
 .toast-entry.toast-error { color: var(--red); background: var(--error-bg); border-color: var(--red); }
 .toast-entry.toast-success { color: var(--green); background: var(--success-bg); }
+
+/* Sign-in page and sidebar Logout (password-protected dashboard) */
+.logout-button { margin-top: 10px; width: 100%; }
+.login-body { display: grid; place-items: center; min-height: 100vh; padding: 16px; background: var(--bg); }
+.login-card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; padding: 28px 24px; box-shadow: 0 8px 28px var(--shadow); }
+.login-card h1 { font-size: 1.4rem; margin: 22px 0 4px; }
+.login-form { display: grid; gap: 14px; margin-top: 18px; }
+.login-form label { display: grid; gap: 6px; font-weight: 600; }
+.login-form input[type="password"] { padding: 10px 12px; font-size: 1rem; }
+.login-form .login-remember { display: flex; align-items: center; gap: 8px; font-weight: 400; }
+.login-error { margin: 12px 0 0; }

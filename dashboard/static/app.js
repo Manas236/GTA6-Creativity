@@ -432,6 +432,11 @@ async function api(url, body) {
           body: JSON.stringify(body),
         },
   );
+  if (response.status === 401) {
+    // Signed out (idle timeout, Logout elsewhere or a new password): go to the login page.
+    location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search);
+    throw Object.assign(new Error("Sign in again."), { status: 401 });
+  }
   const data = await response.json().catch(() => null);
   if (!response.ok || data === null) {
     const error = new Error(data?.error || `Request failed (${response.status}).`);
@@ -718,6 +723,23 @@ function updateRunnerLabel() {
     state.lock.kind === "make" ? "Make job running" : "Runner running";
 }
 
+function remoteLabel(remote) {
+  if (!remote || remote.status === "off") return "remote off";
+  if (remote.status === "on" && remote.url) return "remote " + remote.url;
+  if (remote.status === "waiting_for_password") return "remote waiting for a password";
+  if (remote.status === "starting") return "remote starting";
+  return "remote unavailable";
+}
+
+document.querySelector("#logout")?.addEventListener("click", async () => {
+  try {
+    const result = await api("/logout", {});
+    location.href = result.redirect || "/login";
+  } catch (error) {
+    if (error.status !== 401) toast(error.message, { error: true });
+  }
+});
+
 async function refresh(manual = false) {
   try {
     state = await api("/api/state");
@@ -732,7 +754,9 @@ async function refresh(manual = false) {
       status.dry_run ? "Dry run" : "Live posting",
       "runner " + status.runner,
       status.next_post_at && "next post " + formatTime(status.next_post_at, { day: undefined, month: undefined }),
+      remoteLabel(state.remote),
     ].filter(Boolean).join(" · ");
+    document.querySelector("#logout").hidden = !state.auth;
     document.querySelector("#nav-review").textContent = state.todo?.to_review ?? state.items.filter(isReviewItem).length;
     if (!logsChecked) {
       logsChecked = true;
