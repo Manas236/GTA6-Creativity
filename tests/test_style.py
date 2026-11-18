@@ -454,8 +454,10 @@ def test_a2_missing_bed_is_skipped_not_fatal(tmp_path):
     inputs, chain = audio_mix.music_chain(10.0, [], SS, 48000, "a_main", "a_mus",
                                           path=tmp_path / "nope.mp3")
     assert inputs == [] and chain == "[a_main]anull[a_mus]"
-    sp = _plan("P3")
-    assert sp.music_file is None or audio_mix.music_path(SS).exists()
+    sp = _plan("P3", cfg={"style": {"music_bed": {
+        "library_dir": str(tmp_path), "file": str(tmp_path / "nope.mp3"),
+    }}})
+    assert sp.music_file is None
 
 
 # ============================================================ A3 dead-air removal

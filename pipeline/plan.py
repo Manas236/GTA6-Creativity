@@ -403,12 +403,13 @@ def build_style_plan(
     music_file = None
     spans: list[tuple[float, float]] = []
     if flags["music_bed"]:
-        mp = audio_mix.music_path(ss)
+        # The renderer makes its final selection using the item ID once it has the output path.
+        track = audio_mix.pick_music(ss, Path(analysis.cut_path).stem)
         spans = audio_mix.speech_spans(words_out, ss)
-        if mp.exists():
-            music_file = str(mp)
+        if track is not None:
+            music_file = str(track)
         else:
-            log.warning("A2 music bed missing (%s); run scripts/fetch_assets.py on the laptop", mp)
+            log.warning("A2 music bed missing; run scripts/fetch_assets.py on the pipeline PC")
 
     fade = float(ss["loop_end"]["audio_fade_s"]) if flags["loop_end"] else float(rs["end_fade_s"])
     if speech_out:

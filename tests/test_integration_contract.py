@@ -186,7 +186,9 @@ def test_music_toggle_controls_p3_plan(demo, tmp_path):
     assert client.get("/api/settings").get_json()["look"]["music"]["enabled"] is True
     track = tmp_path / "fixture.wav"
     track.touch()
-    base = config.merge_config(demo[2], {"style": {"music_bed": {"file": str(track)}}})
+    base = config.merge_config(demo[2], {"style": {"music_bed": {
+        "library_dir": str(tmp_path), "file": str(tmp_path / "missing-fallback.mp3"),
+    }}})
     analysis = plan.analyze_clip("unused.mp4", cfg=base, preset="P0", duration=3)
     for enabled in (False, True):
         assert post("/api/settings/look", {"music": {"enabled": enabled}}).status_code == 200
