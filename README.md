@@ -113,3 +113,8 @@ On Windows, double-click `setup.bat` once, then `dashboard.bat` to open the loca
 panel. Or run `python -m dashboard` and open http://127.0.0.1:8765 for the local queue,
 previews, analytics and confirmed controls. Keep the runner loop running to apply
 commands between stages. Setup, demo data and safety details: [DASHBOARD.md](DASHBOARD.md).
+
+Remote access from a phone: set a password with `python -m dashboard set-password`
+and turn on `dashboard.remote.enabled` in `config.local.yaml`. The dashboard then
+opens a Cloudflare quick tunnel and sends its `trycloudflare.com` link to Telegram.
+Every page needs the password. See [DASHBOARD.md](DASHBOARD.md#remote-access).

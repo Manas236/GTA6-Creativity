@@ -73,6 +73,87 @@ The dashboard polls every 30 seconds. Make also polls job progress every
 to Light. Dark and System are available in the top bar. Gemini quota shows
 **not reported** when the runner has no active cooldown to report.
 
+## Remote access
+
+The owner can open the dashboard from a phone through a **Cloudflare quick tunnel**.
+`cloudflared tunnel --url http://127.0.0.1:8765` needs no Cloudflare account and
+prints a random `https://<words>.trycloudflare.com` address. The dashboard itself
+still binds to 127.0.0.1 only. cloudflared connects out to Cloudflare, so no router
+port is opened. Once signed in you have full control, the same as locally: the same
+CSRF tokens, prepare/confirm tickets and confirmation dialogs apply.
+
+**Why a password:** anyone who learns the link could otherwise approve, post, delete
+or switch to live posting. The tunnel therefore never starts unless a password is set.
+
+### Password
+
+```powershell
+python -m dashboard set-password     # asks twice; at least 12 characters
+python -m dashboard clear-password   # removes it (the remote link then stays off)
+```
+
+`set-password` stores only a scrypt hash, as `DASHBOARD_PASSWORD_HASH=` in `.env`.
+It makes a dated backup `.env.YYYY-MM-DD_HHMMSS.bak` first, and the hash is never
+printed. Both commands sign out every device. Restart the dashboard afterwards so
+the remote link picks up the change.
+
+With a password set, every page, `/api/*` and `/media/*` needs a signed-in session,
+locally as well as remotely. Only the sign-in page and its stylesheet are public.
+Sessions end after 12 hours without activity. **Keep me signed in on this device**
+extends that to 30 days. **Log out** in the sidebar signs out every device, since
+there is one user. Cookies are HttpOnly, SameSite=Lax (a dashboard link tapped in
+Telegram opens signed in) and Secure over the tunnel's HTTPS.
+
+Brute-force limits: 5 wrong passwords from one IP within 15 minutes block that IP
+for 15 minutes. 20 failures across all IPs within an hour block every remote sign-in
+for 1 hour. Sign-in on the PC itself (http://127.0.0.1:8765) keeps working during
+that hour. Every failure shows the same message. Over the tunnel, the visitor's IP
+comes from Cloudflare's `CF-Connecting-IP` header.
+
+### Turning it on
+
+1. Install cloudflared once: `winget install --id Cloudflare.cloudflared`.
+2. `python -m dashboard set-password`.
+3. In `config.local.yaml`:
+   ```yaml
+   dashboard:
+     remote:
+       enabled: true
+       cloudflared_path: null   # null: PATH, then the winget install folders
+   ```
+4. Start the dashboard as usual (`dashboard.bat` or `python -m dashboard`).
+   The console prints `REMOTE LINK (password protected): https://….trycloudflare.com`,
+   and the same link arrives in Telegram.
+
+The link changes every time the dashboard (or cloudflared) restarts. Only this run's
+exact hostname is accepted; other `trycloudflare.com` hosts are refused. If
+cloudflared exits, the dashboard restarts it with backoff (5, 10, 20, 40 and 80 s,
+up to 5 tries) and sends the new link. cloudflared is a child process: it stops when
+the dashboard stops, including on Ctrl-C or closing the window. The status line at
+the top of the dashboard shows the current link, `remote off`, or
+`remote waiting for a password`.
+
+If `enabled: true` but no password is set, the console says the remote link is
+waiting for a password and the dashboard runs locally only. If cloudflared prints no
+link within 60 seconds, the error is printed and the dashboard stays local-only.
+
+### Telegram messages
+
+These go through the pipeline's normal alert path, to the same chat, prefixed 🚨:
+
+| Message | Meaning |
+| --- | --- |
+| `Dashboard link: https://….trycloudflare.com` | The tunnel started or restarted. This is the current link. |
+| `Dashboard sign-in through the remote link` with time (IST), IP and browser | Someone signed in over the tunnel. If it was not you, run `set-password` right away (this signs everyone out) and restart the dashboard. Local sign-ins send nothing. |
+| `Dashboard: 20 failed sign-ins in the last hour…` | Someone is guessing passwords. Remote sign-in is refused for an hour. Consider turning remote off. |
+
+### Turning it off
+
+Set `dashboard.remote.enabled: false` in `config.local.yaml` (or delete that block;
+the shipped default is off) and restart the dashboard. The old link stops working
+when cloudflared stops. `clear-password` also keeps the tunnel from starting and
+returns the dashboard to the unauthenticated, loopback-only mode.
+
 ## Mock mode
 
 Start the dashboard with a temporary database and media directory:
@@ -93,10 +174,11 @@ pages use the active backend and omit controls when their APIs are unavailable.
 
 Ticketed actions send a prepare POST and a confirm POST. The UI asks for
 confirmation when changing publishing mode, posting now or deleting. Tickets
-expire after 15 minutes and are bound to that browser session. CSRF tokens, strict same-site cookies, Origin/Host checks
-and a local-only content security policy protect the loopback UI. This is a
-single-user local tool, not an authenticated multi-user server: do not expose it
-through a proxy or tunnel.
+expire after 15 minutes and are bound to that browser session. CSRF tokens, same-site (Lax) cookies, Origin/Host checks
+and a local-only content security policy protect the UI. It is a single-user
+tool. The only supported way to reach it from another device is the
+password-protected Cloudflare quick tunnel described in
+[Remote access](#remote-access). Do not put any other proxy or tunnel in front of it.
 
 Confirmation records the request in `dashboard_commands`. If the runner has a
 fresh heartbeat and holds the lock, it applies quick commands between stages.
