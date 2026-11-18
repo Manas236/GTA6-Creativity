@@ -41,6 +41,7 @@ from typing import Any
 import requests
 
 from . import binding, config, db, keywords
+from .rendercore import HookTooLong, hook_character_budget, layout_hook, render_settings
 
 log = logging.getLogger(__name__)
 
@@ -368,6 +369,8 @@ PREVIOUS ATTEMPT REJECTED: {previous_failure}
 Write a NEW hook and voiceover that only use what is said in the CLIP TRANSCRIPT or clearly visible in the frames.
 """
 
+    rs = render_settings(cfg)
+    budget = hook_character_budget(rs)
     prompt = f"""You are a content strategist for high-performing, authentic GTA 6 short-form vertical videos (Reels).
 You are writing for ONE short clip cut out of a longer source video. Viewers see ONLY this clip:
 the 4 frames are sampled from it and the CLIP TRANSCRIPT is every word spoken in it.{clip_line}
@@ -384,7 +387,7 @@ nothing specific, write an honest generic question hook instead.
 
 TASK 2: WRITE HOOK
 - Hook style: Choose one of "curiosity", "question", or "hype_analysis".
-- Hook text: 1-2 short lines, ALL-CAPS, maximum 6-8 words. High impact, readable in 2 seconds.
+- Hook text: Up to 2 lines of at most {budget} characters each (including spaces), ALL-CAPS, about 4 to 5 words total. High impact, readable in 2 seconds.
 - It must describe what happens in THIS clip (see the grounding rule): unless it is a generic question,
   it uses at least 2 specific words (names, places, things) that are said in the CLIP TRANSCRIPT.
 - CRITICAL HONESTY RULE: If authenticity is "unverified", the hook MUST NOT claim this is confirmed real GTA 6! Frame it honestly as a question or speculation (e.g., "IS THIS REALLY GTA 6?", "WHAT IS LUCIA DOING IN VICE CITY?"). Never deceive viewers.
@@ -413,9 +416,33 @@ Return ONLY a valid JSON object with EXACTLY this structure:
   "keywords": ["WORD", "WORD", "WORD"]
 }}
 """
-    raw_response = _call_gemini(prompt, images=sample_frames, model=model, api_key=api_key,
-                                json_mode=True, cfg=cfg)
+    best = None
+    best_px = 0
+    for attempt in range(3):
+        retry = (
+            f"\nYour last hook was too wide. Use at most {budget} characters per line, "
+            "including spaces, on up to two lines. Write a shorter grounded hook."
+            if attempt else ""
+        )
+        raw_response = _call_gemini(prompt + retry, images=sample_frames, model=model,
+                                    api_key=api_key, json_mode=True, cfg=cfg)
+        data = _parse_hook_response(raw_response, authenticity, transcript_text, cfg)
+        try:
+            _, px = layout_hook(data["hook_text"], rs)
+        except HookTooLong:
+            continue
+        if px >= int(rs["hook"]["warn_below_font_size"]):
+            return data
+        if px > best_px:
+            best, best_px = data, px
+    if best is not None:
+        return best
+    raise HookTooLong(candidate=data)
 
+
+def _parse_hook_response(
+    raw_response: str, authenticity: str, transcript_text: str, cfg: dict[str, Any]
+) -> dict[str, Any]:
     # Tolerate a markdown fence around the JSON, nothing else.
     clean = re.sub(r"^```(?:json)?\s*", "", raw_response.strip())
     clean = re.sub(r"\s*```$", "", clean)
@@ -790,11 +817,22 @@ def run_hooks_for_item(
                         "hook_style": item.get("hook_style") or "question", "authenticity": source_tag,
                         "keywords": keywords.rule_keywords(item["hook_text"], cfg),
                         "keywords_source": "rules"}
+                try:
+                    layout_hook(data["hook_text"], render_settings(cfg))
+                except HookTooLong as e:
+                    raise HookTooLong(candidate=data) from e
             else:
                 data = generate_hook_and_voiceover(
                     cut_path, source_title, transcript_text=transcript, model=model, cfg=cfg,
                     authenticity=source_tag, frames=frames, segment=segment, previous_failure=previous_failure,
                 )
+        except HookTooLong as e:
+            if e.candidate is None:
+                raise
+            candidate = e.candidate
+            rejected.append({"hook_text": candidate["hook_text"], "voiceover_script": candidate["voiceover_script"],
+                             "reason": "hook too long"})
+            return _send_to_review(item, candidate, rejected, transcript, words, db_path)
         except GeminiTransientError as e:
             return _wait_for_gemini(item, e, cfg, db_path)       # not an attempt: next cycle
         except Exception as e:
@@ -958,6 +996,8 @@ def _send_to_review(
         )
     db.transition_stage(item_id, "needs_review", db_path=db_path)
     msg = f"needs_review: {len(rejected)} hooks failed the segment check (last: {data['hook_text']!r}: {reason})"
+    if reason == "hook too long":
+        msg = "needs_review: hook too long"
     db.log_stage(item_id, "hooks", "needs_review", message=msg, db_path=db_path)
     log.warning("Item %s sent to manual review: %s", item_id, msg)
     return False, msg

@@ -1,0 +1,230 @@
+- category: impact
+  file: impact_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/impact-sounds/impactPunch_heavy_002.ogg
+  source_page: https://kenney.nl/assets/impact-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: f6668d56879ac0ee8226ea267f6ea6bd605ca843e3407247b173f9311557b0fe
+- category: impact
+  file: impact_02.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/impact-sounds/impactSoft_heavy_003.ogg
+  source_page: https://kenney.nl/assets/impact-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 292c893ccbffe9943bfcaeabfe1d43908331903c3084640c31b60238d5439757
+- category: impact
+  file: impact_03.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/impact-sounds/impactWood_heavy_001.ogg
+  source_page: https://kenney.nl/assets/impact-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: e0cadf57826bc11c28e6e86bdd53d86930d3283caa64b8174d86f9aa04a15932
+- category: whoosh
+  file: whoosh_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/oga-battle/battle_sound_effects/swish_2.wav
+  source_page: https://opengameart.org/content/battle-sound-effects
+  licence: CC0-1.0
+  author: Ogrebane
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 83a5ea756d4cf6835575ed02a5f55d56c83c5812f21c5a948abaee765b288863
+- category: whoosh
+  file: whoosh_02.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/oga-battle/battle_sound_effects/swish_3.wav
+  source_page: https://opengameart.org/content/battle-sound-effects
+  licence: CC0-1.0
+  author: Ogrebane
+  trim:
+  - 0.0
+  - 1.2
+  sha256: bca72121e7fe1db971dff3185cebc729e6ea746e12454ff72f6124437fc52363
+- category: whoosh
+  file: whoosh_03.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/oga-battle/battle_sound_effects/swish_4.wav
+  source_page: https://opengameart.org/content/battle-sound-effects
+  licence: CC0-1.0
+  author: Ogrebane
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 832c7bc3e427dbffc96e2fac747a0aab2fcf6715962c059535ee1151de090c3b
+- category: riser
+  file: riser_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/oga-levelup-powerup/Rise01.wav
+  source_page: https://opengameart.org/content/level-up-power-up-coin-get-13-sounds
+  licence: CC0-1.0
+  author: wobbleboxx
+  trim:
+  - 0.0
+  - 2.0
+  sha256: 7851455f04e7098156b2982e30a74be02514fcdff7438f46c2db77b34a073c26
+- category: riser
+  file: riser_02.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/oga-levelup-powerup/Rise04.wav
+  source_page: https://opengameart.org/content/level-up-power-up-coin-get-13-sounds
+  licence: CC0-1.0
+  author: wobbleboxx
+  trim:
+  - 0.0
+  - 2.0
+  sha256: 95e71bc0b5fead6a6330e6be5f5a00e9ecc84123d339d53377b6c8ed65822ed8
+- category: riser
+  file: riser_03.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/oga-levelup-powerup/Rise07.wav
+  source_page: https://opengameart.org/content/level-up-power-up-coin-get-13-sounds
+  licence: CC0-1.0
+  author: wobbleboxx
+  trim:
+  - 0.0
+  - 2.0
+  sha256: 048978c5e6e9580e8e92de098fdc70ceb80200f8fc40910dd06251d8e693c2a7
+- category: glitch
+  file: glitch_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/glitch_001.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 8017aa8d3d5d89a14a38e428fc28b62e8677e73c3f68f4d68613ab657143bae7
+- category: glitch
+  file: glitch_02.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/glitch_002.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 75796dc18641f44bafedd389937bcc641363f48c6745cfd05416c6481c97c79f
+- category: glitch
+  file: glitch_03.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/glitch_004.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: f11c13375d9485d85a59b8a363aaf49a38ee14a8703aed66713ae9d73f973dec
+- category: pop
+  file: pop_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/pluck_001.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 9b9a42c49e76959b805cfb57405359bb384f11ffc531f413eef2066c72918b57
+- category: pop
+  file: pop_02.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/pluck_002.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 88fff81beb46559cde01e81bd697ef2254ce681182e47e2b5ced78ac92a3b0e5
+- category: pop
+  file: pop_03.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/click_004.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: bf5c9777d3fe2277f0de397dc960c4c49ea0d39351556e1380c1bb3e44f0e7f0
+- category: cash
+  file: cash_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/rpg-audio/handleCoins.ogg
+  source_page: https://kenney.nl/assets/rpg-audio
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 8c7e577b2407764c2b6e61b3c2329533539fa4568463766ad3ea86a395370ae7
+- category: cash
+  file: cash_02.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/rpg-audio/handleCoins2.ogg
+  source_page: https://kenney.nl/assets/rpg-audio
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 1afd1bbef5813533a247954cd9fe944f7e0767ccb2bc8f6f29cc3ec14d8cb458
+- category: siren
+  file: siren_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/oga-levelup-powerup/Alarm.wav
+  source_page: https://opengameart.org/content/level-up-power-up-coin-get-13-sounds
+  licence: CC0-1.0
+  author: wobbleboxx
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 563dc389a6e24d7bd84d9638a8325bcaae9bf0adacf064f2368099156a4e3b57
+- category: siren
+  file: siren_02.wav
+  source_url: https://pixabay.com/sound-effects/city-police-siren-short-409404/
+  licence: Pixabay Content License
+  author: spinopel
+  trim:
+  - 0.0
+  - 1.2
+  sha256: null
+  manual: true
+- category: notification
+  file: notification_01.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/confirmation_001.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 0c49768cca7d134dbc463dbc5972075837ee1da4fd2b77fcf2a99bd47ab32d82
+- category: notification
+  file: notification_02.wav
+  source_url: https://raw.githubusercontent.com/Mcamento8/open-game-sfx-index/34bbe8b525b5ceff3804915ea745532af11f6055/audio/interface-sounds/confirmation_003.ogg
+  source_page: https://kenney.nl/assets/interface-sounds
+  licence: CC0-1.0
+  author: Kenney
+  trim:
+  - 0.0
+  - 1.2
+  sha256: 127135e093b82c3e9afb563d0906c732b3a20f8fc48f179bf3736df80c54a6ae
+- category: record_scratch
+  file: record_scratch_01.wav
+  source_url: https://pixabay.com/sound-effects/film-special-effects-record-scratch-108233/
+  licence: Pixabay Content License
+  author: freesound_community
+  trim:
+  - 0.0
+  - 1.2
+  sha256: null
+  manual: true
+- category: record_scratch
+  file: record_scratch_02.wav
+  source_url: https://pixabay.com/sound-effects/film-special-effects-dj-scratch-87179/
+  licence: Pixabay Content License
+  author: freesound_community
+  trim:
+  - 0.0
+  - 1.2
+  sha256: null
+  manual: true

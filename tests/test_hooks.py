@@ -370,3 +370,18 @@ def test_hooks_stage_reuses_its_own_cached_transcript(tmp_db, tmp_path):
     assert ok is True
     tw.assert_not_called()
 
+
+
+def test_gemini_retries_the_quality_of_life_hook_with_measured_budget():
+    import json
+    from pipeline.rendercore import hook_character_budget, render_settings
+
+    raw = {"authenticity": "unverified", "hook_style": "question", "voiceover_script": "Look at Lucia."}
+    long = json.dumps({**raw, "hook_text": "QUALITY OF LIFE IMPROVEMENTS COMING?"})
+    short = json.dumps({**raw, "hook_text": "WHO IS LUCIA CAMINOS?"})
+    with patch.object(hooks, "_call_gemini", side_effect=[long, short]) as model:
+        result = hooks.generate_hook_and_voiceover("unused.mp4", "GTA 6", frames=[b"f"], api_key="test")
+    assert result["hook_text"] == "WHO IS LUCIA CAMINOS?"
+    assert model.call_count == 2
+    budget = hook_character_budget(render_settings())
+    assert f"at most {budget} characters" in model.call_args.args[0]

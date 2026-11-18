@@ -51,6 +51,7 @@ RENDER_DEFAULTS: dict[str, Any] = {
     "hook": {
         "font_size": 150,
         "min_font_size": 96,
+        "warn_below_font_size": 130,
         "outline": 8,
         "shadow": 3,
         "max_lines": 2,
@@ -271,6 +272,24 @@ def normalize_caption_words(words: Sequence[dict[str, Any]]) -> list[dict[str, A
     return out
 
 
+class HookTooLong(RuntimeError):
+    """The hook cannot fit at the configured minimum font size."""
+
+    def __init__(self, message: str = "hook too long", *, candidate: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.candidate = candidate
+
+
+def hook_character_budget(rs: dict[str, Any]) -> int:
+    """Estimate line capacity using the mean uppercase glyph advance."""
+    hk = rs["hook"]
+    sa = rs["safe_area"]
+    width = sa["x_max"] - sa["x_min"] - 2 * (hk["outline"] + hk["shadow"])
+    sample = "WHY IS THIS DETAIL IN THE NEW CLIP?"
+    average = text_width_px(sample, hk["font_size"], rs["font_path"]) / len(sample)
+    return max(1, int(width / average))
+
+
 def layout_hook(hook_text: str, rs: dict[str, Any]) -> tuple[list[str], int]:
     """Wrap the hook into <= max_lines lines that fit the safe-area width.
 
@@ -286,7 +305,8 @@ def layout_hook(hook_text: str, rs: dict[str, Any]) -> tuple[list[str], int]:
     if not words:
         return [], int(hk["font_size"])
     max_lines = max(1, int(hk.get("max_lines", 2)))
-    size = float(hk["font_size"])
+    floor = int(hk["min_font_size"])
+    size = max(floor, int(hk["font_size"]))
 
     def best_split(sz: float) -> tuple[list[str], float]:
         one = " ".join(words)
@@ -306,14 +326,33 @@ def layout_hook(hook_text: str, rs: dict[str, Any]) -> tuple[list[str], int]:
         widest = min(candidates, key=lambda c: c[0])
         return widest[1], widest[0]
 
-    for _ in range(20):
+    while True:
         lines, width = best_split(size)
         if width <= max_w:
-            break
-        size = math.floor(size * max_w / width) - 1
-    if size < float(hk.get("min_font_size", 0)):
-        log.warning("Hook %r needed font size %.0f (< min %s) to fit 2 lines", hook_text, size, hk.get("min_font_size"))
-    return lines, int(size)
+            return lines, size
+        if size == floor:
+            raise HookTooLong("hook too long")
+        size = max(floor, math.floor(size * max_w / width) - 1)
+
+
+def caption_chunk_size(text: str, rs: dict[str, Any]) -> float:
+    cap = rs["caption"]
+    sa = rs["safe_area"]
+    size = float(cap["font_size"])
+    max_w = sa["x_max"] - sa["x_min"] - 2 * (cap["outline"] + cap["shadow"])
+    if text_width_px(text, size, rs["font_path"]) <= max_w:
+        return size
+    # Allow for libass glyph hinting and the rasterized outline at the fitted size.
+    max_w *= 0.98
+    floor = size * 0.7
+    while True:
+        width = text_width_px(text, size, rs["font_path"])
+        if width <= max_w:
+            return size
+        if size <= floor:
+            log.warning("Caption word %r exceeds safe width at %.2f px", text, floor)
+            return floor
+        size = max(floor, min(size - 0.1, int(size * max_w / width * 100) / 100))
 
 
 def hook_line_pitch(font_size: float, rs: dict[str, Any]) -> float:

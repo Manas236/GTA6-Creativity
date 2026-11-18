@@ -275,7 +275,7 @@ def test_render_previews_swaps_in_the_next_real_item_on_no_clean_ending(tmp_path
          patch.object(render_previews, "default_items", return_value=["item_a", "item_b", "item_c"]), \
          patch.object(render_previews, "candidate_items", return_value=["item_a", "item_b", "item_c", "item_d"]), \
          patch.object(render_previews, "render_item", side_effect=fake_render_item) as ri:
-        rc = render_previews.main(["--presets", "P0", "--out", str(tmp_path)])
+        rc = render_previews.main(["--items", "--presets", "P0", "--out", str(tmp_path)])
     assert rc == 0
     assert [c.args[0] for c in ri.call_args_list] == ["item_a", "item_b", "item_c", "item_d"]
     text = (tmp_path / "README.txt").read_text()

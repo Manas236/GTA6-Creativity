@@ -2,9 +2,7 @@
 
   A1  ensure_sfx_assets  boom / whoosh, synthesized with ffmpeg when no CC0 download is
                          reachable (see assets/sfx/LICENSES.md)
-      plan_sfx_cues      boom on the hook's first frame, then a whoosh only on a punch-in
-                         that is min_gap_s clear of every other cue, max_per_clip in all
-                         (THE one place the SFX density rule is enforced)
+      plan_sfx_cues      choose unique files by trigger priority and enforce cue spacing
       sfx_chain          one delayed, gain-staged input per cue, summed with amix
   A2  music_chain        CC0 bed at level_db, trimmed/padded to exactly the clip length
       duck_expr          whisper word timestamps as volume automation (no sidechaincompress)
@@ -15,6 +13,7 @@ voice always sits on top.
 from __future__ import annotations
 
 import logging
+import random
 import math
 import re
 import subprocess
@@ -45,6 +44,8 @@ SFX_SPECS: dict[str, dict[str, Any]] = {
 }
 
 PEAK_TARGET_DB = -1.0
+SFX_CATEGORIES = ("impact", "whoosh", "riser", "glitch", "pop", "cash", "siren",
+                  "notification", "record_scratch")
 
 
 # --------------------------------------------------------------------------------------
@@ -128,59 +129,75 @@ def ensure_sfx_assets(ss: dict[str, Any], regenerate: bool = False) -> dict[str,
 @dataclass
 class SfxCue:
     at: float
-    kind: str          # "boom" | "whoosh"
+    kind: str
     path: str
+    trigger: str = ""
+    gain_offset_db: float = 0.0
+
+    @property
+    def category(self) -> str:
+        return "impact" if self.kind == "boom" else self.kind
+
+
+def _emoji_category(keyword: str) -> str:
+    if keyword.upper() in {"MONEY", "CASH", "RICH", "$"}:
+        return "cash"
+    if keyword.upper() in {"POLICE", "COPS", "WANTED", "ARRESTED"}:
+        return "siren"
+    return "pop"
 
 
 def plan_sfx_cues(
     punches: Sequence[Any],
     ss: dict[str, Any],
-    hook_at: float = 0.0,
+    hook_at: float | None = 0.0,
     duration: float | None = None,
+    *,
+    item_id: str = "",
+    preset: str = "",
+    emoji_cues: Sequence[Any] = (),
+    caption_at: float | None = None,
 ) -> list[SfxCue]:
-    """The SFX cues for one variant, on its FINAL output timeline.
-
-    Every time here is already an output time: punch-ins are planned after A3's dead-air
-    remap and with the Variant B freeze offset, and the hook starts at 0 in both variants.
-
-    Density rule (style.sfx.min_gap_s, style.sfx.max_per_clip), enforced here and only here:
-      1. the boom on the hook's first frame comes first;
-      2. a whoosh is added to a punch-in only if it starts >= min_gap_s (start to start)
-         from every cue already placed and the clip is still under max_per_clip;
-         punch-ins are offered strongest first (their M3 rank), so the one whoosh a clip
-         usually gets lands on its biggest moment;
-      3. every other punch-in still zooms, silently.
-    """
-    files = sfx_files(ss)
-    s = ss["sfx"]
-    min_gap = float(s.get("min_gap_s", 5.0))
-    cap = int(s.get("max_per_clip", 2))
+    """Pick unique effects in trigger priority order on the final output timeline."""
+    settings = ss["sfx"]
+    enabled = set(settings.get("enabled_categories", SFX_CATEGORIES))
+    min_gap = float(settings.get("min_gap_s", 5.0))
+    cap = int(settings.get("max_per_clip", 2))
+    rng = random.Random(f"{item_id}:{preset}")
     cues: list[SfxCue] = []
-    if cap <= 0:
-        return cues
+    used: set[Path] = set()
+    files = sfx_files(ss)
+    triggers = []
+    if hook_at is not None:
+        triggers.append((hook_at + float(settings.get("boom_at_s", 0)), "impact", "hook", 0.0))
+    emoji_triggers = [(e.at, _emoji_category(e.keyword), "emoji", 0.0) for e in emoji_cues]
+    triggers.extend(sorted(emoji_triggers, key=lambda t: (t[1] == "pop", t[0])))
+    lead = float(settings["whoosh_lead_s"])
+    ranked = sorted(punches, key=lambda p: (int(getattr(p, "rank", 0)), float(p.at)))
+    triggers.extend((p.at - lead, "whoosh", "punch_in", 0.0) for p in ranked)
+    if caption_at is not None:
+        triggers.append((caption_at, "pop", "caption", -6.0))
 
-    def clear(at: float) -> bool:
-        return all(abs(at - c.at) >= min_gap - 1e-6 for c in cues)
-
-    boom = files["boom"]
-    if boom.exists():
-        at = round(max(0.0, float(hook_at) + float(s["boom_at_s"])), 3)
-        if duration is None or at < float(duration):
-            cues.append(SfxCue(at, "boom", str(boom)))
-    whoosh = files["whoosh"]
-    if whoosh.exists():
-        lead = float(s["whoosh_lead_s"])
-        ranked = sorted(punches, key=lambda p: (int(getattr(p, "rank", 0)), float(p.at)))
-        for p in ranked:
-            if len(cues) >= cap:
-                break
-            at = round(max(0.0, float(p.at) - lead), 3)
-            if duration is not None and at >= float(duration):
-                continue
-            if clear(at):
-                cues.append(SfxCue(at, "whoosh", str(whoosh)))
-    cues.sort(key=lambda c: c.at)
-    return cues
+    for at, category, trigger, gain_offset in triggers:
+        if len(cues) >= cap:
+            break
+        at = round(max(0.0, at), 3)
+        if category not in enabled or (duration is not None and at >= duration):
+            continue
+        if any(abs(at - c.at) < min_gap - 1e-6 for c in cues):
+            continue
+        library = sorted(p for p in (sfx_dir(ss) / category).glob("*.wav") if p.is_file())
+        kind = category
+        if not library and category in {"impact", "whoosh"}:
+            kind = "boom" if category == "impact" else category
+            path = files[kind]
+            library = [path] if path.is_file() else []
+        available = [p for p in library if p.resolve() not in used]
+        if available:
+            selected = rng.choice(available)
+            used.add(selected.resolve())
+            cues.append(SfxCue(at, kind, str(selected), trigger, gain_offset))
+    return sorted(cues, key=lambda c: c.at)
 
 
 def sfx_spacing_problems(cues: Sequence[SfxCue], ss: dict[str, Any]) -> list[str]:
@@ -211,7 +228,7 @@ def sfx_chain(
     labels: list[str] = []
     for i, cue in enumerate(cues):
         inputs += ["-i", cue.path]
-        g = float(gains_db.get(cue.kind, -12.0))
+        g = float(gains_db.get(cue.path, gains_db.get(cue.kind, -12.0))) + cue.gain_offset_db
         delay_ms = int(round(cue.at * 1000))
         parts.append(
             f"[{{IDX{i}}}]aformat=sample_fmts=fltp:sample_rates={sample_rate}:channel_layouts=stereo,"
@@ -232,6 +249,18 @@ def sfx_chain(
 def music_path(ss: dict[str, Any]) -> Path:
     p = Path(str(ss["music_bed"]["file"]))
     return p if p.is_absolute() else config.project_root() / p
+
+
+def pick_music(ss: dict[str, Any], item_id: str) -> Path | None:
+    settings = ss["music_bed"]
+    directory = Path(settings.get("library_dir", "assets/music"))
+    if not directory.is_absolute():
+        directory = config.project_root() / directory
+    tracks = sorted(p for p in directory.glob("*.wav") if p.is_file())
+    if tracks:
+        return random.Random(item_id).choice(tracks)
+    fallback = music_path(ss)
+    return fallback if fallback.is_file() else None
 
 
 def speech_spans(words: Iterable[dict[str, Any]], ss: dict[str, Any]) -> list[tuple[float, float]]:

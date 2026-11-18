@@ -296,14 +296,14 @@ def test_creator_clip_can_never_be_upgraded_to_official(tmp_db, tmp_path):
 def test_off_segment_hook_fails_the_overlap_check_and_is_regenerated_once_with_the_reason(tmp_db, tmp_path):
     make_item(tmp_db, tmp_path, "item_h", bind=False)
     prompts: list[tuple[str, Any]] = []
-    off = {**GOOD, "hook_text": "ONLINE MULTIPLAYER LEAKED?"}          # what the TITLE is about, not the clip
+    off = {**GOOD, "hook_text": "ONLINE MULTIPLAYER?"}          # what the TITLE is about, not the clip
     answers = [json.dumps(off), json.dumps(GOOD), "PASS"]
     with patch("pipeline.hooks.extract_sample_frames", return_value=[b"f"]), \
          patch("pipeline.hooks._call_gemini", side_effect=_gemini(answers, prompts)):
         ok, msg = hooks.run_hooks_for_item("item_h", cfg=CFG, db_path=tmp_db)
     assert ok, msg
     assert len(prompts) == 3                    # gen, gen, check: the overlap FAIL cost no Gemini call
-    assert "PREVIOUS ATTEMPT REJECTED" in prompts[1][0] and "ONLINE MULTIPLAYER LEAKED?" in prompts[1][0]
+    assert "PREVIOUS ATTEMPT REJECTED" in prompts[1][0] and "ONLINE MULTIPLAYER?" in prompts[1][0]
     row = db.get_item("item_h", db_path=tmp_db)
     assert row["hook_text"] == GOOD["hook_text"] and row["stage"] == "cut"
     assert json.loads(row["hook_binding"])["check"] == "segment_check"
@@ -345,7 +345,7 @@ def _tap(item_id, action, mid):
 
 def test_two_failed_hooks_go_to_a_review_card_instead_of_rendering(tmp_db, tmp_path):
     make_item(tmp_db, tmp_path, "item_h", bind=False)
-    off = {**GOOD, "hook_text": "ONLINE MULTIPLAYER LEAKED?"}
+    off = {**GOOD, "hook_text": "ONLINE MULTIPLAYER?"}
     with patch("pipeline.hooks.extract_sample_frames", return_value=[b"f"]), \
          patch("pipeline.hooks._call_gemini", side_effect=_gemini([json.dumps(off), json.dumps(off)], [])):
         ok, msg = hooks.run_hooks_for_item("item_h", cfg=CFG, db_path=tmp_db)
@@ -365,7 +365,7 @@ def test_two_failed_hooks_go_to_a_review_card_instead_of_rendering(tmp_db, tmp_p
     assert bot.ensure_card() == "item_h"
     (method, params), = t.calls
     assert method == "sendMessage"                                         # text card: nothing was rendered
-    assert "HOOK REVIEW" in params["text"] and "ONLINE MULTIPLAYER LEAKED?" in params["text"]
+    assert "HOOK REVIEW" in params["text"] and "ONLINE MULTIPLAYER?" in params["text"]
     assert "Lucia drives through Vice City." in params["text"]             # what the clip actually says
     assert [b["callback_data"] for row_ in params["reply_markup"]["inline_keyboard"] for b in row_] == \
         ["a:hookok:item_h", "a:no:item_h"]
@@ -406,3 +406,25 @@ def test_voiceover_stage_binds_the_wav_to_its_script_and_segment(tmp_db, tmp_pat
     row = db.get_item("item_v", db_path=tmp_db)
     assert binding.voiceover_binding_problem(row) is None
     assert "different script" in binding.voiceover_binding_problem({**row, "voiceover_script": "new line"})
+
+
+def test_oversize_generated_hook_exhausts_two_retries_and_needs_review(tmp_db, tmp_path):
+    make_item(tmp_db, tmp_path, "item_h", bind=False)
+    too_long = {**GOOD, "hook_text": "TAKE-TWO CONFIRMS GTA 6 RELEASE DATE AGAIN?"}
+    with patch("pipeline.hooks.extract_sample_frames", return_value=[b"f"]), \
+         patch("pipeline.hooks._call_gemini", return_value=json.dumps(too_long)) as gemini:
+        ok, msg = hooks.run_hooks_for_item("item_h", cfg=CFG, db_path=tmp_db)
+    row = db.get_item("item_h", db_path=tmp_db)
+    assert not ok and msg == "needs_review: hook too long" and gemini.call_count == 3
+    assert row["stage"] == "needs_review" and json.loads(row["hook_review"])["reason"] == "hook too long"
+
+
+def test_bound_manual_hook_that_exceeds_floor_uses_render_review(tmp_db, tmp_path):
+    text = "TAKE-TWO CONFIRMS GTA 6 RELEASE DATE AGAIN?"
+    item = make_item(tmp_db, tmp_path, "item_h", hook=text)
+    with pytest.raises(render.HookTooLong) as error:
+        _variants(item, text, tmp_path)
+    assert isinstance(error.value, render.style.SourceTextCollision)
+    assert render.send_collision_to_review(item, error.value, tmp_db) == "needs_review: hook too long"
+    row = db.get_item("item_h", db_path=tmp_db)
+    assert row["stage"] == "needs_review" and json.loads(row["hook_review"])["reason"] == "hook too long"

@@ -1,10 +1,11 @@
-"""Render the P0-P3 x A/B style previews for the three CP2 items, on the laptop.
+"""Render voiceover style previews for P1, P2, and P3 from the synthetic sample.
 
-One command, no prompts:
+Defaults to voiceover previews from the generated sample. Pass --items to use the
+legacy database-backed preview workflow.
 
     python scripts/render_previews.py
 
-For each of the three CP2 items it:
+For each item in the legacy workflow it:
   1. re-downloads the source (yt-dlp, idempotent) and re-cuts it unless the cut on disk
      was made by the current cut stage (its end checked against a completed sentence);
      an item whose cut fails with no_clean_ending is replaced by the next real item in
@@ -43,7 +44,7 @@ from typing import Any, Sequence
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipeline import binding, config, cut as cutmod, db, download, endings, hooks, keywords as kwmod, render, style, transcribe  # noqa: E402
+from pipeline import binding, config, cut as cutmod, db, download, endings, hooks, keywords as kwmod, render, render_meta, style, transcribe  # noqa: E402
 
 log = logging.getLogger("render_previews")
 
@@ -523,20 +524,69 @@ def default_items(db_path: Any = None, want: int = 3) -> list[str]:
     return ids
 
 
+def render_sample(preset, cfg, out_root, *, cut, vo):
+    """Render one voiceover preview from the generated sample without a database."""
+    from scripts import style_check
+    from pipeline import plan as planning
+
+    sample = json.loads((ROOT / "samples" / "synthetic" / "item.json").read_text(encoding="utf-8"))
+    words = [{"word": word, "start": start, "end": end}
+             for word, start, end in style_check.WORDS]
+    vo_words = render.estimate_words_from_script(sample["voiceover_script"], render.media_duration(vo))
+    analysis = planning.analyze_clip(cut, words, cfg=cfg, preset=preset, clean_cut_end=True)
+    freeze = render.freeze_duration(render.media_duration(vo), cfg)
+    plan = planning.build_style_plan(
+        analysis, sample["hook_text"], variant="B", freeze_s=freeze, vo_words=vo_words,
+        cfg=cfg, preset=preset, channel_name=style_check.CHANNEL,
+        keyword_list=["LEAK", "MAP", "VICE", "CITY", "CARS", "MONEY", "POLICE"],
+    )
+    out = out_root / f"synthetic_{preset}.mp4"
+    ass = out.with_suffix(".ass")
+    ass.write_text(render.build_ass_subtitles(sample["hook_text"], plan.total_s, plan.words,
+                                             cfg=cfg, sp=plan), encoding="utf-8")
+    try:
+        ok, _ = render.render_variant_b(cut, vo, ass, out, duration_s=plan.content_s,
+                                        freeze_s=freeze, cfg=cfg, sp=plan, item_id="synthetic")
+        if not ok:
+            raise render.RenderVerificationError(f"Sample failed verification: {out}")
+    finally:
+        ass.unlink(missing_ok=True)
+    print(render_meta.summary(out))
+    return out
+
+
+def render_samples(presets, cfg, out_root):
+    from scripts import style_check
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    source = out_root / ".source"
+    cut, vo = source / "cut.mp4", source / "vo.wav"
+    if not cut.is_file() or not vo.is_file():
+        cut, vo = style_check.build_source(source)
+    for preset in presets:
+        render_sample(preset, cfg, out_root, cut=cut, vo=vo)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Render the P0-P3 x A/B style previews for the CP2 items.")
+    ap = argparse.ArgumentParser(description="Render P1, P2 and P3 voiceover previews from the synthetic sample.")
     ap.add_argument("--items", nargs="*", default=None)
-    ap.add_argument("--presets", nargs="*", default=PRESETS)
+    ap.add_argument("--presets", nargs="*", default=None)
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--no-grid", action="store_true")
-    ap.add_argument("--out", default=None, help="output root (default media/previews)")
+    ap.add_argument("--out", default=None, help="output root (default samples/synthetic/presets for sample previews)")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     cfg = config.get_config()
+    for preset in args.presets or []:
+        style.resolve_preset(preset, cfg)
+    if args.items is None:
+        out_root = Path(args.out) if args.out else ROOT / "samples" / "synthetic" / "presets"
+        return render_samples(args.presets or ["P1", "P2", "P3"], cfg, out_root)
+
+    args.presets = args.presets or PRESETS
     db.init_db()
-    for p in args.presets:
-        style.resolve_preset(p, cfg)          # fail fast on a typo before any rendering
 
     out_root = Path(args.out) if args.out else config.media_dir("previews")
     out_root.mkdir(parents=True, exist_ok=True)

@@ -400,7 +400,7 @@ def test_a1_boom_on_the_hook_then_a_whoosh_only_where_it_is_clear():
     cues = audio_mix.plan_sfx_cues(punches, SS, hook_at=0.0, duration=20.0)
     lead = SS["sfx"]["whoosh_lead_s"]
     # 3.94 s is under 5.0 s from the boom: that punch-in zooms silently
-    assert [(c.kind, c.at) for c in cues] == [("boom", 0.0), ("whoosh", round(9.0 - lead, 3))]
+    assert [(c.category, c.at) for c in cues] == [("impact", 0.0), ("whoosh", round(9.0 - lead, 3))]
     _, chain = audio_mix.sfx_chain(cues, {"boom": -10.0, "whoosh": -12.0}, 48000, "a_main", "a_sfx")
     assert "adelay=0:all=1" in chain and f"adelay={int(round((9.0 - lead) * 1000))}:all=1" in chain
     assert "amix=inputs=3:normalize=0:duration=first" in chain
