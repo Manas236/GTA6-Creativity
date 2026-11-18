@@ -577,7 +577,7 @@ def main() -> None:
             print("Locked: another runner active")
             return
         try:
-            run_dashboard_operations(config.get_config(), db_p, args.job)
+            run_dashboard_operations(config.get_config(), db_p)
         finally:
             release_lock(db_path=db_p)
     elif args.command == "status":

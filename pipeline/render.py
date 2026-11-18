@@ -889,6 +889,9 @@ def render_item_variants(
         subs = Path(subtitles_dir)
         subs.mkdir(parents=True, exist_ok=True)
         for version in version_presets:
+            if version not in ("P1", "P2", "P3"):
+                raise RenderVerificationError(f"Unsupported version preset: {version!r}")
+        for version in dict.fromkeys(version_presets):
             output = Path(out_b).with_name(f"{name}_{version}.mp4")
             ass = subs / f"{name}_{version}.ass"
             try:
@@ -915,6 +918,11 @@ def render_item_variants(
                 continue
             except Exception as exc:
                 failures.append(exc)
+                for abandoned in (output, output.with_suffix(".meta.json")):
+                    try:
+                        abandoned.unlink(missing_ok=True)
+                    except OSError:
+                        log.warning("Could not remove failed render artifact %s", abandoned)
                 log.exception("Render %s/%s failed", name, version)
                 continue
             results.append((version.lower(), version, str(output),
@@ -1067,7 +1075,6 @@ def run_render_item(
 
     if progress:
         progress("render")
-    rs = render_settings(cfg)
     tkey = transcribe.cache_key(cfg)
     speech_words = cut_speech_words(item, cut_path, tkey, cfg)
     log.info("%d speech words on the cut timeline.", len(speech_words))
@@ -1129,7 +1136,10 @@ def run_render_item(
                                     {"caption_text": caption, "approved_versions": None}, db_path)
         download = item.get("download_path")
         if download and cfg.get("retention", {}).get("purge_downloads_immediately", True):
-            Path(download).unlink(missing_ok=True)
+            try:
+                Path(download).unlink(missing_ok=True)
+            except OSError:
+                log.warning("Could not purge source download for %s", item_id)
         db.log_stage(item_id, "render", "success", message="Preset renders verified", db_path=db_path)
         return True, f"Renders complete for {item_id}", {
             "total_render_s": round(sum(row[4] for row in result["versions"]), 2),

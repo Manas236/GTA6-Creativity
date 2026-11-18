@@ -132,6 +132,10 @@ def fingerprint(item, posts):
         "approval_type",
         "caption_body",
         "caption_hashtags",
+        "caption_words_override",
+        "voiceover_override",
+        "approved_versions",
+        "creation_job",
     )
     state = {k: item.get(k) for k in fields} if item else {}
     # A card being sent changes rendered to awaiting_approval without changing its content.
@@ -530,11 +534,7 @@ def apply(command, cfg, path):
         when = clock.parse(payload["at"])
         _, zone, slots = scheduler.active_profile(cfg)
         reserved = scheduler.reserved_times(path, item_id)
-        gap = timedelta(hours=max(3, float(cfg.get("posting", {}).get("min_gap_hours", 3))))
-        daily_target = int(cfg.get("posting", {}).get("daily_post_target", 2))
-        same_day = sum(scheduler.local_day(t, cfg) == scheduler.local_day(when, cfg) for t in reserved)
-        if (when.astimezone(zone).time() not in slots
-                or any(abs(t - when) < gap for t in reserved) or same_day >= daily_target):
+        if when.astimezone(zone).time() not in slots or not scheduler.slot_available(when, reserved, cfg):
             raise ControlError("That slot is unavailable under the posting gap or daily target.")
         if not posting.enabled_platforms(cfg):
             raise ControlError("No publishing platforms are enabled.")

@@ -108,6 +108,16 @@ def reserved_times(db_path: Any = None, exclude_item_id: str | None = None) -> l
     return sorted(seen.values())
 
 
+def slot_available(candidate, taken, cfg):
+    """Check a candidate against live and queued reservations in the active profile."""
+    posting_cfg = (cfg or {}).get("posting", {})
+    gap = timedelta(hours=float(posting_cfg.get("min_gap_hours", 3)))
+    target = int(posting_cfg.get("daily_post_target", 2))
+    day = local_day(candidate, cfg)
+    return (all(candidate != other and abs(candidate - other) >= gap for other in taken)
+            and sum(local_day(other, cfg) == day for other in taken) < target)
+
+
 def next_free_slot(
     after: datetime,
     cfg: dict[str, Any] | None = None,
@@ -118,18 +128,12 @@ def next_free_slot(
     daily target."""
     cfg = cfg or config.get_config()
     posting_cfg = cfg.get("posting") or {}
-    min_gap = timedelta(hours=float(posting_cfg.get("min_gap_hours", 3.0)))
-    daily_target = int(posting_cfg.get("daily_post_target", 2))
     search_days = int(posting_cfg.get("max_slot_search_days", 60))
     taken = reserved_times(db_path, exclude_item_id=exclude_item_id)
 
     for candidate in slot_candidates(after, cfg, days=search_days):
-        if any(abs(candidate - t) < min_gap for t in taken):
-            continue
-        day = local_day(candidate, cfg)
-        if sum(1 for t in taken if local_day(t, cfg) == day) >= daily_target:
-            continue
-        return candidate
+        if slot_available(candidate, taken, cfg):
+            return candidate
     raise RuntimeError(f"no free posting slot within {search_days} days of {clock.iso(after)}")
 
 

@@ -168,7 +168,7 @@ class Cleaner:
     def rejected_and_failed(self) -> None:
         keep = timedelta(days=self.rules["rejected_failed_days"])
         for item in self._items(("rejected", "failed")):
-            if not any(item.get(c) for c in ALL_COLUMNS):
+            if not any(item.get(c) for c in ALL_COLUMNS) and not db.renders_for_item(item["id"], self.db_path):
                 continue
             if self.now < clock.parse(item["stage_updated_at"]) + keep or self._needed_by_a_post(item):
                 continue

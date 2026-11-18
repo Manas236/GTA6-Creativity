@@ -61,3 +61,34 @@ def test_three_arm_floor_and_post_resolves_preset(tmp_db, isolated_media, monkey
     assert probabilities == pytest.approx({"p1": 0.2, "p2": 0.6, "p3": 0.2})
     item = db.get_item("clip", tmp_db)
     assert posting.video_for_post(item, {"variant": "p2"}, tmp_db) == video
+
+
+def test_go_live_requires_current_meta_check_and_only_writes_local_overlay(
+    tmp_db, isolated_media, fake_clock, monkeypatch
+):
+    import connection_checks
+
+    cfg = {"app": {"dry_run": True}, "posting": {"platforms": {"instagram": True}}}
+    env = {"IG_ACCESS_TOKEN": "testing-token", "IG_USER_ID": "testing-user"}
+    monkeypatch.setattr(connection_checks, "current_environment", lambda: env.copy())
+    monkeypatch.setattr(connection_checks, "run_checks", lambda *_args, **_kwargs: {
+        service: {"status": "ok", "checked_at": fake_clock.now.isoformat(), "reason": "fixture"}
+        for service in ("instagram_token", "instagram_user")
+    })
+    client = create_app(tmp_db, cfg=cfg, media_root=isolated_media).test_client()
+    csrf = client.get("/api/state", base_url=BASE).get_json()["csrf"]
+
+    def post(url, body):
+        return client.post(url, base_url=BASE, headers={"X-CSRF-Token": csrf}, json=body)
+
+    action = {"action": "go_live", "payload": {"dry_run_mode": None}}
+    assert post("/api/prepare", action).status_code == 409
+    assert post("/api/connections/test", {"service": "all"}).status_code == 200
+    ticket = post("/api/prepare", action).get_json()["ticket"]
+    env["IG_ACCESS_TOKEN"] = "rotated-testing-token"
+    assert post("/api/confirm", {"ticket": ticket}).get_json()["command"]["status"] == "refused"
+    assert post("/api/connections/test", {"service": "all"}).status_code == 200
+    ticket = post("/api/prepare", action).get_json()["ticket"]
+    assert post("/api/confirm", {"ticket": ticket}).get_json()["command"]["status"] == "applied"
+    assert client.get("/api/settings", base_url=BASE).get_json()["golive"]["dry_run"] is False
+    assert cfg["app"]["dry_run"] is True
