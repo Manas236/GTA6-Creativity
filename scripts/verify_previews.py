@@ -244,7 +244,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--items", nargs="*", default=None)
     args = ap.parse_args(argv)
     cfg = config.get_config()
-    out_root = Path(args.out) if args.out else ROOT / "samples" / "synthetic" / "presets"
+    if args.out:
+        out_root = Path(args.out)
+    elif args.items:
+        out_root = config.media_dir("previews")
+    else:
+        out_root = ROOT / "samples" / "synthetic" / "presets"
     if not args.items and (not args.out or any(out_root.glob("synthetic_P*.mp4"))
                            or any(out_root.glob("P*_[AB].mp4"))):
         return check_synthetic(out_root, cfg)

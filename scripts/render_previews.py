@@ -1,11 +1,11 @@
-"""Render the P0-P3 x A/B style previews for the three CP2 items, on the laptop.
+"""Render voiceover style previews for P1, P2, and P3 from the synthetic sample.
 
 Defaults to voiceover previews from the generated sample. Pass --items to use the
 legacy database-backed preview workflow.
 
     python scripts/render_previews.py
 
-For each of the three CP2 items it:
+For each item in the legacy workflow it:
   1. re-downloads the source (yt-dlp, idempotent) and re-cuts it unless the cut on disk
      was made by the current cut stage (its end checked against a completed sentence);
      an item whose cut fails with no_clean_ending is replaced by the next real item in
