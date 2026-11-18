@@ -1,5 +1,9 @@
 # Project Handoff: GTA 6 Clipping Pipeline
 
+After pulling this, run `python scripts/fetch_assets.py` on the pipeline PC. Until it runs, P2/P3 use the two synthesized sounds and P3 has no new music. Optional Pixabay files are listed in `assets/sfx/NEEDED.md` and `assets/music/NEEDED.md`.
+
+The DB migration runs automatically on first start; back up `pipeline.db` first.
+
 ## 0. Laptop: what to run next
 
 ### After pulling the 2026-11-12 pre-launch fix pass (office PC; PLAN.md calls #173-#192)
