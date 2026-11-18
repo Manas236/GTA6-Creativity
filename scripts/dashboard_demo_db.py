@@ -26,6 +26,7 @@ from pipeline import (
     db,
     posting,
     render,
+    render_meta,
     scheduler,
     transcribe,
 )
@@ -255,6 +256,26 @@ def build_demo(path, media=True):
                     if local % 2
                     else "auto_quality_gate: source_text_collision"
                 )
+            if stage == "awaiting_approval" and local < 2:
+                fields.update(render_a_path=None, render_b_path=None, chosen_variant=None)
+                for preset in ("P1", "P2"):
+                    video = clip_root / f"{item_id}_{preset}.mp4"
+                    shutil.copyfile(clip_root / "B.mp4", video)
+                    render_meta.write(video, {
+                        "preset": preset,
+                        "hook_font_px": 118 if preset == "P2" else 141,
+                        "sfx_cues": [],
+                        "music_track": None,
+                        "caption_words": [
+                            {"i": i, "text": word["word"].upper(),
+                             "start": round(word["start"], 2), "end": round(word["end"], 2)}
+                            for i, word in enumerate(words) if word["end"] <= 3
+                        ],
+                    })
+                    with db.db(path) as conn:
+                        conn.execute("INSERT INTO renders VALUES (?, ?, ?, ?, ?, ?)",
+                                     (item_id, preset.lower(), preset, str(video),
+                                      str(video.with_suffix(".meta.json")), db.now()))
             db.transition_stage(item_id, stage, fields, path)
             item = db.get_item(item_id, path)
             render.store_cut_words(
