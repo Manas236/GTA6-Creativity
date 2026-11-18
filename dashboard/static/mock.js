@@ -33,11 +33,11 @@
   const metrics = [
     { hours: 24, late: false, views: 8512, likes: 612, comments: 27, shares: 148, saves: 33, reach: 7240 },
     { hours: 72, late: true, views: 12341, likes: 931, comments: 56, shares: 240, saves: 61, reach: 10814 },
-  ].map((metric, index) => ({ ...metric, post_id: "post-reel", item_id: "posted", platform: "instagram", variant: "p2", fetched_at: iso(index - 1000) }));
+  ].map((metric, index) => ({ ...metric, post_id: "post-reel", item_id: "posted", platform: "instagram", variant: "p2", posted_at: posts[0].posted_at, fetched_at: iso(index - 1000) }));
   const voiceover = { script: "Did the trailer hide a second getaway car?", voice: "af_heart", speed: 1.08 };
   const settings = {
     posting: { profile: "local", slots: { local: ["18:00", "21:00"], server: ["18:00", "21:00"] }, min_gap_hours: 3, daily_post_target: 2,
-      platforms: { instagram: true, facebook: true }, hashtags: ["#GTA6", "#FelonyFlamingo"], caption_templates: { youtube: "{hook}\n{credit}", twitch: "{hook}\n{credit}" } },
+      platforms: { instagram: true, facebook: true }, hashtags: ["#GTA6", "#FelonyFlamingo"], caption_templates: { youtube: "{hook_text}\n{author_name}", twitch: "{hook_text}\n{author_name}" } },
     look: { versions: ["P1", "P2", "P3"], sfx: { enabled_categories: ["impact", "whoosh", "riser"], max_per_clip: 5, min_gap_s: 0.6 },
       music: { enabled: true }, hook: { font_size: 150, min_font_size: 115, warn_below: 130 }, caption: { font_size: 68 } },
     sources: { youtube: { enabled: true, queries: ["GTA 6 trailer details"] }, twitch: { enabled: true, enable_from: "2026-11-19", lookback_hours: 48, min_views: 75 },

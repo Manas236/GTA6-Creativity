@@ -260,7 +260,7 @@ function analytics() {
   patchMarkup(content, heading("Analytics", "Stored insights from published clips") +
     (warnings.length ? `<section class="panel warning-card"><h2>Missed snapshot windows</h2>${warnings.map((warning) =>
       `<p><a href="${itemLink(warning.item_id)}">${escape(itemById(warning.item_id)?.original_title || warning.item_id)}</a> · ${warning.window_h} h window missed · ${warning.late_snapshot_taken ? "Late snapshot taken" : "No late snapshot yet"}</p>`).join("")}</section>` : "") +
-    (latest.length ? `<div class="metrics-grid">${["views", "likes", "comments", "shares"].map((field) => metric(field, number(latest.reduce((sum, row) => sum + Number(row[field] || 0), 0)), "Latest snapshot per post")).join("")}</div>
+    (latest.length ? `<div class="metrics-grid">${["views", "likes", "comments", "shares"].map((field) => metric(field[0].toUpperCase() + field.slice(1), number(latest.reduce((sum, row) => sum + Number(row[field] || 0), 0)), "Latest snapshot per post")).join("")}</div>
     <section class="panel commands"><h2>Views by publish date</h2><div class="chart-box"><canvas id="analytics-chart" role="img" aria-label="Views by platform"></canvas></div><div class="legend"><span><i style="background:var(--pink)"></i>Instagram</span><span><i style="background:var(--blue)"></i>Facebook</span></div></section>
     <section class="panel commands"><h2>Post snapshots</h2>${latest.map((row) => `<article data-row="${escape(row.post_id)}"><h3><a href="${itemLink(row.item_id)}">${escape(itemById(row.item_id)?.original_title || row.item_id)}</a> · ${escape(row.platform)} · ${escape(versionName(row.variant))}</h3>${metricTable(state.metrics.filter((m) => m.post_id === row.post_id))}</article>`).join("")}</section>` :
     empty("Insights appear after a live post reaches its first snapshot window and the runner collects metrics.")));
@@ -330,7 +330,7 @@ function platformChart(id, latest) {
     values: days.map((day) =>
       latest
         .filter((m) => m.platform === platform && dayKey(m.posted_at) === day)
-        .reduce((n, m) => n + m.views, 0),
+        .reduce((n, m) => n + Number(m.views || 0), 0),
     ),
   }));
   drawLines(
@@ -1007,8 +1007,8 @@ function advanceReview(id, commandId) {
 async function review(force = false) {
   const items = inboxItems();
   if (!document.querySelector("#review-inbox")) {
-    content.innerHTML = heading("Review", "", '<button class="button secondary" id="review-help" aria-label="Keyboard shortcuts">?</button>') +
-      reviewTabs() + '<div class="review-layout"><aside id="review-inbox" aria-label="Review inbox"></aside><section id="review-selected"></section></div>' +
+    content.innerHTML = '<div class="review-toolbar">' + heading("Review", "") +
+      reviewTabs() + '<button class="button secondary" id="review-help" aria-label="Keyboard shortcuts">?</button></div><div class="review-layout"><aside id="review-inbox" aria-label="Review inbox"></aside><section id="review-selected"></section></div>' +
       '<dialog id="review-shortcuts"><form method="dialog"><h2>Keyboard shortcuts</h2><p>J/K or arrows · Next / previous</p><p>Space · Play or pause previews</p><dl>' +
       Object.entries(keys).map(([key, action]) => `<dt>${key.toUpperCase()}</dt><dd>${labels[action]}</dd>`).join("") +
       '<dt>1 / 2 / 3</dt><dd>Switch preset on new clips</dd><dt>Z</dt><dd>Undo</dd></dl><button class="button secondary">Close</button></form></dialog>';
@@ -1051,18 +1051,18 @@ async function review(force = false) {
     pane.dataset.actions = actionSignature;
     const versions = versionPanel(next);
     patchMarkup(pane, `${versions}
-      <div class="detail-actions review-actions">${approvalButtons(next)}${["approve", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption", "retry", "delete"]
-        .filter((action) => next.actions.includes(action))
-        .map((action) => {
-          const shortcut = Object.keys(keys).find((key) => keys[key] === action);
-          return button(action, requested, labels[action] + (shortcut ? " [" + shortcut.toUpperCase() + "]" : ""));
-        }).join("")}</div>
       <section class="panel"><h2>${escape(current.original_title)}</h2><div class="hook-display">${escape(current.hook_text)}</div>
       <p>${escape(current.voiceover_script)}</p>
       ${current.error_message || current.rejection_reason || next.review.reason ? `<p class="reason">${escape(current.error_message || current.rejection_reason || next.review.reason)}</p>` : ""}
       <p><a href="${itemLink(requested)}">Open item details</a></p>
       ${next.media.cut ? `<details><summary>Watch the cut</summary><video controls preload="none" src="${mediaURL("/media/" + encodeURIComponent(requested) + "/cut")}"></video></details>` : ""}
-      <h3>Post text (Instagram caption)</h3><div class="caption-preview">${escape(next.caption)}</div></section>`);
+      <h3>Post text (Instagram caption)</h3><div class="caption-preview">${escape(next.caption)}</div></section>
+      <div class="detail-actions review-actions">${approvalButtons(next)}${["approve", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption", "retry", "delete"]
+        .filter((action) => next.actions.includes(action))
+        .map((action) => {
+          const shortcut = Object.keys(keys).find((key) => keys[key] === action);
+          return button(action, requested, labels[action] + (shortcut ? " [" + shortcut.toUpperCase() + "]" : ""));
+        }).join("")}</div>`);
   } catch (error) {
     if (sequence === reviewRequest) pane.textContent = error.message;
   }

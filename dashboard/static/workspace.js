@@ -119,9 +119,9 @@ function versionPanel(data) {
   const variant = versions.find((entry) => entry.variant === selectedVersion) || versions.find((entry) => entry.variant === "p2") || versions[0];
   selectedVersion = variant.variant;
   return `<section class="panel version-panel" data-row="${escape(data.item.id)}">
-    <div class="tabs" aria-label="Render versions">${versions.map(({ variant }) => `<button class="button secondary" data-version="${variant}" aria-pressed="${variant === selectedVersion}">${versionName(variant)}</button>`).join("")}</div>
     <div class="version-body"><video class="phone-preview" controls preload="metadata" aria-label="${versionName(selectedVersion)}" ${mockMode ? 'poster="/static/thumbnail.svg"' : ""} src="${escape(mediaURL(variant.url))}"></video>
-    <div id="render-meta">${versionMeta(data, variant)}</div></div>
+    <div><div class="tabs" aria-label="Render versions">${versions.map(({ variant }) => `<button class="button secondary" data-version="${variant}" aria-pressed="${variant === selectedVersion}">${versionName(variant)}</button>`).join("")}</div>
+    <div id="render-meta">${versionMeta(data, variant)}</div></div></div>
   </section>`;
 }
 function versionMeta(data, variant) {
@@ -356,10 +356,11 @@ function settingField(path, label, value) {
   if (path === "versions") return `<fieldset><legend>${label}</legend>${["P1", "P2", "P3"].map((preset) => `<label class="check-field"><input data-preset type="checkbox" value="${preset}" ${value?.includes(preset) ? "checked" : ""}>${versionName(preset)}</label>`).join("")}</fieldset>`;
   if (typeof value === "boolean") return `<label class="check-field"><input name="${name}" type="checkbox" ${value ? "checked" : ""}> ${label}</label>`;
   if (Array.isArray(value)) return `<label>${label}<textarea name="${name}" data-list aria-describedby="lines-tip">${escape(value.join("\n"))}</textarea></label>`;
-  const type = path === "twitch.enable_from" ? "date" : typeof value === "number" ? "number" : "text";
+  const optionalDays = path === "switch_to_auto_after_days";
+  const type = path === "twitch.enable_from" ? "date" : optionalDays || typeof value === "number" ? "number" : "text";
   const startDate = path === "twitch.enable_from" && value
     ? `<small>Turns on automatically on ${escape(new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" }).format(new Date(value + "T00:00Z")))}</small>` : "";
-  return `<label>${label}<input name="${name}" type="${type}" ${type === "number" ? 'step="any" required' : ""} value="${escape(value)}">${startDate}</label>`;
+  return `<label>${label}<input name="${name}" type="${type}" ${optionalDays ? 'min="0" max="365" step="1"' : type === "number" ? 'step="any" required' : ""} value="${escape(value)}">${startDate}</label>`;
 }
 function slotChip(value = "") {
   return `<span class="slot-chip"><input type="time" aria-label="Posting time" value="${escape(value)}" required><button type="button" class="icon-button" data-remove-slot aria-label="Remove posting time">×</button></span>`;
@@ -420,7 +421,7 @@ document.addEventListener("submit", async (event) => {
   const values = structuredClone(preferences[group]);
   for (const field of form.querySelectorAll("[name]")) {
     const [outer, inner] = field.name.split(".");
-    const value = field.type === "checkbox" ? field.checked : field.type === "number" ? Number(field.value) :
+    const value = field.type === "checkbox" ? field.checked : field.type === "number" ? (field.value === "" ? null : Number(field.value)) :
       field.hasAttribute("data-list") ? field.value.split("\n").map((line) => line.trim()).filter(Boolean) :
       field.type === "date" ? field.value || null : field.value;
     if (inner) (values[outer] ||= {})[inner] = value;

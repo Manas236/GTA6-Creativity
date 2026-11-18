@@ -915,9 +915,10 @@ dialog label {
 .topbar {
   height: 80px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 530px) auto;
+  grid-template-columns: max-content minmax(0, 530px) auto;
   gap: 12px;
 }
+#breadcrumb { white-space: nowrap; }
 .toast {
   display: grid;
   gap: 3px;
@@ -1160,9 +1161,19 @@ dialog label {
 .library-clip { display: flex; align-items: center; gap: 10px; }
 .library-thumb { flex: none; object-fit: cover; border-radius: 5px; background: var(--line); }
 
+main:has(> .review-toolbar) { padding-top: 10px; }
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-bottom: 8px;
+}
+.review-toolbar .page-heading, .review-toolbar h1, .review-toolbar .tabs { margin: 0; }
+#review-help { margin-left: auto; }
 .review-layout {
   display: grid;
-  grid-template-columns: minmax(190px, 260px) minmax(0, 1fr);
+  grid-template-columns: minmax(190px, 230px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -1186,13 +1197,16 @@ dialog label {
 .inbox-entry small { display: block; }
 .review-actions {
   position: sticky;
-  top: 0;
+  bottom: 0;
   z-index: 2;
-  padding: 8px;
+  gap: 6px;
+  padding: 5px 8px;
   margin: 8px 0;
   background: var(--subtle);
   border-radius: 8px;
 }
+.review-actions .button { min-height: 32px; padding-block: 5px; }
+#review-selected .version-panel { padding: 8px 16px; }
 #review-selected video:not(.phone-preview) { max-height: 335px; max-width: 100%; }
 #review-shortcuts dl { display: grid; grid-template-columns: 5em 1fr; gap: 6px; }
 #review-shortcuts dd { margin: 0; }
@@ -1266,8 +1280,8 @@ dialog label {
 .panel.todo-row { padding: 16px 20px; }
 .health-strip { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .version-panel { min-width: 0; margin-bottom: 12px; }
-.version-body { display: grid; grid-template-columns: minmax(160px, 260px) minmax(0, 1fr); gap: 20px; align-items: start; }
-.phone-preview { display: block; width: 100%; aspect-ratio: 9/16; max-height: 460px; background: var(--video); border-radius: 10px; object-fit: contain; }
+.version-body { display: grid; grid-template-columns: clamp(175px, calc(72dvh - 288px), 360px) minmax(0, 1fr); gap: 20px; align-items: start; }
+.phone-preview { display: block; width: 100%; aspect-ratio: 9/16; background: var(--video); border-radius: 10px; object-fit: contain; }
 .mock-preview { display: grid; place-items: center; }
 .mock-preview img { max-width: 100%; }
 #render-meta h3 { margin-top: 0; }
