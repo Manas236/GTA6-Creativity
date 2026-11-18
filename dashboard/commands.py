@@ -53,7 +53,17 @@ ACTIONS = {
     "down": "Move down",
     "post_now": "Post at the earliest allowed time",
     "edit_caption": "Save caption",
+    "approve_versions": "Approve preset versions",
+    "edit_caption_words": "Edit burned-in captions",
+    "edit_voiceover": "Edit voiceover",
+    "move_to_slot": "Move to exact slot",
+    "make_from_discovered": "Make clip from discovered source",
+    "snapshot_now": "Take analytics snapshot",
+    "run_stage": "Run a pipeline stage",
+    "go_live": "Go live",
+    "go_dry": "Enable dry run",
 }
+GLOBAL_ACTIONS = {"go_live", "go_dry", "run_stage"}
 DECISIONS = {"approve": "ok", "aonly": "aonly", "bonly": "bonly", "reject": "no", "hookok": "hookok"}
 #: Approval decision -> the renders that must exist on disk before it is accepted.
 APPROVAL_RENDERS = {"approve": ("a", "b"), "aonly": ("a",), "bonly": ("b",)}
@@ -122,6 +132,10 @@ def fingerprint(item, posts):
         "approval_type",
         "caption_body",
         "caption_hashtags",
+        "caption_words_override",
+        "voiceover_override",
+        "approved_versions",
+        "creation_job",
     )
     state = {k: item.get(k) for k in fields} if item else {}
     # A card being sent changes rendered to awaiting_approval without changing its content.
@@ -169,6 +183,16 @@ def publishing_block_reason(posts):
 def validate(action, item, posts, payload, path):
     if action not in ACTIONS:
         raise ControlError("Unknown action.")
+    if action in GLOBAL_ACTIONS:
+        if action == "go_live" and payload.get("dry_run_mode") is not None:
+            raise ControlError("Going live requires a null dry_run_mode.")
+        if action == "run_stage" and payload.get("stage") not in ("analytics", "cleanup"):
+            raise ControlError("Choose analytics or cleanup.")
+        return
+    if action == "snapshot_now":
+        if not item or not any(post["status"] == "live" and post["remote_id"] for post in posts):
+            raise ControlError("This item has no live posts.")
+        return
     if action in ("pause", "resume"):
         if action == "resume" and not rate_limit.dashboard_meta_paused(path):
             raise ControlError("No dashboard pause to resume. Meta cooldowns expire on their own.")
@@ -202,6 +226,47 @@ def validate(action, item, posts, payload, path):
             "Publishing has started or failed. This item is display-only to prevent duplicate posts."
         )
     stage = item["stage"]
+    if action == "make_from_discovered" and (stage != "discovered" or item.get("creation_job")):
+        raise ControlError("Choose an unclaimed discovered item.")
+    if action == "approve_versions":
+        variants = payload.get("variants")
+        if (stage not in ("rendered", "awaiting_approval") or not isinstance(variants, list)
+                or not variants or any(v not in ("p1", "p2", "p3") for v in variants)
+                or len(set(variants)) != len(variants)):
+            raise ControlError("Choose one or more available preset versions.")
+        available = {row["variant"] for row in db.renders_for_item(item["id"], path)
+                     if Path(row["path"]).is_file()}
+        if not set(variants) <= available:
+            raise ControlError("A selected render is missing. Re-render before approval.")
+        binding.assert_caption_binding(item, item.get("hook_text"), vo_path=item.get("voiceover_audio_path"))
+    if action in ("edit_caption_words", "edit_voiceover"):
+        if stage not in EDITABLE or not Path(item.get("cut_path") or "").is_file():
+            raise ControlError("Editing requires an unposted item with a cut file.")
+        if action == "edit_caption_words":
+            words = payload.get("words")
+            if (not isinstance(words, list) or not words or any(
+                not isinstance(w, dict) or type(w.get("i")) is not int or not 0 <= w["i"] < 2000
+                or not isinstance(w.get("text"), str) or not 0 < len(w["text"].strip()) <= 80
+                or any(ord(c) < 32 for c in w["text"]) for w in words
+            )):
+                raise ControlError("Enter indexed caption words with 1–80 characters each.")
+        else:
+            script = payload.get("script")
+            speed = payload.get("speed", 1.1)
+            voice = payload.get("voice", "am_adam")
+            if (not isinstance(script, str) or not 0 < len(script.strip()) <= 300
+                    or type(speed) not in (int, float) or not 0.5 <= speed <= 2
+                    or not isinstance(voice, str) or not re.fullmatch(r"[a-z]{2}_[a-z0-9]+", voice)):
+                raise ControlError("Use a 1–300 character script, a Kokoro voice and speed between 0.5 and 2.")
+    if action == "move_to_slot":
+        if stage not in ("approved", "queued"):
+            raise ControlError("Approve the item before moving it.")
+        try:
+            when = datetime.fromisoformat(payload["at"])
+            if when.tzinfo is None or when <= clock.utcnow():
+                raise ValueError()
+        except (KeyError, ValueError, TypeError):
+            raise ControlError("Choose a future slot with an explicit timezone.") from None
     if stage in ("posted", "measured", "cleaned"):
         raise ControlError("Remove published media on Instagram yourself.")
     if action == "delete" and stage == "rejected" and item.get("rejection_reason") == "deleted from dashboard":
@@ -240,6 +305,8 @@ def validate(action, item, posts, payload, path):
         if stage not in expected:
             raise ControlError("This decision no longer applies. Refresh the item.")
         if action in APPROVAL_RENDERS:
+            if db.renders_for_item(item["id"], path):
+                raise ControlError("Choose a preset version.")
             binding.assert_caption_binding(
                 item, item.get("hook_text"), vo_path=item.get("voiceover_audio_path")
             )
@@ -306,15 +373,15 @@ def caption_values(payload):
     return body.strip(), " ".join(tags)
 
 
-def available_actions(item, posts):
+def available_actions(item, posts, path=None):
     if not db.is_releasable(item) or not unstarted(posts):
-        return []
+        return ["snapshot_now"] if any(p["status"] == "live" and p["remote_id"] for p in posts) else []
     stage = item["stage"]
     if stage in ("posted", "measured", "cleaned"):
         return []
     actions = [] if item.get("rejection_reason") == "deleted from dashboard" else ["delete"]
     if stage in ("approved", "queued"):
-        actions += ["unapprove", "post_now"]
+        actions += ["unapprove", "post_now", "move_to_slot"]
     if stage == "queued" and posts:
         actions += ["up", "down"]
     if stage in EDITABLE:
@@ -324,7 +391,12 @@ def available_actions(item, posts):
     if actions and item.get("cut_path") and Path(item["cut_path"]).is_file():
         actions.append("remake_hook")
     if stage in ("rendered", "awaiting_approval"):
-        actions += ["approve", "aonly", "bonly", "reject"]
+        versions = path is not None and db.renders_for_item(item["id"], path)
+        actions += (["approve_versions", "edit_caption_words", "edit_voiceover"] if versions
+                    else ["approve", "aonly", "bonly"])
+        actions.append("reject")
+    if stage == "discovered" and not item.get("creation_job"):
+        actions.append("make_from_discovered")
     if stage == "needs_review":
         actions += ["hookok", "reject"]
     if stage in EDITABLE and item.get("hook_text") and item.get("voiceover_script"):
@@ -337,12 +409,20 @@ def available_actions(item, posts):
 
 
 def prepare(action, item_id, payload, path, cfg):
-    if item_id and action in ("pause", "resume", "make", "clip_url"):
+    if item_id and action in GLOBAL_ACTIONS | {"pause", "resume", "make", "clip_url"}:
         raise ControlError("This control does not select an item.")
     item = db.get_item(item_id, path) if item_id else None
     posts = posting.get_posts_for_item(item_id, path) if item_id else []
     validate(action, item, posts, payload, path)
     detail = ACTIONS[action]
+    if action in ("move_to_slot", "reslot"):
+        payload = {**payload, "previous_slot": posting.item_slot(posts)}
+    if action == "edit_hook":
+        payload = {**payload, "previous": {"hook_text": item["hook_text"]}}
+    if action == "edit_caption":
+        payload = {**payload, "previous": {"body": item["caption_body"] or "",
+                                         "hashtags": item["caption_hashtags"] or ""},
+                   "restore_default": item.get("caption_body") is None}
     if action in ("position", "up", "down"):
         rows = queue_controls.scheduled(path)
         order = [row["id"] for row in rows]
@@ -356,7 +436,8 @@ def prepare(action, item_id, payload, path, cfg):
                    "schedule": rows}
     if action == "unapprove":
         payload = {"previous_slot": posting.item_slot(posts), "stage": item["stage"],
-                   "decision": RESTORE_DECISIONS.get(item["approval_type"], "approve")}
+                   "decision": RESTORE_DECISIONS.get(item["approval_type"], "approve"),
+                   "versions": json.loads(item.get("approved_versions") or "[]")}
     if action == "restore_approval":
         payload = {"command_id": str(payload.get("command_id", ""))}
     if action == "delete":
@@ -445,6 +526,42 @@ def apply(command, cfg, path):
         raise ControlError(
             "State changed before the runner reached this command. Refresh and confirm again."
         )
+    if action == "approve_versions":
+        message = telegram_bot.approve_versions(item_id, payload["variants"], path)
+        release_card(item_id, path)
+        return message
+    if action == "move_to_slot":
+        when = clock.parse(payload["at"])
+        _, zone, slots = scheduler.active_profile(cfg)
+        reserved = scheduler.reserved_times(path, item_id)
+        if when.astimezone(zone).time() not in slots or not scheduler.slot_available(when, reserved, cfg):
+            raise ControlError("That slot is unavailable under the posting gap or daily target.")
+        if not posting.enabled_platforms(cfg):
+            raise ControlError("No publishing platforms are enabled.")
+        posting.ensure_post_rows(item, clock.iso(when), cfg, path)
+        queue_controls.set_slot(item_id, clock.iso(when), path)
+        db.transition_stage(item_id, "queued", db_path=path)
+        return f"Scheduled for {slot_time(when, cfg)}."
+    if action == "make_from_discovered":
+        db.transition_stage(item_id, "discovered", {"creation_job": command["id"]}, path)
+        return "Discovered item claimed."
+    if action in ("edit_caption_words", "edit_voiceover"):
+        with db.db(path) as conn:
+            conn.execute("DELETE FROM posts WHERE item_id=?", (item_id,))
+        fields = {"creation_job": command["id"], "approved_versions": None, "chosen_variant": None,
+                  "approval_type": None, "ab_excluded": 0}
+        if action == "edit_caption_words":
+            words = json.loads(item.get("caption_words_override") or "{}")
+            words.update({str(w["i"]): w["text"].strip() for w in payload["words"]})
+            fields["caption_words_override"] = json.dumps(words)
+        else:
+            voiceover = {**cfg.get("voiceover", {}), **payload}
+            override = {key: voiceover[key] for key in ("script", "voice", "speed") if key in voiceover}
+            fields.update(voiceover_override=json.dumps(override), voiceover_script=payload["script"].strip(),
+                          voiceover_binding=None, voiceover_audio_path=None)
+        release_card(item_id, path)
+        db.transition_stage(item_id, "cut", fields, path)
+        return "Re-render requested."
     if action == "pause":
         rate_limit.set_dashboard_meta_pause(True, path)
         return "Posting paused by the dashboard until resumed."
@@ -479,10 +596,13 @@ def apply(command, cfg, path):
                 raise ControlError("No publishing platforms are enabled.")
         # "a_only" is the flag unapprovals recorded before B-only existed.
         decision = original.get("decision") or ("aonly" if original.get("a_only") else "approve")
-        if decision not in APPROVAL_RENDERS:
+        if original.get("versions"):
+            outcome, message = "approved_versions", telegram_bot.approve_versions(item_id, original["versions"], path)
+        elif decision not in APPROVAL_RENDERS:
             raise ControlError("The original approval cannot be restored.")
-        validate(decision, item, posts, {}, path)
-        outcome, message = telegram_bot.decide(item_id, DECISIONS[decision], path)
+        else:
+            validate(decision, item, posts, {}, path)
+            outcome, message = telegram_bot.decide(item_id, DECISIONS[decision], path)
         if not outcome or outcome == telegram_bot.NOT_APPLICABLE:
             raise ControlError(message)
         if slot and original.get("stage") == "queued":
@@ -498,7 +618,7 @@ def apply(command, cfg, path):
         if action == "delete":
             db.mark_rejected(item_id, "deleted from dashboard", db_path=path)
             return "Deleted from dashboard."
-        fields = {"chosen_variant": None, "approval_type": None, "ab_excluded": 0}
+        fields = {"chosen_variant": None, "approval_type": None, "ab_excluded": 0, "approved_versions": None}
         if action == "unapprove":
             db.transition_stage(item_id, "awaiting_approval", fields, path)
             return "Returned to review."
@@ -506,12 +626,17 @@ def apply(command, cfg, path):
         if stage == "downloaded" and not Path(item.get("download_path") or "").is_file():
             stage = "discovered"
         fields.update(binding.SEGMENT_CONTENT_FIELDS, creation_job=command["id"], error_message=None,
-                      error_stage=None, caption_body=None, caption_hashtags=None)
+                      error_stage=None, caption_body=None, caption_hashtags=None,
+                      caption_words_override=None, voiceover_override=None,
+                      legacy_renders=int(bool(item.get("legacy_renders") or item.get("render_a_path")
+                                              or item.get("render_b_path"))))
         db.transition_stage(item_id, stage, fields, path)
         return "Remake started."
     if action == "edit_caption":
         body, tags = caption_values(payload)
         fields = {"caption_body": body, "caption_hashtags": tags}
+        if payload.get("restore_default_caption") is True:
+            fields = {"caption_body": None, "caption_hashtags": None}
         db.transition_stage(item_id, item["stage"], fields, path)
         with db.db(path) as conn:
             conn.execute("UPDATE posts SET caption_text=?, updated_at=? WHERE item_id=?",
@@ -547,6 +672,11 @@ def apply(command, cfg, path):
             "hook_binding": None,
             "voiceover_binding": None,
             "voiceover_audio_path": None,
+            "legacy_renders": int(bool(item.get("legacy_renders") or item.get("render_a_path")
+                                       or item.get("render_b_path"))),
+            "approved_versions": None,
+            "caption_words_override": None,
+            "voiceover_override": None,
             "render_a_path": None,
             "render_b_path": None,
             "caption_text": None,
@@ -620,7 +750,9 @@ def runner_boundary(cfg, path, stage):
             r[0]
             for r in conn.execute(
                 "SELECT id FROM dashboard_commands WHERE status='pending' AND action NOT IN "
-                "('make','clip_url','remake_cut','remake_hook') ORDER BY created_at, rowid LIMIT 50"
+                "('make','clip_url','remake_cut','remake_hook','make_from_discovered',"
+                "'edit_caption_words','edit_voiceover','snapshot_now','go_live','go_dry','run_stage') "
+                "ORDER BY created_at, rowid LIMIT 50"
             )
         ]
     for command_id in ids:
@@ -686,3 +818,21 @@ def submit(plan, command_id, path, cfg, media_root=None):
         return apply_pending(command_id, cfg, path, media_root) or command
     finally:
         runner.release_lock(path)
+
+
+def undo_for(plan, command_id):
+    action, item_id, payload = plan["action"], plan["item_id"], plan["payload"]
+    undo = None
+    if action in APPROVAL_RENDERS or action == "approve_versions":
+        undo = ("unapprove", {})
+    elif action == "unapprove":
+        undo = ("restore_approval", {"command_id": command_id})
+    elif action in ("up", "down", "position") and payload.get("undo_target"):
+        undo = ("position", {"target": payload["undo_target"]})
+    elif action in ("move_to_slot", "reslot") and payload.get("previous_slot"):
+        undo = ("move_to_slot", {"at": payload["previous_slot"]})
+    elif action in ("edit_hook", "edit_caption") and payload.get("previous") is not None:
+        undo = (action, {**payload["previous"], **(
+            {"restore_default_caption": True} if action == "edit_caption" and payload.get("restore_default") else {}
+        )})
+    return {"action": undo[0], "item_id": item_id, "payload": undo[1]} if undo else None

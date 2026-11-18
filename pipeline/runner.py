@@ -264,6 +264,7 @@ def run_stages(
     db_path: Any = None,
     stages: list[tuple[str, Any]] | None = None,
     graceful: bool = False,
+    reload_before_post: bool = False,
 ) -> dict[str, Any]:
     """Run every stage in order WITHOUT taking the lock (the caller holds it).
 
@@ -300,6 +301,10 @@ def run_stages(
             except Exception:
                 log.exception("Dashboard boundary failed before %s; running the stage", name)
         try:
+            if name == "post" and reload_before_post:
+                cfg = config.get_config(reload=True)
+            if name == "analytics":
+                run_dashboard_operations(cfg, db_path)
             results[name] = fn(cfg, db_path)
             log.info("Stage %-9s ok in %.1fs: %s", name, time.time() - t_stage, str(results[name])[:300])
         except Exception as e:  # noqa: BLE001 - this is the isolation boundary
@@ -370,7 +375,7 @@ def run_loop(
         while (max_cycles is None or cycles < max_cycles) and not stopping(db_path):
             try:
                 cfg = fixed_config or config.get_config(reload=True)
-                result = run_stages(cfg, db_path, graceful=True)
+                result = run_stages(cfg, db_path, graceful=True, reload_before_post=fixed_config is None)
                 log.info("Cycle %d: %s%s", cycles + 1, result["status"],
                          f" (failed stages: {sorted(result['errors'])})" if result["errors"] else "")
                 # Dead-man switch: only after a fully successful cycle; never raises.
@@ -399,6 +404,34 @@ def run_loop(
     return cycles
 
 
+def run_dashboard_operations(cfg, db_path, job_id=None):
+    """Run queued read-only analytics or retention operations under the runner lock."""
+    with db.db(db_path) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='dashboard_commands'").fetchone():
+            return
+        jobs = conn.execute(
+            "SELECT * FROM dashboard_commands WHERE status='pending' AND action IN ('snapshot_now','run_stage') "
+            "AND (? IS NULL OR id=?) ORDER BY rowid", (job_id, job_id)
+        ).fetchall()
+    for job in jobs:
+        payload = json.loads(job["payload"])
+        try:
+            if db.kv_get("dashboard:demo", db_path=db_path):
+                result = "Demo operation completed."
+            elif job["action"] == "snapshot_now":
+                ids = analytics.snapshot_now(job["item_id"], cfg, db_path)
+                result = f"Captured {len(ids)} live post snapshot(s)."
+            else:
+                result = str(EXTRA_COMMANDS[payload["stage"]](cfg, db_path))
+            status = "applied"
+        except Exception as exc:
+            status, result = "failed", posting.redact(exc)
+            log.warning("Dashboard operation %s: %s", job["id"], result)
+        with db.db(db_path) as conn:
+            conn.execute("UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
+                         (status, result[:500], db.now(), job["id"]))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GTA 6 Pipeline Runner")
     parser.add_argument("--db", type=str, default=None, help="Custom database path")
@@ -420,6 +453,8 @@ def main() -> None:
     loop_parser.add_argument("--interval", type=float, default=None, help="Seconds between cycles")
     make_parser = subparsers.add_parser("make", help="Create clips without publishing")
     make_parser.add_argument("--job", required=True)
+    operation = subparsers.add_parser("operation", help="Run a confirmed dashboard operation")
+    operation.add_argument("--job", required=True)
     subparsers.add_parser("status", help="Print current database status and stage counts")
 
     args = parser.parse_args()
@@ -536,6 +571,15 @@ def main() -> None:
     elif args.command == "make":
         from .creation import make_worker
         make_worker(args.job, db_path=db_p)
+    elif args.command == "operation":
+        db.init_db(db_p)
+        if not acquire_lock(db_path=db_p):
+            print("Locked: another runner active")
+            return
+        try:
+            run_dashboard_operations(config.get_config(), db_p)
+        finally:
+            release_lock(db_path=db_p)
     elif args.command == "status":
         print_status(db_path=db_p)
     else:

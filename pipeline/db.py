@@ -280,6 +280,17 @@ def init_db(db_path: Path | str | None = None) -> None:
     with db(db_path) as conn:
         conn.executescript(SCHEMA)
         conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS renders (
+                item_id TEXT REFERENCES items(id) ON DELETE CASCADE, variant TEXT, preset TEXT,
+                path TEXT, meta_path TEXT, created_at TEXT, PRIMARY KEY(item_id, variant)
+            )
+        """)
+        metric_cols = {r[1] for r in conn.execute("PRAGMA table_info(metrics)")}
+        for col, kind in (("late", "INTEGER DEFAULT 0"), ("age_hours", "REAL"),
+                          ("saves", "INTEGER"), ("reach", "INTEGER")):
+            if col not in metric_cols:
+                conn.execute(f"ALTER TABLE metrics ADD COLUMN {col} {kind}")
         # Migrate channel_id and authenticity if missing in existing table
         cols = [r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()]
         if "channel_id" not in cols:
@@ -300,9 +311,13 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE items ADD COLUMN preview_only INTEGER DEFAULT 0")
         # Caption binding (pipeline.binding): rows from before it have none, so their hooks are
         # regenerated for the item's current segment before they can be rendered.
-        for col in ("hook_binding", "voiceover_binding", "hook_review"):
+        for col in ("hook_binding", "voiceover_binding", "hook_review",
+                    "caption_words_override", "voiceover_override", "approved_versions"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE items ADD COLUMN {col} TEXT")
+        if "legacy_renders" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN legacy_renders INTEGER DEFAULT 0")
+            conn.execute("UPDATE items SET legacy_renders=1 WHERE render_a_path IS NOT NULL OR render_b_path IS NOT NULL")
         # Gemini outages: the hooks stage waits instead of failing the item (PLAN.md call #177).
         if "transient_errors" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN transient_errors INTEGER DEFAULT 0")
@@ -414,6 +429,13 @@ def get_item(item_id: str, db_path: Path | str | None = None) -> dict[str, Any] 
 #: approval and posting queries - they do not rely on the preview_only triggers firing.
 SYNTHETIC_PREFIX = "synthetic-"   # ids of the items scripts/cp3_dry_run.py builds for its test card
 RELEASABLE_SQL = f"COALESCE(preview_only, 0) = 0 AND id NOT LIKE '{SYNTHETIC_PREFIX}%'"
+
+
+def renders_for_item(item_id, db_path=None):
+    with db(db_path) as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM renders WHERE item_id=? ORDER BY variant", (item_id,)
+        )]
 
 
 def is_synthetic(item: dict[str, Any] | None) -> bool:

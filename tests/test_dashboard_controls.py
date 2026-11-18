@@ -195,7 +195,7 @@ def test_settings_backup_and_reload(tmp_path, monkeypatch):
     assert first in [path.read_bytes() for path in tmp_path.glob("config.local.yaml.*.bak")]
     merged = config.get_config(reload=True)
     assert merged["cut"]["heatmap_weight"] == 0.5
-    assert merged["sources"]["twitch"]["enable_from"] is None
+    assert merged["sources"]["twitch"]["enable_from"] == cfg["sources"]["twitch"]["enable_from"]
     assert merged["approval"]["dashboard_only"]
     assert (tmp_path / "config.yaml").read_bytes() == original
 

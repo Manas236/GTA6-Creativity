@@ -107,6 +107,15 @@ def run_voiceover_for_item(
     voice = cfg.get("voiceover", {}).get("voice", "am_adam")
     speed = float(cfg.get("voiceover", {}).get("speed", 1.1))
 
+    import json
+
+    override = json.loads(item.get("voiceover_override") or "{}")
+    script = override.get("script", script).strip()
+    if override and script != item.get("voiceover_script"):
+        db.transition_stage(item_id, item["stage"], {"voiceover_script": script}, db_path)
+        item["voiceover_script"] = script
+    voice = override.get("voice", voice)
+    speed = override.get("speed", speed)
     audio_dir = config.media_dir("audio")
     out_path = audio_dir / f"{item_id}_vo.wav"
 

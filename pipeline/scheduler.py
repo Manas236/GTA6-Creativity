@@ -108,6 +108,16 @@ def reserved_times(db_path: Any = None, exclude_item_id: str | None = None) -> l
     return sorted(seen.values())
 
 
+def slot_available(candidate, taken, cfg):
+    """Check a candidate against live and queued reservations in the active profile."""
+    posting_cfg = (cfg or {}).get("posting", {})
+    gap = timedelta(hours=float(posting_cfg.get("min_gap_hours", 3)))
+    target = int(posting_cfg.get("daily_post_target", 2))
+    day = local_day(candidate, cfg)
+    return (all(candidate != other and abs(candidate - other) >= gap for other in taken)
+            and sum(local_day(other, cfg) == day for other in taken) < target)
+
+
 def next_free_slot(
     after: datetime,
     cfg: dict[str, Any] | None = None,
@@ -118,18 +128,12 @@ def next_free_slot(
     daily target."""
     cfg = cfg or config.get_config()
     posting_cfg = cfg.get("posting") or {}
-    min_gap = timedelta(hours=float(posting_cfg.get("min_gap_hours", 3.0)))
-    daily_target = int(posting_cfg.get("daily_post_target", 2))
     search_days = int(posting_cfg.get("max_slot_search_days", 60))
     taken = reserved_times(db_path, exclude_item_id=exclude_item_id)
 
     for candidate in slot_candidates(after, cfg, days=search_days):
-        if any(abs(candidate - t) < min_gap for t in taken):
-            continue
-        day = local_day(candidate, cfg)
-        if sum(1 for t in taken if local_day(t, cfg) == day) >= daily_target:
-            continue
-        return candidate
+        if slot_available(candidate, taken, cfg):
+            return candidate
     raise RuntimeError(f"no free posting slot within {search_days} days of {clock.iso(after)}")
 
 
@@ -153,10 +157,21 @@ def variant_stats(db_path: Any = None) -> dict[str, dict[str, float]]:
             for r in rows}
 
 
-def variant_probabilities(cfg: dict[str, Any] | None = None, db_path: Any = None) -> tuple[dict[str, float], str]:
+def variant_probabilities(cfg: dict[str, Any] | None = None, db_path: Any = None, arms=None) -> tuple[dict[str, float], str]:
     """({'A': p, 'B': p}, why). The single place the allocation rule lives; analytics stores the
     same numbers in ab_learning.weight."""
     auto = ((cfg or {}).get("autopilot") or {})
+    if arms:
+        even = dict.fromkeys(arms, 1 / len(arms))
+        minimum = int(auto.get("bandit_min_samples_per_variant", 3))
+        stats = variant_stats(db_path)
+        if in_week_one(cfg, db_path) or any(stats.get(arm, {}).get("n", 0) < minimum for arm in arms):
+            return even, "uniform preset exploration"
+        best = max(stats[arm]["score"] for arm in arms)
+        leaders = [arm for arm in arms if abs(stats[arm]["score"] - best) < 1e-9]
+        floor = max(0, min(float(auto.get("bandit_min_exploration_floor", 0.20)), 1 / len(arms)))
+        bonus = (1 - floor * len(arms)) / len(leaders)
+        return {arm: floor + (bonus if arm in leaders else 0) for arm in arms}, "preset bandit"
     floor = min(max(float(auto.get("bandit_min_exploration_floor", 0.20)), 0.0), 0.5)
     min_samples = int(auto.get("bandit_min_samples_per_variant", 3))
     even = {"A": 0.5, "B": 0.5}
@@ -186,6 +201,11 @@ def pinned_variant(item: dict[str, Any]) -> str | None:
     A pinned item (ab_excluded, or a single-variant approval_type) keeps its own chosen_variant.
     If that was never recorded it falls back to the approval_type's variant, and only then to A.
     """
+    import json
+
+    versions = json.loads(item.get("approved_versions") or "[]")
+    if versions:
+        return versions[0] if len(versions) == 1 else None
     approval = item.get("approval_type")
     if not (int(item.get("ab_excluded") or 0) or approval in PINNED_APPROVAL_TYPES):
         return None
@@ -205,7 +225,17 @@ def choose_variant(
     pinned = pinned_variant(item)
     if pinned:
         return pinned, f"approved {pinned} only: stays {pinned}, excluded from the A/B comparison"
-    probs, why = variant_probabilities(cfg, db_path)
+    import json
+
+    versions = json.loads(item.get("approved_versions") or "[]")
+    probs, why = variant_probabilities(cfg, db_path, versions)
+    if versions:
+        roll = (rng or random).random()
+        for variant, probability in probs.items():
+            roll -= probability
+            if roll < 0:
+                return variant, why
+        return versions[-1], why
     roll = (rng or random).random()
     variant = "A" if roll < probs["A"] else "B"
     return variant, why

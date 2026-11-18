@@ -10,7 +10,8 @@ from urllib.parse import parse_qs, urlsplit
 from . import config, cut, db, discover, download, render, runner
 
 log = logging.getLogger(__name__)
-ACTIONS = {"make", "clip_url", "remake_cut", "remake_hook"}
+ITEM_JOBS = {"remake_cut", "remake_hook", "make_from_discovered", "edit_caption_words", "edit_voiceover"}
+ACTIONS = {"make", "clip_url"} | ITEM_JOBS
 
 
 def source_from_url(value):
@@ -133,7 +134,8 @@ def run_jobs(cfg, path, only=None):
     with db.db(path) as conn:
         jobs = conn.execute(
             "SELECT * FROM dashboard_commands WHERE status IN ('pending','running') "
-            "AND action IN ('make','clip_url','remake_cut','remake_hook') AND (? IS NULL OR id=?) "
+            "AND action IN ('make','clip_url','remake_cut','remake_hook','make_from_discovered',"
+            "'edit_caption_words','edit_voiceover') AND (? IS NULL OR id=?) "
             "ORDER BY rowid", (only, only),
         ).fetchall()
     demo = db.kv_get("dashboard:demo", db_path=path)
@@ -145,7 +147,7 @@ def run_jobs(cfg, path, only=None):
         try:
             with transaction(path) as conn:
                 conn.execute("UPDATE dashboard_commands SET status='running' WHERE id=?", (job_id,))
-                if action.startswith("remake_") and job["status"] == "pending":
+                if action in ITEM_JOBS and job["status"] == "pending":
                     commands.apply(dict(job), cfg, path)
             with db.db(path) as conn:
                 ids = [row[0] for row in conn.execute("SELECT id FROM items WHERE creation_job=?", (job_id,))]
