@@ -225,6 +225,7 @@ def build_ass_subtitles(
     cfg: dict[str, Any] | None = None,
     *,
     sp: Any = None,
+    caption_overrides: dict[str, str] | None = None,
 ) -> str:
     """Generate ASS content: hook in the band above the video for the whole clip, plus
     1-3 word captions with the active word highlighted.
@@ -298,6 +299,13 @@ def build_ass_subtitles(
         # Caption text only: "PRE -DOWNLOAD" -> "PRE-DOWNLOAD", "1 001 / 004" -> "1,001/004".
         words = normalize_caption_words(words)
         timeline = [w for w in words if float(w["start"]) < video_duration - 0.05]
+        # Chunking skips words with no display text. Index only those present in the sidecar.
+        timeline = [w for w in timeline if _clean_caption_word(w["word"])]
+        if caption_overrides:
+            for index, word in enumerate(timeline):
+                replacement = caption_overrides.get(str(index))
+                if replacement and _clean_caption_word(replacement):
+                    word["word"] = replacement
         chunks = chunk_caption_words(timeline, rs)
         base = cap["color"]
         kw_list = list(sp.keyword_list) if sp is not None else []
@@ -997,12 +1005,11 @@ def render_item_variants(
                     cfg=cfg, preset=version, channel_name=channel_name, keyword_list=keyword_list,
                     occupancy=occupancy.with_freeze() if occupancy is not None and freeze_s > 0 else occupancy,
                 )
-                plan.words = [dict(word, word=overrides.get(str(i), word["word"]))
-                              for i, word in enumerate(plan.words)]
-                if cfg.get("style", {}).get("music", {}).get("enabled") is False:
-                    plan.music_file = None
-                ass.write_text(build_ass_subtitles(hook_text, plan.total_s, plan.words, cfg=cfg, sp=plan),
-                               encoding="utf-8")
+                ass.write_text(
+                    build_ass_subtitles(hook_text, plan.total_s, plan.words, cfg=cfg, sp=plan,
+                                        caption_overrides=overrides),
+                    encoding="utf-8",
+                )
                 ok, elapsed = render_variant_b(
                     cut_path, vo_path, ass, output, target_lufs,
                     duration_s=plan.content_s, freeze_s=freeze_s, cfg=cfg, sp=plan,
@@ -1040,9 +1047,6 @@ def render_item_variants(
         preset=preset_name, channel_name=channel_name, keyword_list=keyword_list,
         occupancy=occupancy.with_freeze() if occupancy is not None and freeze_s > 0 else occupancy,
     )
-    if overrides:
-        plan_b.words = [dict(word, word=overrides.get(str(i), word["word"]))
-                        for i, word in enumerate(plan_b.words)]
     content_s = plan_a.content_s
 
     subs = Path(subtitles_dir)
@@ -1054,7 +1058,8 @@ def render_item_variants(
         encoding="utf-8",
     )
     ass_b.write_text(
-        build_ass_subtitles(hook_text, plan_b.total_s, plan_b.words, cfg=cfg, sp=plan_b if use_style else None),
+        build_ass_subtitles(hook_text, plan_b.total_s, plan_b.words, cfg=cfg,
+                            sp=plan_b if use_style else None, caption_overrides=overrides),
         encoding="utf-8",
     )
 

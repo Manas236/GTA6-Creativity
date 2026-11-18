@@ -486,3 +486,35 @@ def test_run_render_item_reuses_the_cached_cut_words(tmp_db: Path, tmp_path: Pat
     assert ok, msg
     assert [Path(c.args[0]) for c in tw.call_args_list] == [vo]      # VO only, never the cut
     assert riv.call_args.args[3] == CACHED_WORDS                      # speech words = the cache
+
+
+@pytest.mark.parametrize("versions", [["P2"], None], ids=["preset-p2", "legacy-b"])
+def test_caption_override_uses_sidecar_index(tmp_path, monkeypatch, versions):
+    cut = _make_cut(tmp_path / "cut.mp4", seconds=3)
+    vo = _make_vo(tmp_path / "vo.wav")
+    monkeypatch.setattr(render, "assert_item_caption_binding", lambda *args: None)
+    monkeypatch.setattr(render, "source_text_override", lambda item: True)
+    monkeypatch.setattr(render.planning, "gate_caption_words", lambda analysis, *_: analysis)
+    monkeypatch.setattr(render.transcribe, "speech_profile", lambda *_: None)
+
+    tokens = ["MONEY", "PRE", "-DOWNLOAD", "STROWEL", "ZELNICK"]
+    speech = [{"word": word, "start": i * 0.4, "end": i * 0.4 + 0.3}
+              for i, word in enumerate(tokens)]
+    voiceover = [{"word": "VO", "start": 0.1, "end": 0.8}]
+    subtitles = tmp_path / "subs"
+    render.render_item_variants(
+        cut, vo, "VICE CITY", speech, voiceover,
+        tmp_path / "item_A.mp4", tmp_path / "item_B.mp4", subtitles,
+        preset="P2", version_presets=versions, clean_cut_end=True,
+        item={"caption_words_override": '{"3": "STRAUSS"}'},
+    )
+
+    name = "item_P2" if versions else "item_B"
+    caption_words = render.render_meta.read(tmp_path / f"{name}.mp4")["caption_words"]
+    assert [(word["i"], word["text"]) for word in caption_words] == list(
+        enumerate(["VO", "MONEY", "PRE-DOWNLOAD", "STRAUSS", "ZELNICK"])
+    )
+    dialogue = "\n".join(line for line in (subtitles / f"{name}.ass").read_text().splitlines()
+                         if line.startswith("Dialogue:"))
+    assert "STRAUSS" in dialogue and "PRE-DOWNLOAD" in dialogue
+    assert "STROWEL" not in dialogue

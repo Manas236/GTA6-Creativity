@@ -137,6 +137,7 @@ STYLE_DEFAULTS: dict[str, Any] = {
     },
     # A2 ------------------------------------------------------------------
     "music_bed": {
+        "enabled": True,
         "file": "assets/music/bed.mp3",
         "level_db": -24.0,
         "duck_db": -8.0,
@@ -211,6 +212,7 @@ def resolve_preset(preset: str | None = None, cfg: dict[str, Any] | None = None)
             if f not in flags:
                 raise KeyError(f"Preset {nm!r} disables unknown style flag {f!r}")
             flags[f] = False
+    flags["music_bed"] &= ss["music_bed"]["enabled"] is not False
     return flags
 
 
