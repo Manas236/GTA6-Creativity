@@ -4,30 +4,32 @@ let preferences, reviewId = new URLSearchParams(location.search).get("item"), jo
 const busyActions = new Set();
 const inboxPending = new Map();
 const waitingCommands = new Map();
-let inlineDecision, reviewRequest = 0;
+let reviewRequest = 0;
 let undoQueue = Promise.resolve();
 const undoHistory = [];
 const notices = new Map();
 const actionVerbs = { position: "move", up: "move", down: "move", aonly: "approve", bonly: "approve", clip_url: "queue clip from URL", restore_approval: "restore approval for" };
-const quickActions = new Set(["approve", "aonly", "bonly", "hookok", "up", "down", "unapprove", "pause", "resume", "edit_hook", "edit_caption", "make", "clip_url", "retry", "position"]);
-const inlineConfirm = new Set(["reject", "remake_cut", "remake_hook"]);
 const keys = { a: "approve", "1": "aonly", "2": "bonly", h: "hookok", r: "reject", e: "edit_hook", c: "edit_caption", m: "remake_cut", g: "remake_hook" };
-const reviewLink = (id) => "/review?item=" + encodeURIComponent(id);
+const reviewLink = (id) => {
+  const tab = { needs_review: "decision", failed: "failed", rejected: "rejected" }[itemById(id)?.stage];
+  return localLink("/review?item=" + encodeURIComponent(id) + (tab ? "&tab=" + tab : ""));
+};
 let libraryAnchor, libraryRequest = 0, draggedItem, queueCompact = false;
 const selectedItems = new Set();
 let connectionRows = [], connectionsBusy = false;
 const content = document.querySelector("#content");
 const dialog = document.querySelector("#action-dialog");
-const colors = {
-  instagram: "#f49abb",
-  facebook: "#85b9ff",
-  A: "#b2a1ff",
-  B: "#70d8b2",
-};
+const themeColor = (name) => getComputedStyle(document.documentElement).getPropertyValue("--" + name).trim();
+const colors = { get instagram() { return themeColor("pink"); }, get facebook() { return themeColor("blue"); } };
 const labels = {
-  approve: "Approve both variants",
-  aonly: "Approve A only",
-  bonly: "Approve B only",
+  position: "Move",
+  go_live: "Go live", go_dry: "Back to dry run", approve_versions: "Approve versions",
+  edit_caption_words: "Edit captions in video", edit_voiceover: "Edit voiceover",
+  move_to_slot: "Move to slot", run_stage: "Run stage", snapshot_now: "Snapshot now",
+  make_from_discovered: "Make this one",
+  approve: "Approve both versions",
+  aonly: "Approve Captions version only",
+  bonly: "Approve Voiceover version only",
   reject: "Reject item",
   hookok: "Hook is right",
   edit_hook: "Edit hook",
@@ -44,9 +46,9 @@ const labels = {
   up: "Move up",
   down: "Move down",
   post_now: "Post now",
-  edit_caption: "Edit caption",
+  edit_caption: "Edit post text (Instagram caption)",
 };
-const filters = { queue: "", stage: "all", failures: "all" };
+const filters = { queue: "", stage: "all" };
 const escape = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -62,8 +64,8 @@ const compact = (value) =>
     maximumFractionDigits: 1,
   }).format(value || 0);
 const pretty = (value) => String(value || "unknown").replaceAll("_", " ");
-const itemLink = (id) => "/items/" + encodeURIComponent(id);
-const itemById = (id) => state.items.find((i) => i.id === id);
+const itemLink = (id) => localLink("/items/" + encodeURIComponent(id) + "?from=" + encodeURIComponent(location.pathname + location.search));
+const itemById = (id) => state?.items.find((i) => i.id === id);
 const formatTime = (value, options = {}) =>
   value
     ? new Intl.DateTimeFormat("en-GB", {
@@ -103,7 +105,7 @@ function button(action, id = "", text = labels[action]) {
   return `<button class="button ${["reject", "delete"].includes(action) ? "danger" : action === "approve" ? "primary" : "secondary"}" data-action="${action}" data-id="${escape(id)}">${escape(text)}</button>`;
 }
 function heading(title, subtitle, controls = "") {
-  return `<div class="page-heading"><div><h1>${title}</h1><p>${escape(subtitle)}</p></div>${controls}</div>`;
+  return `<div class="page-heading"><div><h1>${title}</h1>${subtitle ? `<p>${escape(subtitle)}</p>` : ""}</div>${controls}</div>`;
 }
 function metric(label, value, caption, tone = "") {
   return `<div class="metric"><div class="eyebrow">${label}</div><div class="value ${tone}">${value}</div><div class="caption">${escape(caption)}</div></div>`;
@@ -150,88 +152,29 @@ function commandsPanel() {
 function commandRow(c) {
   return `<div class="command-row">${pill(commandState(c), c.status === "applied" ? "green" : ["pending", "running"].includes(c.status) ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${resultMessage(c.result || (c.status === "running" ? "Worker running." : "Waiting for a worker or the next runner boundary."))}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`;
 }
-function runnerButtons() {
-  const active = state.lock.status === "alive";
-  return `<div class="detail-actions runner-controls">
-    <button class="button primary" data-runner="start" ${active ? "disabled" : ""}>Start runner</button>
-    <button class="button secondary" data-runner="stop" ${!active || state.lock.stopping ? "disabled" : ""}>Stop runner</button>
-    ${state.lock.force ? `<button class="button danger" data-runner="force" ${["post", "settle"].includes(state.lock.stage) ? "disabled" : ""}>Force stop</button>` : ""}
-  </div>`;
-}
 function overview() {
-  const next = queueItems()
-      .filter((q) => q.posts.length)
-      .slice(0, 5),
-    latest = totals();
-  const live = state.posts.filter((p) => p.status === "live").length;
-  const review = state.items.filter((i) =>
-    ["needs_review", "awaiting_approval", "rendered"].includes(i.stage),
-  ).length;
-  const max = Math.max(1, ...state.stages.map((s) => s.count));
-  const runtime = state.runtime,
-    lock = state.lock;
-  const quotaBlocked =
-    runtime.gemini_blocked_until &&
-    new Date(runtime.gemini_blocked_until) > new Date();
-  const quotaKnown = state.runtime_known;
-  const quotaText = quotaKnown
-    ? quotaBlocked
-      ? "Cooldown"
-      : "No cooldown reported"
-    : "Unknown";
-  const cooldownMinutes = Math.max(1, Math.ceil(
-    (new Date(state.meta_cooldown_until) - new Date(state.at)) / 60000,
-  ));
-  const cooldown = state.meta_cooldown_until
-    ? `Meta cooldown · ${cooldownMinutes} min remaining · ${state.meta_cooldown_reason}`
-    : "";
-  const metaDetails = [
-    state.dashboard_paused ? "Paused by dashboard." : "",
-    cooldown,
-  ].filter(Boolean).join(" ");
-  const health = (name, status, desc, tone = "") =>
-    `<div class="health-row"><div><div class="health-name">${escape(name)}</div><div class="health-detail">${escape(desc)}</div></div><div class="health-state"><span class="light ${tone}"></span>${escape(status)}</div></div>`;
-  content.innerHTML =
-    heading(
-      "Your pipeline, at a glance.",
-      `${formatTime(state.at, { weekday: "long" })} · ${state.timezone}`,
-      runnerButtons() + (state.dashboard_paused
-        ? button("resume", "", "Lift dashboard pause")
-        : state.meta_paused ? "" : button("pause")),
-    ) +
-    `<div class="metrics-grid">${metric("READY TO GO", `${state.ready} <em>/ ${state.target}</em>`, "Ready buffer · target from config", "pink")}${metric("LIVE PLATFORM POSTS", number(live), "Instagram + Facebook")}${metric("RECORDED VIEWS", compact(latest.reduce((n, m) => n + m.views, 0)), "Latest stored snapshot per post", "green")}${metric("AWAITING A DECISION", review, "Rendered, approval & review queues", "purple")}</div>
-    <div class="grid-main"><section class="panel">${panelHead("Production funnel", "Every pipeline stage · current inventory", pill(`${state.items.length} items`))}
-    ${state.stages.map((s) => `<a href="/queue?stage=${s.stage}" class="funnel-row"><span class="funnel-label">${escape(pretty(s.stage))}</span><div class="track"><div class="fill" style="width:${(s.count / max) * 100}%;background:${["failed", "rejected"].includes(s.stage) ? "var(--red)" : s.stage === "needs_review" ? "var(--amber)" : s.stage === "queued" ? "var(--pink)" : "var(--purple)"}"></div></div><b>${number(s.count)}</b></a>`).join("")}</section>
-    <section class="panel">${panelHead("System health", "Observed state from the runner and SQLite")}
-    ${health("Runner", lock.stopping ? "Stopping" : lock.status === "alive" ? "Running" : "Stopped", lock.stopping ? `Finishing ${lock.stage || "startup"}` : lock.age === null ? "No valid heartbeat" : `Heartbeat ${lock.age}s ago · ${lock.host || "unknown host"} · ${lock.stage || "starting"}`, lock.status === "alive" ? "" : lock.status === "stale" ? "red" : "gray")}
-    ${health("Meta publishing", state.meta_paused ? "Paused" : "Enabled", state.meta_paused ? metaDetails : state.dry_run ? "Dry run is on; publish requests are suppressed." : "The runner publishes at scheduled slots.", state.meta_paused ? "amber" : "")}
-    ${health("Gemini quota", quotaText, quotaBlocked ? `Runner reported a block until ${formatTime(runtime.gemini_blocked_until)}.` : "Remaining daily allowance is not exposed by the pipeline.", quotaBlocked ? "amber" : quotaKnown ? "" : "gray")}
-    ${state.limits
-      .filter((l) => l.source !== "meta_graph")
-      .map((l) =>
-        health(
-          pretty(l.source),
-          l.paused ? "Paused" : "Available",
-          l.paused ? l.reason : "No active source cooldown.",
-          l.paused ? "amber" : "",
-        ),
-      )
-      .join("")}
-    ${health("Approval mode", pretty(state.approval_mode), state.days_live === null ? "The first live post starts the seven-day clock." : `${state.days_live.toFixed(1)} days since first live post.`)}
-    <div class="ring-wrap"><div class="ring">${Math.round(state.probabilities.A * 100)}%</div><div><h3>Variant A allocation</h3><div class="small">B receives ${Math.round(state.probabilities.B * 100)}% of eligible draws</div></div></div><p class="reason">${escape(state.variant_reason)}</p></section></div>
-    <div class="grid-main"><section class="panel">${panelHead("Next in line", "Scheduled in " + state.timezone, '<a class="small" href="/queue">Open calendar ↗</a>')}
-    ${
-      next.length
-        ? next
-            .map((q) => {
-              const slot = q.posts[0].slot_datetime;
-              return `<a class="upcoming-row" href="${itemLink(q.item.id)}"><div class="date-tile">${escape(formatTime(slot, { day: undefined, hour: undefined, minute: undefined, month: "short" }))}<b>${escape(formatTime(slot, { month: undefined, hour: undefined, minute: undefined, day: "2-digit" }))}</b></div><div class="grow"><h3>${escape(q.item.original_title)}</h3><div class="meta">${escape(q.item.author_name)} · ${escape(q.item.source)}</div></div><div class="next-time">${escape(formatTime(slot, { day: undefined, month: undefined }))}<div>${pill(q.posts[0].variant === "?" ? "A/B at publish" : `Variant ${q.posts[0].variant}`)}</div></div></a>`;
-            })
-            .join("")
-        : empty("No scheduled items. Approve a render to fill the queue.")
-    }</section>
-    <section class="panel">${panelHead("Views by platform", "Latest snapshot totals, grouped by publish day")}<div class="chart-box"><canvas id="overview-chart" role="img" aria-label="Views by platform over publish dates"></canvas></div><div class="legend"><span><i style="background:var(--pink)"></i>Instagram</span><span><i style="background:var(--blue)"></i>Facebook</span></div></section></div>${commandsPanel()}`;
-  platformChart("overview-chart", latest);
+  const status = summaryStatus();
+  const todo = state.todo || {};
+  const rows = [
+    [`${todo.to_review ?? state.items.filter((item) => isReviewItem(item) && item.stage !== "needs_review").length} clips to review`, '<a class="button secondary" href="/review">Review</a>'],
+    [status.next_post_at ? "Next post " + formatTime(status.next_post_at, { day: undefined, month: undefined }) : "No post scheduled", '<a class="button secondary" href="/queue">Queue</a>'],
+    [`Runner ${status.runner}`, `<button class="button secondary" data-runner="${status.runner === "running" ? "stop" : "start"}">${status.runner === "running" ? "Stop" : "Start"}</button>`],
+    [`${status.problems} ${status.problems === 1 ? "problem" : "problems"}`, '<a class="button secondary" href="/review?tab=failed">Failures tab</a>'],
+  ];
+  patchMarkup(content, heading("Overview", "") +
+    `<section class="panel todo-list">${rows.map(([label, control]) => `<div class="todo-row"><strong>${escape(label)}</strong>${control}</div>`).join("")}</section>
+    <div class="health-strip">${pill("Gemini quota · " + (Date.parse(state.runtime?.gemini_blocked_until) > Date.now() ? "cooldown" : "not reported"))}
+    ${pill("Ready buffer · " + state.ready + " / " + state.target)}
+    ${pill("Approval · " + pretty(state.approval_mode))}
+    ${button(state.dashboard_paused ? "resume" : "pause")}</div>${commandsPanel()}`);
+}
+function summaryStatus() {
+  return state.status_line || {
+    dry_run: state.dry_run,
+    runner: state.lock.status === "alive" ? "running" : state.lock.status === "stale" ? "stale" : "stopped",
+    next_post_at: queueItems().find(({ posts }) => posts[0]?.slot_datetime)?.posts[0].slot_datetime,
+    problems: state.items.filter((item) => ["needs_review", "failed"].includes(item.stage)).length,
+  };
 }
 function queue() {
   const query = new URLSearchParams(location.search).get("stage");
@@ -262,27 +205,27 @@ function queue() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   }
-  content.innerHTML =
+  patchMarkup(content,
     heading(
-      "The publishing calendar.",
+      "Queue",
       `${state.profile} profile · ${state.timezone} · slots ${state.slots.join(" & ")}`,
-      `<button class="button secondary" id="queue-view" aria-pressed="${queueCompact}">${queueCompact ? "Calendar" : "Compact list"}</button>`,
-    ) +
+      `<button class="button secondary" id="queue-view" aria-pressed="${queueCompact}">${queueCompact ? "Calendar" : "List view"}</button>`,
+    ) + calendarMarkup() +
     `<div class="toolbar"><input type="search" id="queue-search" aria-label="Search items" placeholder="Search clips, creators or item IDs" value="${escape(filters.queue)}"><select id="stage-filter" aria-label="Filter stage"><option value="all">Approved & queued</option>${state.stages.map((s) => `<option value="${s.stage}" ${filters.stage === s.stage ? "selected" : ""}>${pretty(s.stage)} (${s.count})</option>`).join("")}</select></div>
-  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "compact" ? "QUEUE ORDER" : day === "unscheduled" ? "WAITING FOR A SLOT" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card ${queueCompact ? "queue-compact" : ""}" data-queue-item="${escape(item.id)}" draggable="${item.actions.includes("up")}"><div class="queue-time">${posts[0] ? escape(queueTime(posts[0].slot_datetime)) : "—"}<div class="small">${posts[0] ? "SCHEDULED" : "UNSCHEDULED"}</div></div><div><h3><a href="${reviewLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(["A", "B"].includes(posts[0]?.variant || item.chosen_variant) ? `Variant ${posts[0]?.variant || item.chosen_variant}` : "A/B drawn at publish")}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.includes("post_now") ? button("post_now", item.id) : ""}
+  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "compact" ? "Queue order" : day === "unscheduled" ? "Waiting for a slot" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card ${queueCompact ? "queue-compact" : ""}" data-queue-item="${escape(item.id)}" draggable="${item.stage === "approved" || item.actions.includes("up")}"><div class="queue-time">${posts[0] ? escape(queueTime(posts[0].slot_datetime)) : "—"}<div class="small">${posts[0] ? "Scheduled" : "Unscheduled"}</div></div><div><h3><a href="${reviewLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(versionName(posts[0]?.variant || item.chosen_variant))}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.includes("post_now") ? button("post_now", item.id) : ""}
       <details class="queue-menu"><summary class="button secondary" aria-label="More actions">…</summary>
-      <div>${item.actions.filter((action) => ["unapprove", "up", "down"].includes(action)).map((action) => button(action, item.id)).join("")}
-      <a href="${reviewLink(item.id)}">Open in Review</a></div></details></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`;
+      <div>${item.actions.filter((action) => ["unapprove", "up", "down", "reslot"].includes(action)).map((action) => button(action, item.id)).join("")}
+      <a href="${reviewLink(item.id)}">Open in Review</a></div></details></div><div class="reslot-host"></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`);
 }
 document.addEventListener("click", (event) => {
   if (event.target.closest("#queue-view")) { queueCompact = !queueCompact; queue(); return; }
   const row = event.target.closest("[data-queue-item]");
-  if (row && !event.target.closest("a, button, details")) location.href = reviewLink(row.dataset.queueItem);
+  if (row && !event.target.closest("a, button, details, input, form")) location.href = localLink(reviewLink(row.dataset.queueItem));
 });
 
 document.addEventListener("dragstart", (event) => {
   const row = event.target.closest('[data-queue-item][draggable="true"]');
-  if (!row || event.target !== row) return;
+  if (!row) return;
   draggedItem = row.dataset.queueItem;
   event.dataTransfer.setData("text/plain", draggedItem);
   event.dataTransfer.effectAllowed = "move";
@@ -307,112 +250,44 @@ document.addEventListener("dragend", () => {
   document.querySelector(".drop-target")?.classList.remove("drop-target");
 });
 
+function metricTable(metrics) {
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Snapshot</th><th>Views</th><th>Likes</th><th>Comments</th><th>Shares</th></tr></thead><tbody>
+    ${metrics.map((m) => `<tr><td>${m.hours ?? m.window_hours ?? m.window_h ?? m.snapshot_hours ?? "—"} h ${m.late ? pill("late", "amber") : ""}</td><td>${number(m.views)}</td><td>${number(m.likes)}</td><td>${number(m.comments)}</td><td>${number(m.shares)}</td></tr>`).join("")}</tbody></table></div>`;
+}
 function analytics() {
-  const latest = totals(),
-    views = latest.reduce((n, m) => n + m.views, 0);
-  const median = latest.length
-    ? [...latest].sort((a, b) => a.views - b.views)[
-        Math.floor(latest.length / 2)
-      ].views
-    : 0;
-  const breakdown = (field) => {
-    const groups = new Map();
-    for (const m of latest) {
-      const k = m[field] || "unknown";
-      const v = groups.get(k) || { views: 0, n: 0 };
-      v.views += m.views;
-      v.n++;
-      groups.set(k, v);
-    }
-    return [...groups].sort((a, b) => b[1].views - a[1].views);
-  };
-  const bars = (field) => {
-    const rows = breakdown(field),
-      max = Math.max(1, ...rows.map((r) => r[1].views));
-    return (
-      rows
-        .map(
-          ([label, v]) =>
-            `<div class="bar-row"><div class="bar-label"><span>${escape(pretty(label))}</span><span>${compact(v.views)} <span class="muted">· ${v.n} posts</span></span></div><div class="track"><div class="fill" style="width:${(v.views / max) * 100}%;background:${field === "source" ? "var(--green)" : "var(--purple)"}"></div></div></div>`,
-        )
-        .join("") || empty("No stored measurements yet.")
-    );
-  };
-  content.innerHTML =
-    heading(
-      "Learn from every Reel.",
-      "Stored insights only · no live API requests",
-    ) +
-    `<div class="metrics-grid">${metric("TOTAL RECORDED VIEWS", compact(views), "Latest available snapshot per platform post", "pink")}${metric("MEASURED POSTS", latest.length, "Platform posts with at least one snapshot")}${metric("MEDIAN VIEWS", compact(median), "Across measured platform posts", "green")}${metric("SNAPSHOTS", state.metrics.length, "All stored observation windows", "purple")}</div>
-  <div class="grid-main"><section class="panel">${panelHead("Views over time", "Latest views grouped by publish date; cumulative snapshots are not added together.")}<div class="chart-box"><canvas id="analytics-chart" role="img" aria-label="Instagram and Facebook views by publish date"></canvas></div><div class="legend"><span><i style="background:var(--pink)"></i>Instagram</span><span><i style="background:var(--blue)"></i>Facebook</span></div></section>
-  <section class="panel">${panelHead("A/B allocation", "Current probabilities from the scheduler")}
-  <div class="allocation"><div style="width:${state.probabilities.A * 100}%;background:var(--purple)">A · ${Math.round(state.probabilities.A * 100)}%</div><div style="width:${state.probabilities.B * 100}%;background:var(--green)">B · ${Math.round(state.probabilities.B * 100)}%</div></div><p class="reason">${escape(state.variant_reason)}</p>
-  ${["A", "B"].map((v) => `<div class="health-row"><span>Variant ${v}</span><span class="small">${state.variants[v]?.n || 0} items · score ${(state.variants[v]?.score || 0).toFixed(3)}</span></div>`).join("")}</section></div>
-  <div class="grid-half"><section class="panel">${panelHead("Performance by hook style", "Latest recorded views · grouped by post hook style")}${bars("hook_style")}</section><section class="panel">${panelHead("Performance by source", "Latest recorded views · grouped by post source")}${bars("source")}</section></div>
-  <section class="panel">${panelHead("Follow an individual post", "Views at each stored observation time")}<div class="toolbar"><select id="post-select" aria-label="Select post"><option value="">Choose a platform post</option>${latest.map((m) => `<option value="${m.post_id}">${escape(itemById(m.item_id)?.original_title || m.item_id)} · ${m.platform} · ${m.variant}</option>`).join("")}</select></div><div class="chart-box"><canvas id="post-chart" role="img" aria-label="Selected post views at snapshot times"></canvas></div></section>`;
-  content.insertAdjacentHTML("beforeend", `<section class="panel commands">${panelHead("Moment selection", "Signal recorded for each selected cut")}
-     ${["heatmap", "chat", "audio_scene"].map((signal) => `<div class="health-row"><span>${pretty(signal)}</span><b>${state.items.filter((i) => i.cut_signal === signal).length}</b></div>`).join("")}</section>`);
-  platformChart("analytics-chart", latest);
-  const select = document.querySelector("#post-select");
-  select.addEventListener("change", () => postChart(select.value));
-  if (latest.length) {
-    select.value = latest[0].post_id;
-    postChart(select.value);
-  } else drawLines("post-chart", [], []);
+  const latest = totals();
+  const warnings = state.analytics_warnings || [];
+  patchMarkup(content, heading("Analytics", "Stored insights from published clips") +
+    (warnings.length ? `<section class="panel warning-card"><h2>Missed snapshot windows</h2>${warnings.map((warning) =>
+      `<p><a href="${itemLink(warning.item_id)}">${escape(itemById(warning.item_id)?.original_title || warning.item_id)}</a> · ${warning.window_h} h window missed · ${warning.late_snapshot_taken ? "Late snapshot taken" : "No late snapshot yet"}</p>`).join("")}</section>` : "") +
+    (latest.length ? `<div class="metrics-grid">${["views", "likes", "comments", "shares"].map((field) => metric(field, number(latest.reduce((sum, row) => sum + Number(row[field] || 0), 0)), "Latest snapshot per post")).join("")}</div>
+    <section class="panel commands"><h2>Views by publish date</h2><div class="chart-box"><canvas id="analytics-chart" role="img" aria-label="Views by platform"></canvas></div><div class="legend"><span><i style="background:var(--pink)"></i>Instagram</span><span><i style="background:var(--blue)"></i>Facebook</span></div></section>
+    <section class="panel commands"><h2>Post snapshots</h2>${latest.map((row) => `<article data-row="${escape(row.post_id)}"><h3><a href="${itemLink(row.item_id)}">${escape(itemById(row.item_id)?.original_title || row.item_id)}</a> · ${escape(row.platform)} · ${escape(versionName(row.variant))}</h3>${metricTable(state.metrics.filter((m) => m.post_id === row.post_id))}</article>`).join("")}</section>` :
+    empty("Insights appear after a live post reaches its first snapshot window and the runner collects metrics.")));
+  if (latest.length) platformChart("analytics-chart", latest);
 }
-function failureList(items) {
-  return (
-    items
-      .map(
-        (i) =>
-          `<article class="failure-card"><div class="failure-symbol">${i.stage === "needs_review" ? "?" : "!"}</div><div class="grow"><h3><a href="${itemLink(i.id)}">${escape(i.original_title)}</a></h3><p>${escape(i.error_message || i.rejection_reason || i.hook_text || "Needs a human decision")}</p><div class="chips">${pill(pretty(i.error_stage || i.stage), i.stage === "needs_review" ? "amber" : "red")}${pill(i.source)}</div>${["posting", "publishing"].includes(i.error_stage) ? '<p class="error">Display-only. Retry could double-post.</p>' : ""}</div><a class="button secondary" href="${itemLink(i.id)}">Inspect ↗</a></article>`,
-      )
-      .join("") || empty("Nothing here.")
-  );
-}
-function failures() {
-  const failed = state.items.filter((i) => i.stage === "failed"),
-    rejected = state.items.filter((i) => i.stage === "rejected"),
-    review = state.items.filter((i) => i.stage === "needs_review");
-  const stats = state.cut_stats;
-  content.innerHTML =
-    heading(
-      "Catch what needs attention.",
-      "Inspect the cause, review the clip, then choose the next step.",
-    ) +
-    `<div class="metrics-grid">${metric("FAILED", failed.length, "Items stopped by a stage error", "pink")}${metric("NEEDS REVIEW", review.length, "Hook or layout decisions waiting", "purple")}${metric("REJECTED", rejected.length, "Quality, dedupe or human decisions")}${metric("NO CLEAN ENDING", `${Math.round(stats.rate * 100)}%`, `${stats.no_clean_ending} of ${stats.attempts} cut attempts · last 24h`)}</div>
- <div class="grid-main"><section class="panel">${panelHead("Failed & rejected", "Publishing failures are display-only.")}<div class="toolbar"><select id="failure-filter" aria-label="Filter failures"><option value="all">All failed & rejected</option><option value="failed" ${filters.failures === "failed" ? "selected" : ""}>Failed only</option><option value="rejected" ${filters.failures === "rejected" ? "selected" : ""}>Rejected only</option></select></div>${failureList([...failed, ...rejected].filter((i) => filters.failures === "all" || i.stage === filters.failures))}</section>
- <div><section class="panel">${panelHead("Needs a human", "Open the item to see its segment and binding.", pill(`${review.length} waiting`, "amber"))}${failureList(review)}</section><section class="panel commands">${panelHead("Cut outcomes", "Last 24 hours")}<div class="bar-row"><div class="bar-label"><span>No clean ending</span><span>${stats.no_clean_ending}</span></div><div class="track"><div class="fill" style="width:${stats.rate * 100}%;background:var(--amber)"></div></div></div><p class="reason">${stats.attempts} completed cut attempts. This rate excludes attempts still in progress.</p></section></div></div>${commandsPanel()}`;
-}
-async function itemPage(id = decodeURIComponent(location.pathname.split("/")[2]), reviewBar = "") {
-  detail = await api("/api/items/" + encodeURIComponent(id));
+
+async function itemPage(id = decodeURIComponent(location.pathname.split("/")[2])) {
+  const priorId = detail?.item.id;
+  detail = await loadDetail(id);
   const i = detail.item;
-  let renderHelp = "Render previews will appear when available.";
-  if (i.stage === "needs_review") {
-    renderHelp = "Review the hook and cut segment before rendering.";
-  } else if (detail.media.a && detail.media.b && detail.actions.includes("approve")) {
-    renderHelp = "Play both variants before approving.";
-  }
-  const video = (v, title) =>
-    `<div class="video-card"><header><h3>${title}</h3>${pill(v.toUpperCase(), "pink")}</header>${detail.media[v] ? `<video controls preload="metadata" src="/media/${encodeURIComponent(i.id)}/${v}#t=0.1" aria-label="${title}"></video>` : empty("No render available for this variant.")}</div>`;
-  content.innerHTML =
-    reviewBar + (reviewBar ? "" : `<a class="back-link" href="/library">← Back to library</a>`) +
+  selectedVersion = priorId === id ? selectedVersion : undefined;
+  patchMarkup(content,
+    `<a class="back-link" href="${escape(fromLink())}">← Back</a>` +
     heading(
       escape(i.original_title || i.id),
       `${i.author_name} · ${i.source} · ${i.id}`,
       pill(pretty(i.stage), "pink"),
     ) +
     (["posting", "publishing"].includes(i.error_stage) ||
-    detail.posts.some((p) => !["pending", "dry_run"].includes(p.status))
+    detail.posts.some((p) => p.status && !["pending", "dry_run", "live"].includes(p.status))
       ? '<div class="notice">Posting history exists. Started or failed publishes are display-only to prevent duplicate posts.</div>'
       : "") +
-    (["posted", "measured", "cleaned"].includes(i.stage) ? '<div class="notice">Remove published media on Instagram yourself.</div>' : "") +
     (i.preview_only
       ? '<div class="notice">Preview-only item. Approval and pipeline controls are blocked.</div>'
       : "") +
-    `<div class="grid-main"><section class="panel">${panelHead("Render comparison", renderHelp)}
- <div class="video-grid">${video("a", "Captions only")}${video("b", "Voiceover + clip")}</div>
- <div class="detail-actions">${detail.actions
+    `<div class="grid-main"><section class="panel">${versionPanel(detail)}
+ <div class="detail-actions">${approvalButtons(detail)}${detail.actions
    .filter((a) => ["approve", "aonly", "bonly", "reject", "hookok"].includes(a))
    .map((a) =>
      button(
@@ -424,23 +299,24 @@ async function itemPage(id = decodeURIComponent(location.pathname.split("/")[2])
      ),
    )
    .join("")}</div>
- ${detail.media.cut ? `<details class="commands"><summary class="muted">Watch the cut segment</summary><video controls preload="none" src="/media/${encodeURIComponent(i.id)}/cut" style="width:100%;max-height:300px"></video></details>` : ""}</section>
- <section class="panel">${panelHead("The story", i.hook_style ? pretty(i.hook_style) + " hook" : "Hook pending", pill(i.authenticity || "unverified", i.authenticity === "official" ? "green" : "amber"))}<div class="hook-display">${escape(i.hook_text || "No hook generated yet")}</div><div class="label-value"><div class="eyebrow">VOICEOVER SCRIPT</div><p>${escape(i.voiceover_script || "Not generated")}</p></div><div class="label-value"><div class="eyebrow">CUT WINDOW</div><p>${i.cut_start == null ? "Not cut" : `${Number(i.cut_start).toFixed(2)} → ${Number(i.cut_end).toFixed(2)} s · ${Number(i.cut_duration || i.cut_end - i.cut_start).toFixed(2)} s`}</p></div>
+ ${detail.media.cut ? `<details class="commands"><summary class="muted">Watch the cut segment</summary><video controls preload="none" src="${mediaURL("/media/" + encodeURIComponent(i.id) + "/cut")}" style="width:100%;max-height:300px"></video></details>` : ""}</section>
+ <section class="panel">${panelHead("The story", i.hook_style ? pretty(i.hook_style) + " hook" : "Hook pending", pill(i.authenticity || "unverified", i.authenticity === "official" ? "green" : "amber"))}<div class="hook-display">${escape(i.hook_text || "No hook generated yet")}</div><div class="label-value"><div class="eyebrow">Voiceover script</div><p>${escape(i.voiceover_script || "Not generated")}</p></div><div class="label-value"><div class="eyebrow">Cut window</div><p>${i.cut_start == null ? "Not cut" : `${Number(i.cut_start).toFixed(2)} → ${Number(i.cut_end).toFixed(2)} s · ${Number(i.cut_duration || i.cut_end - i.cut_start).toFixed(2)} s`}</p></div>
  ${Object.entries(detail.binding)
    .map(
      ([k, v]) =>
        `<div class="binding-status ${v ? "warning" : ""}">${v ? "◉" : "✓"} ${escape(pretty(k))} binding${v ? `<br>${escape(v)}` : " verified for this segment"}</div>`,
    )
    .join("")}
- <div class="label-value"><div class="eyebrow">CUT SIGNAL</div><p>${escape(pretty(i.cut_signal))}</p></div>
+ <div class="label-value"><div class="eyebrow">Cut signal</div><p>${escape(pretty(i.cut_signal))}</p></div>
  <div class="detail-actions">${detail.actions
-   .filter((a) => !["approve", "aonly", "bonly", "reject", "hookok"].includes(a) && a !== "edit_caption")
+   .filter((a) => !["approve", "aonly", "bonly", "reject", "hookok"].includes(a) && a !== "edit_caption" && !contractActions.has(a))
    .map((a) => button(a, i.id))
    .join("")}</div></section></div>
- <section class="panel commands">${panelHead("Posting caption", "Creator credit and disclosure are appended when an override is saved.")}
+ <section class="panel commands">${panelHead("Post text (Instagram caption)", "Creator credit and disclosure are appended when an override is saved.")}
  <p class="caption-preview">${escape(detail.caption)}</p>${detail.actions.includes("edit_caption") ? button("edit_caption", i.id) : ""}</section>
+ ${postedDetails(detail)}
  ${detail.review.reason ? `<section class="panel commands">${panelHead("Review context")}<p class="reason">${escape(detail.review.reason)}</p><p>${escape(detail.review.transcript_excerpt || "")}</p></section>` : ""}
- <section class="panel commands">${panelHead("Stage history", "Full history, oldest to newest", pill(`${detail.logs.length} events`))}${detail.logs.map((l) => `<div class="log-entry"><time>${escape(formatTime(l.created_at))}</time><span>${escape(pretty(l.stage))}</span><div>${pill(l.status, ["failed", "failure"].includes(l.status) ? "red" : l.status === "success" ? "green" : "")}<p>${escape(l.message)}${l.duration_s ? ` · ${Number(l.duration_s).toFixed(1)}s` : ""}</p></div></div>`).join("") || empty("No stage history recorded.")}</section>${commandsPanel()}`;
+ <section class="panel commands">${panelHead("Stage history", "Full history, oldest to newest", pill(`${detail.logs.length} events`))}${detail.logs.map((l) => `<div class="log-entry"><time>${escape(formatTime(l.created_at))}</time><span>${escape(pretty(l.stage))}</span><div>${pill(l.status, ["failed", "failure"].includes(l.status) ? "red" : l.status === "success" ? "green" : "")}<p>${escape(l.message)}${l.duration_s ? ` · ${Number(l.duration_s).toFixed(1)}s` : ""}</p></div></div>`).join("") || empty("No stage history recorded.")}</section>${commandsPanel()}`);
 }
 function platformChart(id, latest) {
   const days = [
@@ -463,22 +339,6 @@ function platformChart(id, latest) {
     series,
   );
 }
-function postChart(id) {
-  const rows = state.metrics.filter((m) => String(m.post_id) === String(id));
-  drawLines(
-    "post-chart",
-    rows.map((m) => formatTime(m.fetched_at)),
-    rows.length
-      ? [
-          {
-            name: rows[0].platform,
-            color: colors[rows[0].platform],
-            values: rows.map((m) => m.views),
-          },
-        ]
-      : [],
-  );
-}
 function drawLines(id, labels, series) {
   const canvas = document.getElementById(id);
   if (!canvas) return;
@@ -490,8 +350,8 @@ function drawLines(id, labels, series) {
   canvas.height = h * dpr;
   const ctx = canvas.getContext("2d");
   ctx.scale(dpr, dpr);
-  ctx.font = "10px Segoe UI, Arial";
-  ctx.fillStyle = "#919bb0";
+  ctx.font = "12px Segoe UI, Arial";
+  ctx.fillStyle = themeColor("muted");
   if (!labels.length) {
     ctx.textAlign = "center";
     ctx.fillText("No stored measurements yet", w / 2, h / 2);
@@ -506,7 +366,7 @@ function drawLines(id, labels, series) {
     max = Math.max(1, ...series.flatMap((s) => s.values)) * 1.15;
   for (let n = 0; n < 5; n++) {
     const y = top + (ph * n) / 4;
-    ctx.strokeStyle = "#2a3040";
+    ctx.strokeStyle = themeColor("line");
     ctx.beginPath();
     ctx.moveTo(left, y);
     ctx.lineTo(w - right, y);
@@ -572,16 +432,12 @@ async function api(url, body) {
           body: JSON.stringify(body),
         },
   );
-  let data;
-  try {
-    data = await response.json();
-  } catch {
-    throw new Error(
-      `Request failed (${response.status}). Refresh and try again.`,
-    );
+  const data = await response.json().catch(() => null);
+  if (!response.ok || data === null) {
+    const error = new Error(data?.error || `Request failed (${response.status}).`);
+    error.status = response.status;
+    throw error;
   }
-  if (!response.ok)
-    throw new Error(data.error || `Request failed (${response.status}).`);
   return data;
 }
 function toast(message, { error = false, group, inverse, command, title } = {}) {
@@ -660,17 +516,14 @@ function commandNotice(action, command, title, payload = {}, inverse, warning) {
     return;
   }
   const pending = command.status === "pending";
-  const isApproval = ["approve", "aonly", "bonly"].includes(action);
+  const isApproval = ["approve", "approve_versions", "aonly", "bonly"].includes(action);
   const group = isApproval ? (pending ? "approvals queued" : "approved") : undefined;
   const count = payload.count;
   const messages = {
     make: `${count} ${count === 1 ? "clip" : "clips"} queued`,
     clip_url: "Clip queued",
-    approve: pending ? "Approval queued" : "1 approved",
-    aonly: pending ? "Approval queued" : "1 approved",
-    bonly: pending ? "Approval queued" : "1 approved",
   };
-  toast(messages[action] || [title, command.result || "Change queued"].filter(Boolean).join(" · "),
+  toast((isApproval ? (pending ? "Approval queued" : "1 approved") : messages[action]) || [title, command.result || "Change queued"].filter(Boolean).join(" · "),
     { group, inverse, command, title });
 }
 
@@ -706,25 +559,29 @@ async function runAction(action, id, payload = {}, trigger, inlineError, reverse
   const title = itemById(id)?.original_title || (action === "clip_url" ? payload.url : null);
   try {
     const plan = await api("/api/prepare", { action, item_id: id || null, payload });
-    const { command, warning } = await api("/api/confirm", { ticket: plan.ticket });
+    const { command, warning, undo } = await api("/api/confirm", { ticket: plan.ticket });
     if (["refused", "failed"].includes(command.status)) throw new Error(warning || command.result);
     if (["make", "clip_url", "remake_cut", "remake_hook"].includes(action)) jobId = command.id;
-    const inverse = {
+    const inverse = undo ? [undo.action, undo.item_id, undo.payload] : {
       approve: ["unapprove", id], aonly: ["unapprove", id], bonly: ["unapprove", id],
       pause: ["resume"], resume: ["pause"], up: ["down", id], down: ["up", id],
-      position: ["position", id, { target: plan.payload.undo_target }],
+      position: ["position", id, { target: plan.payload?.undo_target }],
       unapprove: ["restore_approval", id, { command_id: command.id }],
     }[action] || reverseEdit;
     if (command.status === "pending") waitingCommands.set(command.id, { title, action });
     commandNotice(action, command, title, payload, undoing ? null : inverse, warning);
-    if (location.pathname === "/review" && id === reviewId &&
-        ["approve", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook"].includes(action)) {
+    if (isReviewPage() && id === reviewId &&
+        ["approve", "approve_versions", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption_words", "edit_voiceover"].includes(action)) {
       advanceReview(id, command.id);
-      await review();
     }
     await refresh(true);
     return true;
   } catch (error) {
+    if (contractActions.has(action) && isUnavailable(error)) {
+      unavailable.add(action);
+      if (trigger) trigger.hidden = true;
+      return false;
+    }
     if (inlineError) inlineError.innerHTML = resultMessage(error.message);
     toast(actionError(action, title, error.message), { error: true });
     if (location.pathname === "/queue" && ["position", "up", "down"].includes(action)) await refresh(true);
@@ -748,21 +605,7 @@ function triggerAction(node) {
     openInlineReslot(node, id);
     return;
   }
-  if (inlineConfirm.has(action)) {
-    if (inlineDecision === node) {
-      inlineDecision = null;
-      node.textContent = labels[action];
-    } else {
-      inlineDecision = node;
-      const label = node.textContent;
-      node.textContent = "Click again to " + ({ reject: "reject", remake_cut: "remake cut", remake_hook: "regenerate hook" })[action];
-      setTimeout(() => {
-        if (inlineDecision === node) inlineDecision = null;
-        node.textContent = label;
-      }, 3000);
-      return;
-    }
-  } else if (!quickActions.has(action)) {
+  if (["post_now", "delete"].includes(action)) {
     openAction(action, id, node);
     return;
   }
@@ -777,7 +620,9 @@ function openInlineReslot(trigger, id) {
   form.innerHTML = `<label>Find a free slot after (UTC)<input type="datetime-local" required value="${new Date(Date.now() + 60000).toISOString().slice(0, 16)}"></label>
     <button class="button primary">Move to next free slot</button>
     <button class="button secondary" type="button">Cancel</button><p role="status"></p>`;
-  trigger.closest(".detail-actions").after(form);
+  const host = trigger.closest(".queue-card")?.querySelector(".reslot-host");
+  if (host) host.append(form);
+  else trigger.closest(".detail-actions").after(form);
   const field = form.querySelector("input");
   const cancel = () => { form.remove(); trigger.focus({ preventScroll: true }); };
   form.querySelector('[type="button"]').onclick = cancel;
@@ -785,10 +630,7 @@ function openInlineReslot(trigger, id) {
   form.onsubmit = async (event) => {
     event.preventDefault();
     const after = new Date(field.value + "Z").toISOString();
-    if (await runAction("reslot", id, { after }, event.submitter, form.querySelector("p"))) {
-      cancel();
-      await itemPage(id);
-    }
+    if (await runAction("reslot", id, { after }, event.submitter, form.querySelector("p"))) cancel();
   };
   field.focus();
 }
@@ -799,7 +641,7 @@ function openInlineEditor(action, id) {
   if (!region || region.querySelector("form")) return;
   const previous = region.innerHTML;
   const initial = { body: detail.item.caption_body ?? detail.item.hook_text ?? "", hashtags: detail.caption_hashtags };
-  region.innerHTML = `<form class="inline-editor"><label>${caption ? "Caption" : "Hook"}<textarea required maxlength="${caption ? 2200 : 220}">${escape(caption ? detail.item.caption_body ?? detail.item.hook_text : detail.item.hook_text)}</textarea></label>${caption ? `<label>Hashtags<input value="${escape(detail.caption_hashtags)}"></label>` : ""}<button class="button primary">Save</button> <button type="button" class="button secondary">Cancel</button><p role="status"></p></form>`;
+  region.innerHTML = `<form class="inline-editor"><label>${caption ? "Post text (Instagram caption)" : "Hook"}<textarea required maxlength="${caption ? 2200 : 220}">${escape(caption ? detail.item.caption_body ?? detail.item.hook_text : detail.item.hook_text)}</textarea></label>${caption ? `<label>Hashtags<input value="${escape(detail.caption_hashtags)}"></label>` : ""}<button class="button primary">Save</button> <button type="button" class="button secondary">Cancel</button><p role="status"></p></form>`;
   const form = region.querySelector("form");
   const field = form.querySelector("textarea");
   const cancel = () => { region.innerHTML = previous; };
@@ -814,7 +656,7 @@ function openInlineEditor(action, id) {
     if (await runAction(action, id, payload, form.querySelector("button"), form.querySelector("p"), caption ? ["edit_caption", id, initial] : null)) {
       if (form.isConnected) {
         cancel();
-        if (location.pathname === "/review") await review(true);
+        if (isReviewPage()) await review(true);
         else await itemPage(id);
       }
     }
@@ -828,14 +670,14 @@ function connections() {
   const tones = { ok: "green", failed: "red", warning: "amber", not_set: "gray", unchecked: "gray" };
   const names = { ok: "OK", failed: "Failed", warning: "Warning", not_set: "Not set", unchecked: "Not checked" };
   const disabled = connectionsBusy ? " disabled" : "";
-  content.innerHTML = (settingsPage ? settingsForm() : "") + heading(
+  patchMarkup(content, (settingsPage ? settingsTabs() : "") + heading(
     "Connections",
     "Checks run only when pressed, on this computer. Each has a 10-second timeout.",
     `<button class="button primary" data-connection="all"${disabled}>${connectionsBusy ? "Testing…" : "Test all (sends a real success ping)"}</button>`,
   ) + `<section class="panel">${panelHead("Service connections", "Test all checks services in parallel and sends a real Healthchecks success ping. Telegram messages require the separate button below.")}
     <div class="table-wrap"><table class="data-table connections-table"><thead><tr><th>Service</th><th>Status</th><th>Reason</th><th>Last check</th><th>Test</th></tr></thead><tbody>
     ${connectionRows.map((row) => `<tr><td><code>${escape(row.label)}</code></td><td>${pill(names[row.status] || row.status, tones[row.status] || "gray")}</td><td class="connection-reason">${escape(row.reason)}</td><td>${row.checked_at ? escape(formatTime(row.checked_at, { second: "2-digit" })) : "Never"}</td><td><button class="button secondary" data-connection="${escape(row.id)}"${disabled}>${row.id === "healthcheck" ? "Test (sends a real success ping)" : "Test"}</button></td></tr>`).join("")}
-    </tbody></table></div><div class="detail-actions"><button class="button secondary" data-send-telegram${disabled}>Send test message</button><span class="reason">Sends one Telegram message to the configured chat. Never included in Test all.</span></div><p id="telegram-test-result" class="reason" role="status"></p></section>`;
+    </tbody></table></div><div class="detail-actions"><button class="button secondary" data-send-telegram${disabled}>Send test message</button><span class="reason">Sends one Telegram message to the configured chat. Never included in Test all.</span></div><p id="telegram-test-result" class="reason" role="status"></p></section>`);
 }
 async function testConnection(service, sendMessage = false) {
   if (connectionsBusy) return;
@@ -858,13 +700,13 @@ async function testConnection(service, sendMessage = false) {
     document.querySelectorAll("[data-connection], [data-send-telegram]").forEach((node) => node.disabled = false);
   }
 }
-function videoPlaying() {
-  return [...content.querySelectorAll("video")].some((video) => !video.paused);
-}
-
 function refreshRecentControls() {
   const panel = document.querySelector("#recent-controls");
-  if (panel) panel.outerHTML = commandsPanel();
+  if (panel && commandsPanel()) {
+    const template = document.createElement("template");
+    template.innerHTML = commandsPanel();
+    patchMarkup(panel, template.content.firstElementChild.innerHTML);
+  } else if (panel) panel.remove();
   else content.insertAdjacentHTML("beforeend", commandsPanel());
 }
 
@@ -885,20 +727,26 @@ async function refresh(manual = false) {
       new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     document.querySelector("#sidebar-profile").textContent =
       state.profile + " · " + state.timezone;
-    const banner = document.querySelector("#mode-banner");
-    banner.classList.toggle("live", !state.dry_run);
-    banner.innerHTML = `<span><strong>${state.dry_run ? "DRY RUN IS ON" : "LIVE POSTING IS ON"}</strong> &nbsp; ${state.dry_run ? "The runner simulates publishing." : "Approved clips can be published by the runner."}</span><span class="${state.demo ? "demo" : ""}">${state.demo ? "DEMO DATABASE · seeded example data" : state.config_changed ? "CONFIG CHANGED · applies next cycle" : state.runtime_known ? "RUNNER SETTINGS" : state.meta_paused ? "META POSTING PAUSED" : "CONFIG SETTINGS · runner not observed"}</span>`;
-    document.querySelector("#nav-review").textContent = inboxItems().length;
+    const status = summaryStatus();
+    document.querySelector("#mode-banner").textContent = [
+      status.dry_run ? "Dry run" : "Live posting",
+      "runner " + status.runner,
+      status.next_post_at && "next post " + formatTime(status.next_post_at, { day: undefined, month: undefined }),
+    ].filter(Boolean).join(" · ");
+    document.querySelector("#nav-review").textContent = state.todo?.to_review ?? state.items.filter(isReviewItem).length;
+    if (!logsChecked) {
+      logsChecked = true;
+      optionalGet("/api/logs?lines=1").then((result) => {
+        document.querySelector("#nav-logs").hidden = !result;
+      }).catch(() => {});
+    }
     updateRunnerLabel();
     document.querySelector("#nav-queued").textContent = state.items.filter(
       (i) => i.stage === "queued",
     ).length;
-    document.querySelector("#nav-failed").textContent = state.items.filter(
-      (i) => i.stage === "failed",
-    ).length;
-    const page = location.pathname.startsWith("/items/")
-      ? "item"
-      : location.pathname.slice(1) || "overview";
+    const path = location.pathname;
+    const page = path.startsWith("/items/") ? "item" : isReviewPage() ? "review" :
+      (path === "/" && new URLSearchParams(location.search).get("page") === "logs" ? "logs" : path.slice(1) || "overview");
     document
       .querySelectorAll("nav a")
       .forEach((a) =>
@@ -912,46 +760,47 @@ async function refresh(manual = false) {
       "Workspace / " +
       {
         overview: "Overview",
-        queue: "Queue & calendar",
+        queue: "Queue",
         analytics: "Analytics",
-        failures: "Failures & review",
         connections: "Connections",
         settings: "Settings",
         make: "Make",
         review: "Review",
         library: "Library",
         item: "Item detail",
+        logs: "Logs",
       }[page];
     document.querySelector("#footer").textContent =
       `${state.timezone} · ${state.items.length} items · ${state.posts.length} platform posts · all data from the selected SQLite database`;
     if (page === "connections" || page === "settings") {
-      if (!connectionsBusy && (manual || !preferences || (page === "connections" && !connectionRows.length))) {
-        if (page === "settings") preferences = await api("/api/settings");
-        connectionRows = (await api("/api/connections")).connections;
-        connections();
-      }
+      await renderSettings();
+    } else if (page === "logs") {
+      await renderLogs();
+    } else if (page === "queue") {
+      await updateSchedule();
+      queue();
     } else if (page === "review") {
       await review(false);
     } else if (page === "item") {
-      if (!content.querySelector(".inline-editor") && (manual || !detail || (itemById(detail.item.id)?.stage !== detail.item.stage && !videoPlaying()))) await itemPage();
+      if (!content.querySelector(".inline-editor") && !content.querySelector(".editor[open]") && (manual || !detail || itemById(detail.item.id)?.stage !== detail.item.stage || ["posted", "measured", "cleaned"].includes(detail.item.stage))) await itemPage();
       else refreshRecentControls();
     } else if (page === "make") {
       make();
-    } else if (page === "library" && (manual || !document.querySelector("#library-results"))) {
+      await discovered();
+    } else if (page === "library") {
       await library();
     } else if (
-      !document.querySelector("dialog[open]") && !draggedItem && page !== "library" &&
-      !["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)
+      !document.querySelector("dialog[open]") && page !== "library"
     )
-      (({ overview, queue, analytics, failures, make, library })[page] || overview)();
+      (({ overview, queue, analytics, make, library })[page] || overview)();
   } catch (error) {
     document.querySelector("#refresh-status").textContent = "Update failed";
     toast(error.message, { error: true });
   }
 }
-async function openAction(action, id, trigger) {
+async function openAction(action, id, trigger, payload = {}) {
   if (dialog.open || busyActions.has(id)) return;
-  pendingAction = { action, item_id: id || null };
+  pendingAction = { action, item_id: id || null, payload };
   confirmation = null;
   document.querySelector("#dialog-title").textContent = labels[action];
   const subtitle = document.querySelector("#dialog-item");
@@ -978,7 +827,11 @@ async function openAction(action, id, trigger) {
     summary.hidden = false;
     submit.disabled = false;
   } catch (failure) {
-    if (dialog.open && request === pendingAction) error.textContent = failure.message;
+    if (contractActions.has(action) && isUnavailable(failure)) {
+      unavailable.add(action);
+      trigger.hidden = true;
+      dialog.close();
+    } else if (dialog.open && request === pendingAction) error.textContent = failure.message;
   } finally {
     trigger.classList.remove("working");
   }
@@ -1011,7 +864,7 @@ document
       dialog.close();
       if (result.command.status === "pending") waitingCommands.set(result.command.id, { title: confirmation.title, action: pendingAction.action });
       if (pendingAction.action === "delete" && result.command.status !== "refused" &&
-          result.command.status !== "failed" && location.pathname === "/review") {
+          result.command.status !== "failed" && isReviewPage()) {
         advanceReview(pendingAction.item_id, result.command.id);
         await review();
       }
@@ -1028,12 +881,8 @@ document.addEventListener("change", (event) => {
   if (event.target.matches("[data-library-filter]")) updateLibraryFilter(event.target);
   if (event.target.id === "stage-filter") {
     filters.stage = event.target.value;
-    history.replaceState(null, "", "/queue");
+    history.replaceState(null, "", localLink("/queue"));
     queue();
-  }
-  if (event.target.id === "failure-filter") {
-    filters.failures = event.target.value;
-    failures();
   }
 });
 document.addEventListener("input", (event) => {
@@ -1053,7 +902,7 @@ window.addEventListener("resize", () => {
     if (!dialog.open && !location.pathname.startsWith("/items/")) refresh();
   }, 250);
 });
-refresh(true);
+mockReady.then(() => refresh(true)).catch((error) => toast(error.message, { error: true }));
 setInterval(() => {
   if (!dialog.open && !document.hidden) refresh();
 }, 30000);
@@ -1118,7 +967,7 @@ function updateMakeProgress() {
   const items = current ? state.items.filter((i) => i.creation_job === current.id) : [];
   const progress = document.querySelector("#make-progress");
   if (progress.contains(document.activeElement) && document.activeElement.id !== "job-select") return;
-  progress.innerHTML = panelHead("Job progress", current ? (current.result || commandState(current)) : "Start a job to track each clip.",
+  patchMarkup(progress, panelHead("Job progress", current ? (current.result || commandState(current)) : "Start a job to track each clip.",
     jobs.length > 1 ? `<select id="job-select" aria-label="Choose job">${jobs.map((job) =>
       `<option value="${escape(job.id)}" ${job.id === current.id ? "selected" : ""}>${escape(labels[job.action])} · ${formatTime(job.created_at)} · ${commandState(job)}</option>`).join("")}</select>` : "") +
     items.map((item) => {
@@ -1127,7 +976,7 @@ function updateMakeProgress() {
         <span>${isReviewItem(item) ? `<a href="${reviewLink(item.id)}">Ready for review</a>` : pill(pretty(item.creation_phase || item.stage))}
         · ${elapsed}s ${escape(item.error_message || item.rejection_reason || "")}
         ${item.actions.includes("retry") ? button("retry", item.id, "Retry") : ""}</span></div>`;
-    }).join("");
+    }).join(""));
 }
 
 const isReviewItem = (item) => ["awaiting_approval", "rendered", "needs_review"].includes(item.stage);
@@ -1143,7 +992,9 @@ function inboxItems() {
     const command = state.commands.find((entry) => entry.id === commandId);
     if (command && !["pending", "running"].includes(command.status)) inboxPending.delete(id);
   }
-  return state.items.filter((item) => isReviewItem(item) && !inboxPending.has(item.id));
+  return state.items.filter((item) => !inboxPending.has(item.id) && (reviewTab === "approve"
+    ? (isReviewItem(item) && item.stage !== "needs_review") || item.id === reviewId && ["approved", "queued"].includes(item.stage)
+    : item.stage === ({ decision: "needs_review", failed: "failed", rejected: "rejected" })[reviewTab]));
 }
 
 function advanceReview(id, commandId) {
@@ -1157,51 +1008,50 @@ async function review(force = false) {
   const items = inboxItems();
   if (!document.querySelector("#review-inbox")) {
     content.innerHTML = heading("Review", "", '<button class="button secondary" id="review-help" aria-label="Keyboard shortcuts">?</button>') +
-      '<div class="review-layout"><aside id="review-inbox" aria-label="Review inbox"></aside><section id="review-selected"></section></div>' +
+      reviewTabs() + '<div class="review-layout"><aside id="review-inbox" aria-label="Review inbox"></aside><section id="review-selected"></section></div>' +
       '<dialog id="review-shortcuts"><form method="dialog"><h2>Keyboard shortcuts</h2><p>J/K or arrows · Next / previous</p><p>Space · Play or pause previews</p><dl>' +
       Object.entries(keys).map(([key, action]) => `<dt>${key.toUpperCase()}</dt><dd>${labels[action]}</dd>`).join("") +
-      '<dt>Z</dt><dd>Undo</dd></dl><button class="button secondary">Close</button></form></dialog>';
+      '<dt>1 / 2 / 3</dt><dd>Switch preset on new clips</dd><dt>Z</dt><dd>Undo</dd></dl><button class="button secondary">Close</button></form></dialog>';
     document.querySelector("#review-help").onclick = () => document.querySelector("#review-shortcuts").showModal();
   }
+  updateCutRate();
   const inbox = document.querySelector("#review-inbox");
   const pane = document.querySelector("#review-selected");
   const item = items.find((entry) => entry.id === reviewId) || (!reviewId ? items[0] : null);
   if (item) reviewId = item.id;
   const list = items.map((entry) => `<a class="inbox-entry" href="${reviewLink(entry.id)}" data-review-item="${escape(entry.id)}" ${entry.id === reviewId ? 'aria-current="true"' : ""}>
-    <img width="64" height="36" loading="lazy" alt="" src="/media/${encodeURIComponent(entry.id)}/thumb">
+    <img width="64" height="36" loading="lazy" alt="" src="${mediaURL("/media/" + encodeURIComponent(entry.id) + "/thumb")}">
     <span><strong>${escape(entry.hook_text || entry.original_title)}</strong>
     <small title="${escape(formatTime(entry.created_at))}">${escape(relativeAge(entry.created_at))}</small>
     <span class="chips">${pill(entry.authenticity || "unverified")}${entry.stage === "needs_review" ? pill("Needs review", "amber") : ""}${entry.cut_signal ? pill(pretty(entry.cut_signal)) : ""}</span></span></a>`).join("");
-  if (inbox.dataset.markup !== list && !inbox.contains(document.activeElement)) {
-    inbox.innerHTML = list;
+  if (inbox.dataset.markup !== list) {
+    patchMarkup(inbox, list);
     inbox.dataset.markup = list;
   }
   if (!item && !reviewId) {
     if (!pane.dataset.item && pane.childElementCount) return;
     delete pane.dataset.item;
-    history.replaceState(null, "", "/review");
+    history.replaceState(null, "", reviewURL());
     pane.innerHTML = empty('All caught up') + '<a href="/make">Make clips</a>';
     return;
   }
-  const actionSignature = itemById(reviewId)?.actions.join(",");
+  const actionSignature = JSON.stringify([item?.actions, item?.hook_text, item?.error_message, item?.stage_updated_at]);
   if (pane.dataset.item === reviewId && !force &&
-      (pane.dataset.actions === actionSignature || pane.contains(document.activeElement) ||
-       pane.querySelector(".inline-editor") || videoPlaying())) return;
+      (pane.querySelector(".inline-editor, .editor[open]") || pane.dataset.actions === actionSignature)) return;
   const requested = reviewId;
   const sequence = ++reviewRequest;
   try {
-    const next = await api("/api/items/" + encodeURIComponent(requested));
+    const next = await loadDetail(requested);
     if (sequence !== reviewRequest || requested !== reviewId) return;
+    if (detail?.item.id !== requested) selectedVersion = undefined;
     detail = next;
     const current = next.item;
-    history.replaceState(null, "", reviewLink(requested));
+    history.replaceState(null, "", reviewURL(requested));
     pane.dataset.item = requested;
-    pane.dataset.actions = next.actions.join(",");
-    const player = (variant, label) => `<div class="video-card"><h3>${label}</h3>${next.media[variant]
-      ? `<video controls preload="metadata" aria-label="${label}" src="/media/${encodeURIComponent(requested)}/${variant}"></video>`
-      : empty("Preview unavailable")}</div>`;
-    pane.innerHTML = `<div class="video-grid">${player("a", "Variant A")}${player("b", "Variant B")}</div>
-      <div class="detail-actions review-actions">${["approve", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption", "delete"]
+    pane.dataset.actions = actionSignature;
+    const versions = versionPanel(next);
+    patchMarkup(pane, `${versions}
+      <div class="detail-actions review-actions">${approvalButtons(next)}${["approve", "aonly", "bonly", "hookok", "reject", "remake_cut", "remake_hook", "edit_hook", "edit_caption", "retry", "delete"]
         .filter((action) => next.actions.includes(action))
         .map((action) => {
           const shortcut = Object.keys(keys).find((key) => keys[key] === action);
@@ -1209,9 +1059,10 @@ async function review(force = false) {
         }).join("")}</div>
       <section class="panel"><h2>${escape(current.original_title)}</h2><div class="hook-display">${escape(current.hook_text)}</div>
       <p>${escape(current.voiceover_script)}</p>
-      ${next.review.reason ? `<p class="reason">${escape(next.review.reason)}</p>` : ""}
-      ${next.media.cut ? `<details><summary>Watch the cut</summary><video controls preload="none" src="/media/${encodeURIComponent(requested)}/cut"></video></details>` : ""}
-      <h3>Posting caption</h3><div class="caption-preview">${escape(next.caption)}</div></section>`;
+      ${current.error_message || current.rejection_reason || next.review.reason ? `<p class="reason">${escape(current.error_message || current.rejection_reason || next.review.reason)}</p>` : ""}
+      <p><a href="${itemLink(requested)}">Open item details</a></p>
+      ${next.media.cut ? `<details><summary>Watch the cut</summary><video controls preload="none" src="${mediaURL("/media/" + encodeURIComponent(requested) + "/cut")}"></video></details>` : ""}
+      <h3>Post text (Instagram caption)</h3><div class="caption-preview">${escape(next.caption)}</div></section>`);
   } catch (error) {
     if (sequence === reviewRequest) pane.textContent = error.message;
   }
@@ -1230,7 +1081,7 @@ document.addEventListener("keydown", (event) => {
       event.target.closest?.("input, textarea, select, [contenteditable], .inline-editor") || document.querySelector("dialog[open]")) return;
   const key = event.key.toLowerCase();
   if (key === "z" && undoHistory.length) { event.preventDefault(); undoLast(); return; }
-  if (location.pathname !== "/review") return;
+  if (!isReviewPage()) return;
   if (["j", "k", "arrowdown", "arrowup", "arrowright", "arrowleft"].includes(key)) {
     event.preventDefault();
     const items = inboxItems();
@@ -1240,13 +1091,16 @@ document.addEventListener("keydown", (event) => {
   } else if (key === " " && !event.target.closest?.("button, a")) {
     event.preventDefault();
     event.stopPropagation();
-    const players = [...document.querySelectorAll("#review-selected .video-grid video")];
+    const players = [...document.querySelectorAll("#review-selected video.phone-preview")];
     const play = players.every((player) => player.paused);
     for (const player of players) play ? player.play().catch(() => {}) : player.pause();
   } else if (key === "?") {
     document.querySelector("#review-shortcuts")?.showModal();
+  } else if (/^[123]$/.test(key) && detailVersions(detail || { item: {} }).some(({ variant }) => variant.startsWith("p"))) {
+    const control = document.querySelector(`#review-selected [data-version="p${key}"]`);
+    if (control) { event.preventDefault(); control.click(); }
   } else if (keys[key]) {
-    const control = document.querySelector(`#review-selected [data-action="${keys[key]}"]`);
+    const control = document.querySelector(`#review-selected [data-action="${keys[key]}"]`) || (key === "a" ? document.querySelector('#review-selected [data-extra="approve_versions"]') : null);
     if (control && !control.disabled) { event.preventDefault(); control.click(); }
   }
 }, { capture: true });
@@ -1354,15 +1208,15 @@ async function library() {
     params.set("page", target);
     return "/library?" + escape(params.toString());
   };
-  document.querySelector("#library-results").innerHTML = `<div class="toolbar">
+  patchMarkup(document.querySelector("#library-results"), `<div class="toolbar">
       <span>${total} matching · Page ${page} of ${pages}</span>
       ${page > 1 ? `<a data-library-page href="${pageLink(page - 1)}">Previous</a>` : ""}
       ${page < pages ? `<a data-library-page href="${pageLink(page + 1)}">Next</a>` : ""}</div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">Select</th><th scope="col">Clip</th><th scope="col">Source</th><th scope="col">Stage</th></tr></thead>
-    <tbody>${items.map((item) => `<tr><td>${item.actions.some((action) => ["delete", "reject"].includes(action)) ?
+    <tbody>${items.map((item) => `<tr data-row="${escape(item.id)}"><td>${item.actions.some((action) => ["delete", "reject"].includes(action)) ?
       `<input type="checkbox" data-select-item value="${escape(item.id)}" aria-label="Select ${escape(item.original_title)}" ${selectedItems.has(item.id) ? "checked" : ""}>` : ""}
-    </td><td><a class="library-clip" href="${itemLink(item.id)}"><img class="library-thumb" src="/media/${encodeURIComponent(item.id)}/thumb" alt="" loading="lazy" width="64" height="36">${escape(item.original_title)}</a></td>
-    <td>${escape(item.author_name)} · ${escape(platform(item))}</td><td>${pill(pretty(item.stage))}</td></tr>`).join("")}</tbody></table></div>`;
+    </td><td><a class="library-clip" href="${itemLink(item.id)}"><img class="library-thumb" src="${mediaURL("/media/" + encodeURIComponent(item.id) + "/thumb")}" alt="" loading="lazy" width="64" height="36">${escape(item.original_title)}</a></td>
+    <td>${escape(item.author_name)} · ${escape(platform(item))}</td><td>${pill(pretty(item.stage))}</td></tr>`).join("")}</tbody></table></div>`);
   updateBulkBar();
 }
 
@@ -1400,9 +1254,11 @@ async function bulkAction(action) {
   document.querySelector("#bulk-title").textContent = action === "delete" ? "Delete selected clips" : "Reject selected clips";
   document.querySelector("#bulk-description").textContent = question;
   bulkDialog.returnValue = "";
-  bulkDialog.showModal();
-  await new Promise((resolve) => bulkDialog.addEventListener("close", resolve, { once: true }));
-  if (bulkDialog.returnValue !== "confirm") return;
+  if (action === "delete") {
+    bulkDialog.showModal();
+    await new Promise((resolve) => bulkDialog.addEventListener("close", resolve, { once: true }));
+    if (bulkDialog.returnValue !== "confirm") return;
+  }
   const counts = {};
   for (const item_id of ids) {
     try {
@@ -1425,8 +1281,6 @@ async function bulkAction(action) {
 
 async function changeRunner(operation) {
   const stage = state.lock.stage || "starting";
-  const messages = { start: "Start the runner?", stop: "Stop the runner at the next safe boundary?", force: `Interrupt the ${stage} stage immediately?` };
-  if (!window.confirm(messages[operation])) return;
   if (busyActions.has("runner")) return;
   busyActions.add("runner");
   try {
@@ -1463,7 +1317,7 @@ document.addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
   const submit = event.submitter;
-  if (submit.disabled || !window.confirm("Save these dashboard settings?")) return;
+  if (submit.disabled) return;
   submit.disabled = true;
   submit.classList.add("working");
   const slots = Object.fromEntries([...form.querySelectorAll("[data-profile]")].map((field) =>
@@ -1489,7 +1343,7 @@ setInterval(async () => {
     state = await api("/api/state");
     showCompletedControls();
     updateRunnerLabel();
-    if (!document.querySelector("#make-progress").contains(document.activeElement)) make();
+    updateMakeProgress();
   } catch (error) {
     document.querySelector("#make-runner").textContent = error.message;
   }
