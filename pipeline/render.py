@@ -297,15 +297,15 @@ def build_ass_subtitles(
     # --- captions -------------------------------------------------------------------
     if words:
         # Caption text only: "PRE -DOWNLOAD" -> "PRE-DOWNLOAD", "1 001 / 004" -> "1,001/004".
-        words = normalize_caption_words(words)
-        timeline = [w for w in words if float(w["start"]) < video_duration - 0.05]
         # Chunking skips words with no display text. Index only those present in the sidecar.
-        timeline = [w for w in timeline if _clean_caption_word(w["word"])]
-        if caption_overrides:
-            for index, word in enumerate(timeline):
-                replacement = caption_overrides.get(str(index))
-                if replacement and _clean_caption_word(replacement):
-                    word["word"] = replacement
+        timeline = [word for word in normalize_caption_words(words)
+                    if float(word["start"]) < video_duration - 0.05 and _clean_caption_word(word["word"])]
+        overrides = caption_overrides or {}
+        for index, word in enumerate(timeline):
+            word["i"] = index
+            replacement = overrides.get(str(index))
+            if replacement and _clean_caption_word(replacement):
+                word["word"] = replacement
         chunks = chunk_caption_words(timeline, rs)
         base = cap["color"]
         kw_list = list(sp.keyword_list) if sp is not None else []
@@ -332,7 +332,7 @@ def build_ass_subtitles(
                     colour = overlay.word_colour(w, j == i, kw_list, rs, ss, kw_on)
                     parts.append(f"{{\\c{colour}&}}{w}{{\\c{base}&}}" if colour != base else w)
                 text = f"{{\\an5\\pos({cx:.0f},{cap_y:.0f}){size_tag}" + (pop_tags if i == 0 else "") + "}" + " ".join(parts)
-                caption_words.append({"i": len(caption_words), "text": raw[i],
+                caption_words.append({"i": active["i"], "text": raw[i],
                                       "start": round(max(start, 0.0), 3),
                                       "end": round(max(start, min(float(active["end"]), video_duration)), 3)})
                 events.append(
