@@ -1,41 +1,33 @@
-"""Fetch the style-layer assets that could not be fetched in the cloud sandbox.
+"""Install and verify the manifest audio libraries and the existing fallback assets.
 
-What is already in the repository (nothing to download):
-  * assets/emoji/*.png   Twemoji 72x72, CC-BY 4.0 (jdecked/twemoji) - C2
-  * assets/sfx/*.wav     boom / whoosh, synthesized here, CC0 - A1 (see LICENSES.md)
-
-What this script fetches:
-  * assets/music/bed.mp3  a CC0 music bed from OpenGameArt - A2
-                          (FreePD, the original source, closed permanently in 2025. Each
-                          candidate's OpenGameArt page is read first and the track is
-                          installed only if the page's licence field is exactly CC0 and
-                          the page links that file.)
-  * optionally, the Kenney CC0 impact pack to replace the synthesized SFX
-    (--prefer-download)
-
-Every download is verified before it is installed (HTTP 200, real audio, long enough)
-and the source plus licence is written to a LICENSES.md next to the file. The script is
-idempotent: a file that already passes verification is left alone unless --force.
+The manifests specify source, trim, licence and SHA-256. WAVs are installed locally
+at 48 kHz with -3 dBFS peaks. See each library's NEEDED.md for optional MP3 downloads.
 
 Usage:
-    python scripts/fetch_assets.py                  # fetch what is missing
-    python scripts/fetch_assets.py --force          # re-fetch even if present
-    python scripts/fetch_assets.py --prefer-download  # also try the Kenney CC0 SFX pack
-    python scripts/fetch_assets.py --check          # verify only, download nothing
+    python scripts/fetch_assets.py                    # install missing library assets
+    python scripts/fetch_assets.py --check            # verify only
+    python scripts/fetch_assets.py --force            # re-fetch and verify
+    python scripts/fetch_assets.py --prefer-download  # also try the legacy Kenney fallback pack
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
+import math
 import re
 import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+import tempfile
+import wave
 import zipfile
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -158,7 +150,8 @@ def fetch_music(dest: Path, force: bool = False, check: bool = False) -> bool:
             tmp.unlink(missing_ok=True)
             continue
         tmp.replace(dest)
-        write_licenses(dest.parent / "LICENSES.md",
+        licences_name = "LEGACY-LICENSES.md" if (dest.parent / "manifest.yaml").is_file() else "LICENSES.md"
+        write_licenses(dest.parent / licences_name,
                        [(dest.name, f"{url} (page: {page_url})", MUSIC_LICENSE)])
         log(f"    installed {dest} ({why}) - {MUSIC_LICENSE}")
         return True
@@ -243,13 +236,122 @@ def install_kenney_sfx(files: dict[str, Path]) -> bool:
             return False
         rows.append((dest.name, f"{KENNEY_SFX_URL} ({src})", KENNEY_LICENSE))
         log(f"    installed {dest} from {src}")
-    write_licenses(out_dir / "LICENSES.md", rows)
+    write_licenses(out_dir / "LEGACY-LICENSES.md", rows)
     return True
 
 
 # --------------------------------------------------------------------------------------
 # C2: emoji (already committed; verify only)
 # --------------------------------------------------------------------------------------
+
+def _digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _verify_wav(path: Path, entry: dict, music: bool) -> tuple[float, float]:
+    with wave.open(str(path), "rb") as handle:
+        duration = handle.getnframes() / handle.getframerate()
+        if (handle.getframerate(), handle.getsampwidth(), handle.getnchannels()) != (48000, 2, 2 if music else 1):
+            raise ValueError("expected 48 kHz PCM16 WAV with the correct channel count")
+    start, end = entry["trim"]
+    cap = 2.0 if entry["category"] == "riser" else 1.2
+    if music and duration < 60:
+        raise ValueError(f"music is {duration:.3f}s, below 60s")
+    if not music and not 0 < duration <= cap + 1 / 48000:
+        raise ValueError(f"cue is {duration:.3f}s, outside its {cap:g}s cap")
+    if duration > end - start + 1 / 48000:
+        raise ValueError("WAV is longer than the trim window")
+    peak = audio_mix.file_peak_db(path, default=float("-inf"))
+    if not -3.15 <= peak <= -2.85:
+        raise ValueError(f"peak is {peak:.1f} dBFS, expected -3 dBFS")
+    return duration, peak
+
+
+def _convert_wav(raw: Path, output: Path, entry: dict, music: bool) -> None:
+    start, end = entry["trim"]
+    length = end - start
+    if not music:
+        length = min(length, 2.0 if entry["category"] == "riser" else 1.2)
+    converted = output.with_name("trimmed.wav")
+    common = ["ffmpeg", "-v", "error", "-y"]
+    subprocess.run([
+        *common, "-ss", str(start), "-i", str(raw), "-t", str(length),
+        "-map", "0:a:0", "-ar", "48000", "-ac", "2" if music else "1",
+        "-c:a", "pcm_s16le", "-fflags", "+bitexact", str(converted),
+    ], check=True, capture_output=True)
+    peak = audio_mix.file_peak_db(converted, default=float("-inf"))
+    if not math.isfinite(peak) or peak <= -90:
+        raise ValueError("no audible signal in the trim window")
+    subprocess.run([
+        *common, "-i", str(converted), "-af", f"volume={-3.0 - peak:.3f}dB",
+        "-c:a", "pcm_s16le", "-fflags", "+bitexact", str(output),
+    ], check=True, capture_output=True)
+
+
+def fetch_manifest(directory: Path, *, check: bool = False, force: bool = False) -> int:
+    """Install or verify normalized library WAVs and return the count available."""
+    manifest = directory / "manifest.yaml"
+    entries = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    music = directory.name == "music"
+    downloaded: dict[str, bytes | Exception] = {}
+    installed = 0
+    for entry in entries:
+        category, filename = entry["category"], entry["file"]
+        dest = directory / filename if music else directory / category / filename
+        expected = entry["sha256"]
+        try:
+            if dest.is_file() and not force:
+                try:
+                    if expected and _digest(dest) != expected:
+                        raise ValueError("SHA-256 mismatch")
+                    duration, peak = _verify_wav(dest, entry, music)
+                except (ValueError, EOFError, OSError, wave.Error):
+                    if check:
+                        raise
+                else:
+                    log(f"  OK {filename}: {duration:.3f}s, {peak:.1f} dBFS")
+                    installed += 1
+                    continue
+            if check:
+                raise ValueError("missing WAV")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=dest.parent) as workspace:
+                work = Path(workspace)
+                url = entry["source_url"]
+                if entry.get("manual"):
+                    raw = directory / ".incoming" / f"{Path(filename).stem}.mp3"
+                    if not raw.is_file():
+                        raise ValueError(f"download {url} to {raw}")
+                else:
+                    if url not in downloaded:
+                        try:
+                            downloaded[url] = _get(url, timeout=15)
+                        except (OSError, RuntimeError) as exc:
+                            downloaded[url] = exc
+                    content = downloaded[url]
+                    if isinstance(content, Exception):
+                        raise content
+                    member = entry.get("archive_path")
+                    raw = work / "source"
+                    if member:
+                        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                            content = archive.read(member)
+                    raw.write_bytes(content)
+                output = work / "normalized.wav"
+                _convert_wav(raw, output, entry, music)
+                duration, peak = _verify_wav(output, entry, music)
+                digest = _digest(output)
+                if expected and digest != expected:
+                    raise ValueError(f"SHA-256 mismatch: expected {expected}, got {digest}")
+                output.replace(dest)
+            log(f"  Installed {filename}: {duration:.3f}s, {peak:.1f} dBFS, SHA-256 {digest}")
+            installed += 1
+        except (EOFError, ValueError, OSError, KeyError, RuntimeError, wave.Error,
+                subprocess.CalledProcessError, zipfile.BadZipFile) as exc:
+            log(f"  Unavailable {filename}: {exc}")
+    return installed
+
 
 def verify_emoji(ss: dict) -> bool:
     codes = sorted(set(overlay.emoji_map(ss).values()))
@@ -281,9 +383,11 @@ def main() -> int:
         return 1
 
     log("A1 SFX (assets/sfx)")
+    fetch_manifest(ROOT / "assets" / "sfx", check=args.check, force=args.force)
     ok_sfx = fetch_sfx(ss, force=args.force, check=args.check, prefer_download=args.prefer_download)
     log("A2 music bed (assets/music)")
-    ok_music = fetch_music(audio_mix.music_path(ss), force=args.force, check=args.check)
+    installed_music = fetch_manifest(ROOT / "assets" / "music", check=args.check, force=args.force)
+    ok_music = bool(installed_music) or fetch_music(audio_mix.music_path(ss), force=args.force, check=args.check)
     log("C2 emoji (assets/emoji)")
     ok_emoji = verify_emoji(ss)
 

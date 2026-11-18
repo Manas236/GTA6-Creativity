@@ -1,0 +1,90 @@
+- category: electronic
+  file: trace_agent.wav
+  source_url: https://opengameart.org/sites/default/files/trace_agent_0.mp3
+  source_page: https://opengameart.org/content/trace-agent
+  licence: CC0-1.0
+  author: Vitalezzz
+  trim:
+  - 0.0
+  - 155.0
+  sha256: f98a2ca44b597449153d231e0480078d8735bc37000e4f760583fbd4f7b33c2e
+- category: electronic
+  file: electronic_synth.wav
+  source_url: https://opengameart.org/sites/default/files/synth_1.mp3
+  source_page: https://opengameart.org/content/electronic-synth
+  licence: CC0-1.0
+  author: Alex McCulloch (Pro Sensory)
+  trim:
+  - 0.0
+  - 105.0
+  sha256: d9aaf6004a32b6d42e7b45ab230da2b71be43f05d7f7d7c8c1f3cb4740caae9e
+- category: electronic
+  file: still.wav
+  source_url: https://opengameart.org/sites/default/files/still.mp3
+  source_page: https://opengameart.org/content/still
+  licence: CC0-1.0
+  author: sdacfn
+  trim:
+  - 0.0
+  - 180.0
+  sha256: eadc60975f40c4071d6451d60b0dca1424d401262eafca04ec4e241be4e385a1
+- category: electronic
+  file: silent_dance_floor.wav
+  source_url: https://opengameart.org/sites/default/files/silent_dance_floor.wav
+  source_page: https://opengameart.org/content/dance-music-pack
+  licence: CC0-1.0
+  author: Umplix
+  trim:
+  - 0.0
+  - 140.0
+  sha256: 38e1ecf575c96f328da08bdd8f23e6ff602529287bf8c0710c0eae02cbfaf0c3
+- category: electronic
+  file: twin_layers.wav
+  source_url: https://opengameart.org/sites/default/files/twin_layers.wav
+  source_page: https://opengameart.org/content/dance-music-pack
+  licence: CC0-1.0
+  author: Umplix
+  trim:
+  - 0.0
+  - 180.0
+  sha256: a071f2a8ab57f26ea9495cd70c8b15bb5d1b97fa74d6162c618fa5b23d26034c
+- category: synthwave
+  file: tunetank_retro.wav
+  source_url: https://pixabay.com/music/synthwave-synthwave-80s-retro-background-music-349034/
+  licence: Pixabay Content License
+  author: Tunetank
+  trim:
+  - 0.0
+  - 120.0
+  sha256: null
+  manual: true
+- category: synthwave
+  file: begench_night.wav
+  source_url: https://pixabay.com/music/synthwave-night-221519/
+  licence: Pixabay Content License
+  author: Begench_Begenjov
+  trim:
+  - 0.0
+  - 130.0
+  sha256: null
+  manual: true
+- category: trap
+  file: oibeats_dark_light.wav
+  source_url: https://pixabay.com/music/trap-trap-beat-instrumental-dark-light-584768/
+  licence: Pixabay Content License
+  author: OiBeats
+  trim:
+  - 0.0
+  - 170.0
+  sha256: null
+  manual: true
+- category: trap
+  file: octosound_trap_beats.wav
+  source_url: https://pixabay.com/music/beats-the-trap-beats-265154/
+  licence: Pixabay Content License
+  author: OctoSound
+  trim:
+  - 0.0
+  - 120.0
+  sha256: null
+  manual: true
