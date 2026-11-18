@@ -579,3 +579,10 @@ orchestrator:
   loop_interval_seconds: 60
   heartbeat_interval_seconds: 30
   heartbeat_stale_seconds: 120
+
+dashboard:
+  # Remote access through a Cloudflare quick tunnel (DASHBOARD.md "Remote access").
+  # It only starts when DASHBOARD_PASSWORD_HASH is set in .env (python -m dashboard set-password).
+  remote:
+    enabled: false          # turn on per machine in config.local.yaml
+    cloudflared_path: null  # null: find cloudflared on PATH (or the winget install location)
