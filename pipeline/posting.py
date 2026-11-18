@@ -437,8 +437,9 @@ def ensure_post_rows(
     refusal = refusal_reason(item, cfg)
     if refusal:
         raise PublishError(refusal)
-    fixed = (item.get("chosen_variant") or "").upper()
-    variant = fixed if fixed in ("A", "B") else UNDECIDED_VARIANT
+    fixed = item.get("chosen_variant") or ""
+    fixed = fixed.upper() if fixed.lower() in ("a", "b") else fixed.lower()
+    variant = fixed if fixed in ("A", "B", "p1", "p2", "p3") else UNDECIDED_VARIANT
     slot = slot_datetime or db.now()
     caption = caption_for_item(item, cfg)
     ts = db.now()
@@ -464,7 +465,7 @@ def ensure_post_rows(
                     "hook_style": item.get("hook_style") or "unknown",
                     "source": item.get("source") or "unknown",
                     "authenticity": item.get("authenticity") or "unverified",
-                    "style_preset": item.get("style_preset") or "P0",
+                    "style_preset": variant.upper() if variant.startswith("p") else (item.get("style_preset") or "P0"),
                     "slot_datetime": slot,
                     "status": STATUS_PENDING,
                     "ab_excluded": int(item.get("ab_excluded") or 0),
@@ -500,14 +501,14 @@ def decide_variant(
     rows = get_posts_for_item(item_id, db_path=db_path)
     if not rows:
         return None
-    decided = [r for r in rows if r.get("variant_decided_at") and r["variant"] in ("A", "B")]
+    decided = [r for r in rows if r.get("variant_decided_at") and r["variant"] in ("A", "B", "p1", "p2", "p3")]
     frozen = variant_is_frozen(rows)
     if decided and (frozen or len(decided) == len(rows)):
         variant, why = decided[0]["variant"], "already decided"
     elif frozen:
         # A row began before decisions were recorded (an older database): keep what it uses.
         started = next(r for r in rows if r["status"] in VARIANT_FROZEN_STATUSES or r.get("remote_container_id"))
-        if started["variant"] not in ("A", "B"):
+        if started["variant"] not in ("A", "B", "p1", "p2", "p3"):
             # Never guess what an already-begun row used; video_for_post refuses to upload it.
             log.error("item %s: a row began with no known variant; leaving it undecided", item_id)
             return None
@@ -518,9 +519,9 @@ def decide_variant(
     ts = db.now()
     with db.db(db_path) as conn:
         conn.execute(
-            "UPDATE posts SET variant = ?, variant_decided_at = ?, updated_at = ? "
-            "WHERE item_id = ? AND (variant_decided_at IS NULL OR variant NOT IN ('A', 'B'))",
-            (variant, ts, ts, item_id),
+            "UPDATE posts SET variant = ?, style_preset = COALESCE(?, style_preset), variant_decided_at = ?, updated_at = ? "
+            "WHERE item_id = ? AND (variant_decided_at IS NULL OR variant NOT IN ('A', 'B', 'p1', 'p2', 'p3'))",
+            (variant, variant.upper() if variant.startswith("p") else None, ts, ts, item_id),
         )
         conn.execute("UPDATE items SET chosen_variant = ?, updated_at = ? WHERE id = ?", (variant, ts, item_id))
     if why != "already decided":
@@ -610,11 +611,15 @@ def reset_dry_run_rows(cfg: dict[str, Any] | None = None, db_path: Any = None) -
         return cur.rowcount
 
 
-def video_for_post(item: dict[str, Any], post: dict[str, Any]) -> Path:
-    variant = (post.get("variant") or "").upper()
-    if variant not in ("A", "B"):
+def video_for_post(item: dict[str, Any], post: dict[str, Any], db_path=None) -> Path:
+    variant = post.get("variant") or ""
+    variant = variant.upper() if variant.lower() in ("a", "b") else variant.lower()
+    if variant not in ("A", "B", "p1", "p2", "p3"):
         raise PublishError(f"item {item['id']}: the variant has not been decided (row holds {variant!r})")
     path = item.get("render_a_path") if variant == "A" else item.get("render_b_path")
+    if variant in ("p1", "p2", "p3"):
+        path = next((row["path"] for row in db.renders_for_item(item["id"], db_path)
+                     if row["variant"] == variant), None)
     if not path:
         raise PublishError(f"item {item['id']} has no variant {variant} render")
     video = Path(path)
@@ -753,7 +758,7 @@ class Publisher:
             log.warning("meta is paused, %s not sent: %s", post["platform"], why)
             return post["status"]
 
-        if post["variant"] not in ("A", "B") or not post.get("variant_decided_at"):
+        if post["variant"] not in ("A", "B", "p1", "p2", "p3") or not post.get("variant_decided_at"):
             # The post is beginning now: this is when its slot came due, so draw the variant.
             decide_variant(post["item_id"], cfg=self.cfg, db_path=self.db_path, rng=self.rng)
             post = get_post(post_id, db_path=self.db_path) or post
@@ -804,7 +809,7 @@ class Publisher:
         ig_user = config.secret("IG_USER_ID")
         token = ig_token()
         caption = post.get("caption_text") or caption_for_item(item)
-        video = video_for_post(item, post)
+        video = video_for_post(item, post, self.db_path)
         size = video.stat().st_size
         plan = Plan(post_id, PLATFORM_INSTAGRAM)
         base = self.client.base()
@@ -922,7 +927,7 @@ class Publisher:
         page = config.secret("FB_PAGE_ID")
         token = fb_token()
         caption = post.get("caption_text") or caption_for_item(item)
-        video = video_for_post(item, post)
+        video = video_for_post(item, post, self.db_path)
         size = video.stat().st_size
         plan = Plan(post_id, PLATFORM_FACEBOOK)
         base = self.client.base()

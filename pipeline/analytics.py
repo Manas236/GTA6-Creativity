@@ -204,7 +204,6 @@ def due_snapshots(
 ) -> list[tuple[dict[str, Any], int]]:
     """(post, hours) for every live post whose snapshot window is open and not yet recorded."""
     conf = settings(cfg)
-    late = timedelta(hours=float(conf["max_snapshot_late_hours"]))
     with db.db(db_path) as conn:
         posts = [dict(r) for r in conn.execute(
             "SELECT * FROM posts WHERE status = 'live' AND remote_id IS NOT NULL AND posted_at IS NOT NULL "
@@ -217,24 +216,28 @@ def due_snapshots(
         posted = clock.parse(post["posted_at"])
         for hours in sorted(int(h) for h in conf["snapshot_hours"]):
             opens = posted + timedelta(hours=hours)
-            if (post["id"], hours) not in have and opens <= now <= opens + late:
+            if (post["id"], hours) not in have and opens <= now:
                 due.append((post, hours))
     return due
 
 
 def record_snapshot(
-    post_id: int, hours: int, fields: dict[str, int], raw: dict[str, Any], db_path: Any = None
-) -> None:
+    post_id: int, hours: int, fields: dict[str, int], raw: dict[str, Any], db_path: Any = None,
+    *, age_hours: float | None = None, late: bool = False
+) -> bool:
     with db.db(db_path) as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
-            INSERT INTO metrics (post_id, snapshot_hours, views, likes, comments, shares, raw_json, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO metrics (post_id, snapshot_hours, views, likes, comments, shares, raw_json, fetched_at,
+                                 age_hours, late, saves, reach)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(post_id, snapshot_hours) DO NOTHING
             """,
             (post_id, hours, fields["views"], fields["likes"], fields["comments"], fields["shares"],
-             json.dumps(raw)[:20000], db.now()),
+             json.dumps(raw), db.now(), age_hours, int(late),
+             _number(raw.get("saved")), _number(raw.get("reach"))),
         )
+        return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +271,7 @@ def item_scores(cfg: dict[str, Any] | None = None, db_path: Any = None) -> dict[
             SELECT m.post_id, m.snapshot_hours, m.views, m.likes, m.comments, m.shares,
                    p.item_id, p.platform, p.variant, p.hook_style, p.source, p.authenticity,
                    p.style_preset, p.ab_excluded
-            FROM metrics m JOIN posts p ON p.id = m.post_id
+            FROM metrics m JOIN posts p ON p.id = m.post_id WHERE COALESCE(m.late, 0) = 0
             """
         ).fetchall()]
 
@@ -329,6 +332,9 @@ def rebuild_ab_learning(cfg: dict[str, Any] | None = None, db_path: Any = None) 
                 )
     # The variant rows carry the allocation the scheduler will actually use (floor included).
     probs, _why = scheduler.variant_probabilities(cfg, db_path)
+    presets = (cfg or {}).get("style", {}).get("versions", ["P1", "P2", "P3"])
+    preset_probs, _ = scheduler.variant_probabilities(cfg, db_path, [p.lower() for p in presets])
+    probs.update(preset_probs)
     with db.db(db_path) as conn:
         for value, p in probs.items():
             conn.execute(
@@ -385,9 +391,13 @@ def run_analytics_stage(
         log.warning("analytics: meta is paused, %d snapshot(s) wait: %s", len(due), why)
     elif due:
         fetcher = InsightsFetcher(client or posting.MetaClient(cfg=cfg, db_path=db_path), cfg, db_path, alert=alert)
+        cached = {}
+        alerted = set()
         for post, hours in due:
             try:
-                fields, raw = fetcher.fetch(post)
+                if post["id"] not in cached:
+                    cached[post["id"]] = fetcher.fetch(post)
+                fields, raw = cached[post["id"]]
             except RateLimitError as e:
                 log.warning("analytics: meta rate limited; stopping this pass: %s", posting.redact(e))
                 break
@@ -397,7 +407,17 @@ def run_analytics_stage(
                 log.warning("analytics: %s post %s %dh snapshot failed: %s", post["platform"], post["id"], hours,
                             posting.redact(e)[:200])
                 continue
-            record_snapshot(post["id"], hours, fields, raw, db_path=db_path)
+            age = (now - clock.parse(post["posted_at"])).total_seconds() / 3600
+            late = age > hours + float(settings(cfg)["max_snapshot_late_hours"])
+            inserted = record_snapshot(post["id"], hours, fields, raw, db_path=db_path,
+                                       age_hours=age, late=late)
+            if inserted and late and post["id"] not in alerted:
+                alerted.add(post["id"])
+                fetcher.alert(
+                    f"Analytics missed the {hours}h window for {post['item_id']}; "
+                    f"captured a late snapshot at {age:.1f}h.",
+                    key=f"analytics_late:{post['id']}",
+                )
             fetched.append((post["id"], hours))
             log.info("analytics: %s post %s %dh -> %s", post["platform"], post["id"], hours, fields)
 
@@ -405,3 +425,30 @@ def run_analytics_stage(
     measured = mark_measured(now, cfg, db_path)
     return {"snapshots": fetched, "failed": failed, "measured": measured,
             "learning_rows": sum(len(v) for v in learning.values()), "variant": learning.get("variant", {})}
+
+
+def snapshot_now(item_id, cfg, db_path, *, fetcher=None, now=None):
+    """Capture each live post, using an open scheduled window when one is available."""
+    if posting.meta_paused(db_path)[0]:
+        raise ValueError("Meta is paused. Retry the snapshot after posting resumes.")
+    now = now or clock.utcnow()
+    fetcher = fetcher or InsightsFetcher(posting.MetaClient(cfg=cfg, db_path=db_path), cfg, db_path)
+    conf = settings(cfg)
+    captured = []
+    for post in posting.get_posts_for_item(item_id, db_path):
+        if post["status"] != "live" or not post["remote_id"] or not post["posted_at"]:
+            continue
+        age = (now - clock.parse(post["posted_at"])).total_seconds() / 3600
+        with db.db(db_path) as conn:
+            occupied = {row[0] for row in conn.execute(
+                "SELECT snapshot_hours FROM metrics WHERE post_id=?", (post["id"],)
+            )}
+        window = next((h for h in sorted(conf["snapshot_hours"], reverse=True) if h not in occupied
+                       and h <= age <= h + conf["max_snapshot_late_hours"]), None)
+        fields, raw = fetcher.fetch(post)
+        # An ad hoc snapshot has its own key and cannot consume an official window.
+        key = window if window is not None else min({0, *occupied}) - 1
+        if record_snapshot(post["id"], key, fields, raw, db_path, age_hours=age, late=window is None):
+            captured.append(post["id"])
+    rebuild_ab_learning(cfg, db_path)
+    return captured

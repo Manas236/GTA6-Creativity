@@ -464,7 +464,7 @@ approval:
   # quality gate below), with one Telegram notice at the switch. null = approve by hand forever.
   switch_to_auto_after_days: 7
   auto_quality_gate:
-    require_both_renders: true
+    require_at_least_one_version: true
     require_ffprobe_pass: true
     require_grounded_hook: true
     max_duration_seconds: 30.0 # applies to Variant A (the cut-length render)

@@ -116,17 +116,29 @@ def test_24h_and_72h_snapshots_are_taken_once_each_for_both_platforms(tmp_db, cf
     assert db.get_item("item-1", db_path=tmp_db)["stage"] == "measured"
 
 
-def test_a_snapshot_that_is_too_late_is_skipped_not_recorded_as_if_it_were_on_time(tmp_db, cfg, secrets, fake_clock):
-    ids = live_post(tmp_db, "item-1", "2026-11-19T07:30:00Z", platforms=("instagram",))
-    transport = FakeTransport({"/insights": ig_answer(9999)})
-
-    fake_clock.set("2026-11-21T00:00:00Z")                       # 40.5 h: the 24h window (24-36 h) is gone
-    assert run(tmp_db, cfg, transport)["snapshots"] == []
-    fake_clock.set("2026-11-22T10:00:00Z")                       # 74.5 h: the 72h window is open
-    assert run(tmp_db, cfg, transport)["snapshots"] == [(ids["instagram"], 72)]
-    fake_clock.set("2026-11-30T00:00:00Z")                       # long after: nothing more
-    assert run(tmp_db, cfg, transport)["snapshots"] == []
-    assert len(transport.calls) == 1
+def test_legacy_reel_recovers_both_missed_windows(tmp_db, cfg, secrets, fake_clock):
+    item = "item_a35aead652d3"
+    ids = live_post(tmp_db, item, "2026-11-14T12:00:00Z", variant="B",
+                    platforms=("instagram",), source="manual", ab_excluded=1)
+    post_id = ids["instagram"]
+    with db.db(tmp_db) as conn:
+        conn.execute("UPDATE items SET source_id='manual_B:previous_A', render_b_path='legacy_B.mp4' WHERE id=?",
+                     (item,))
+    db.init_db(tmp_db)
+    db.init_db(tmp_db)
+    transport = FakeTransport({"/insights": ig_answer(150, likes=5, comments=1, shares=2)})
+    alerts = []
+    fake_clock.set("2026-11-18T12:00:00Z")
+    assert run(tmp_db, cfg, transport, alerts)["snapshots"] == [(post_id, 24), (post_id, 72)]
+    assert run(tmp_db, cfg, transport, alerts)["snapshots"] == []
+    assert len(transport.calls) == len(alerts) == 1
+    assert learning(tmp_db) == {}
+    with db.db(tmp_db) as conn:
+        rows = conn.execute(
+            "SELECT snapshot_hours, age_hours, late, views, reach FROM metrics ORDER BY snapshot_hours"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [(24, 96, 1, 150, 75), (72, 96, 1, 150, 75)]
+    assert db.get_item(item, tmp_db)["render_b_path"] == "legacy_B.mp4"
 
 
 def test_an_item_whose_window_lapsed_unmeasured_still_leaves_posted(tmp_db, cfg, secrets, fake_clock):

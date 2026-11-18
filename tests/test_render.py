@@ -434,8 +434,7 @@ def test_run_render_item_reuses_the_cached_cut_words(tmp_db: Path, tmp_path: Pat
     render.store_cut_words("item_r", db.get_item("item_r", db_path=tmp_db), CACHED_WORDS,
                            KEY, db_path=tmp_db)
 
-    fake = {"elapsed_a_s": 1.0, "elapsed_b_s": 1.0, "probe_a": {"video_duration": 20.0},
-            "probe_b": {"video_duration": 23.0}, "preset": "P0"}
+    fake = {"versions": [("p2", "P2", "test-P2.mp4", "test-P2.meta.json", 1.0)]}
     with patch.object(render.config, "media_dir", side_effect=lambda sub="": tmp_path / sub), \
          patch.object(render, "verify_video_file", return_value=(True, 20.0)), \
          patch.object(render, "media_duration", return_value=2.0), \

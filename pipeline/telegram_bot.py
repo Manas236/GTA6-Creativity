@@ -58,7 +58,7 @@ ALERT_REPEAT_GAP_S = 3600.0       # the same failure is not re-alerted more ofte
 MAX_VIDEO_BYTES = 50 * 1024 * 1024  # Bot API upload limit for a bot-sent video
 
 ACTIONS = {"ok": "approved", "no": "rejected", "aonly": "approved_a_only", "bonly": "approved_b_only",
-           "hookok": "hook_approved"}
+           "hookok": "hook_approved", **dict.fromkeys(("p1", "p2", "p3", "all"), "approved_versions")}
 #: Single-variant approvals: button -> the variant it pins. The item is ab_excluded.
 PINNED_VARIANT_ACTIONS = {"aonly": "A", "bonly": "B"}
 #: Stages an open card can still be decided in (a review card is for an item in needs_review).
@@ -401,6 +401,24 @@ def refuse_item(item_id: str, stage: str, exc: BaseException, db_path: Any = Non
 # Decisions
 # ---------------------------------------------------------------------------
 
+def approve_versions(item_id, variants, db_path=None):
+    item = db.get_item(item_id, db_path)
+    if not item or item["stage"] not in ("rendered", "awaiting_approval") or not db.is_releasable(item):
+        raise ValueError("This approval no longer applies. Refresh the item.")
+    available = {row["variant"] for row in db.renders_for_item(item_id, db_path)
+                 if Path(row["path"]).is_file()}
+    if not variants or not set(variants) <= available:
+        raise ValueError("Choose one or more available preset versions.")
+    if item.get("render_a_path") or item.get("render_b_path"):
+        raise ValueError("Use the legacy A/B approval controls for this item.")
+    single = len(variants) == 1
+    db.transition_stage(item_id, "approved", {
+        "approval_type": "approved_versions", "approved_versions": json.dumps(sorted(variants)),
+        "chosen_variant": variants[0] if single else None, "ab_excluded": int(single),
+    }, db_path)
+    return "Approved " + ", ".join(version.upper() for version in sorted(variants)) + "."
+
+
 def decide(item_id: str, action: str, db_path: Any = None) -> tuple[str, str]:
     """Apply a button. Returns (outcome, short answer to show on the button).
 
@@ -411,6 +429,24 @@ def decide(item_id: str, action: str, db_path: Any = None) -> tuple[str, str]:
         return "", "That item is gone."
     if item.get("stage") not in DECIDABLE_STAGES:
         return "", f"Already decided ({item.get('stage')})."
+    if action in ("p1", "p2", "p3", "all"):
+        variants = [action] if action != "all" else [
+            row["variant"] for row in db.renders_for_item(item_id, db_path)]
+        try:
+            return "approved_versions", approve_versions(item_id, variants, db_path)
+        except ValueError as exc:
+            return "", str(exc)
+    if action in ("ok", "aonly", "bonly") and db.renders_for_item(item_id, db_path):
+        return "", "Choose a preset version."
+    if action == "hookok" and item["stage"] != "needs_review" and db.renders_for_item(item_id, db_path):
+        if not item.get("hook_binding"):
+            return "", "No segment binding exists. Edit the hook to request a new check."
+        previous = item["stage"]
+        db.transition_stage(item_id, previous, {
+            "hook_grounded": 1,
+            "hook_binding": binding.with_check(item["hook_binding"], "human_approved", "approved on Telegram"),
+        }, db_path)
+        return NOT_APPLICABLE, "Hook confirmed. Choose a preset to approve the clip."
     # A review card (needs_review) only takes hookok / no; a render card never takes hookok.
     if (item.get("stage") == "needs_review") != (action == "hookok") and action != "no":
         return NOT_APPLICABLE, f"That button does not apply to this item ({item.get('stage')})."
@@ -585,6 +621,33 @@ class ApprovalBot:
             except sqlite3.IntegrityError as e:
                 refuse_item(item_id, "approval", e, self.db_path)
                 return None
+        versions = db.renders_for_item(item_id, self.db_path)
+        if versions:
+            from contextlib import ExitStack
+
+            if len(versions) == 1:
+                row = versions[0]
+                album = [self.send_video(row["path"], row["preset"])]
+            else:
+                with ExitStack() as stack:
+                    files = {row["variant"]: stack.enter_context(Path(row["path"]).open("rb"))
+                             for row in versions}
+                    album = self.call("sendMediaGroup", files=files, http_timeout=120,
+                                      chat_id=self.chat_id, media=json.dumps([
+                                          {"type": "video", "media": f"attach://{row['variant']}",
+                                           "caption": row["preset"]} for row in versions]))
+            buttons = [(row["preset"], row["variant"]) for row in versions]
+            keyboard = [[{"text": label, "callback_data": f"a:{key}:{item_id}"}
+                         for label, key in buttons + [("All", "all")]],
+                        [{"text": "Reject", "callback_data": f"a:no:{item_id}"},
+                         {"text": "Hook is right", "callback_data": f"a:hookok:{item_id}"}]]
+            main = self.send_message(f"Review preset versions · {item.get('hook_text') or ''}",
+                                     reply_markup={"inline_keyboard": keyboard})
+            mid = int(main["message_id"])
+            self.editor.touch(mid)
+            set_card_state({"mid": mid, "item_id": item_id, "kind": "versions",
+                            "extra_mids": [int(msg["message_id"]) for msg in album]}, self.db_path)
+            return item_id
         a_path, b_path, preset = card_renders(item)
         text = card_text(item)
 
@@ -615,6 +678,8 @@ class ApprovalBot:
         decided = DECIDED_TEXT.get(outcome, outcome)
         if state.get("kind") == "review":
             kind, text = "text", review_card_text(item, decided=decided)
+        elif state.get("kind") == "versions":
+            kind, text = "text", f"Preset review · {decided}"
         else:
             kind, text = ("video" if item.get("render_b_path") else "text"), card_text(item, decided=decided)
         self.editor.edit(int(state["mid"]), kind, text, {"inline_keyboard": []}, now=True)
@@ -823,7 +888,7 @@ def quality_gate(
     probe = probe or _ffprobe_duration
 
     a_path, b_path = item.get("render_a_path"), item.get("render_b_path")
-    if gate.get("require_both_renders", True):
+    if gate.get("require_both_renders", gate.get("require_at_least_one_version", True)):
         for label, p in (("A", a_path), ("B", b_path)):
             if not p or not Path(p).exists():
                 return False, f"variant {label} render missing"
@@ -862,7 +927,26 @@ def run_auto_approval(
     rejected: list[str] = []
     for stage in ("rendered", "awaiting_approval"):
         for item in db.get_items_by_stage(stage, db_path=db_path, releasable_only=True):
-            passed, reason = quality_gate(item, cfg=cfg, probe=probe)
+            versions = db.renders_for_item(item["id"], db_path)
+            gate = cfg.get("approval", {}).get("auto_quality_gate") or {}
+            if versions:
+                limit = float(gate.get("max_duration_seconds", 22)) + float(gate.get("max_b_extra_seconds", 8))
+                inspect = probe or _ffprobe_duration
+                usable = [row["variant"] for row in versions if Path(row["path"]).is_file()
+                          and (gate.get("enabled", True) is False or not gate.get("require_ffprobe_pass", True)
+                               or 0 < (inspect(row["path"]) or 0) <= limit)]
+                grounded = item.get("hook_text") and item.get("hook_grounded")
+                passed = bool(usable) and (gate.get("enabled", True) is False
+                                           or not gate.get("require_grounded_hook", True) or bool(grounded))
+                reason = "preset quality gate " + ("passed" if passed else "refused")
+                if passed:
+                    approve_versions(item["id"], usable, db_path)
+                    approved.append(item["id"])
+                    db.log_stage(item["id"], "approval", "success", message=reason, db_path=db_path)
+                    continue
+            else:
+                passed, reason = (True, "quality gate disabled") if gate.get("enabled") is False else (
+                    quality_gate(item, cfg=cfg, probe=probe))
             if passed:
                 try:
                     db.transition_stage(
@@ -905,14 +989,13 @@ def effective_mode(cfg: dict[str, Any] | None = None, db_path: Any = None) -> st
     keep approving by hand - that also undoes a switch that already happened.
     """
     approval = ((cfg or {}).get("approval") or {})
-    if approval.get("dashboard_only"):
-        return "dashboard"
+    manual_mode = "dashboard" if approval.get("dashboard_only") else "telegram"
     mode = str(approval.get("mode") or "telegram").lower()
     if mode == "auto":
         return "auto"
     after_days = approval.get("switch_to_auto_after_days")
     if not after_days:
-        return "telegram"
+        return manual_mode
     if db.kv_get(K_AUTO_SINCE, db_path=db_path):
         return "auto"
     days = db.days_since_first_live(db_path)
@@ -920,7 +1003,7 @@ def effective_mode(cfg: dict[str, Any] | None = None, db_path: Any = None) -> st
         db.kv_set(K_AUTO_SINCE, db.now(), db_path=db_path)
         log.info("approval: %.1f days since the first live post; switching to auto approval", days)
         return "auto"
-    return "telegram"
+    return manual_mode
 
 
 def announce_auto_switch(

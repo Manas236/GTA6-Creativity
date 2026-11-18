@@ -102,6 +102,14 @@ class Cleaner:
                 continue
             if self._delete(Path(value)):
                 cleared.append(col)
+        if columns in (ALL_COLUMNS, RENDER_COLUMNS):
+            for render in db.renders_for_item(item["id"], self.db_path):
+                removed = [self._delete(Path(render[field])) for field in ("path", "meta_path")
+                           if render[field]]
+                if all(removed):
+                    with db.db(self.db_path) as conn:
+                        conn.execute("DELETE FROM renders WHERE item_id=? AND variant=?",
+                                     (item["id"], render["variant"]))
         if subtitles:
             sub_dir = self.media_root / "subtitles"
             if sub_dir.is_dir():

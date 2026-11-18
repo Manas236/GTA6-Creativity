@@ -840,6 +840,7 @@ def render_item_variants(
     name: str = "item",
     *,
     preset: str | None = None,
+    version_presets: Sequence[str] | None = None,
     channel_name: str = "",
     keyword_list: Sequence[str] | None = None,
     clean_cut_end: bool = False,
@@ -881,6 +882,50 @@ def render_item_variants(
         occupancy = textdetect.detect_source_text(cut_path, analysis.end_s, analysis.segments, cfg,
                                                   zoom_fill=flags["zoom_fill"])
 
+    overrides = json.loads((item or {}).get("caption_words_override") or "{}")
+    if version_presets is not None:
+        results = []
+        failures = []
+        subs = Path(subtitles_dir)
+        subs.mkdir(parents=True, exist_ok=True)
+        for version in version_presets:
+            output = Path(out_b).with_name(f"{name}_{version}.mp4")
+            ass = subs / f"{name}_{version}.ass"
+            try:
+                plan = planning.build_style_plan(
+                    analysis, hook_text, variant="B", freeze_s=freeze_s, vo_words=vo_words,
+                    cfg=cfg, preset=version, channel_name=channel_name, keyword_list=keyword_list,
+                    occupancy=occupancy.with_freeze() if occupancy is not None and freeze_s > 0 else occupancy,
+                )
+                plan.words = [dict(word, word=overrides.get(str(i), word["word"]))
+                              for i, word in enumerate(plan.words)]
+                if cfg.get("style", {}).get("music", {}).get("enabled") is False:
+                    plan.music_file = None
+                ass.write_text(build_ass_subtitles(hook_text, plan.total_s, plan.words, cfg=cfg, sp=plan),
+                               encoding="utf-8")
+                ok, elapsed = render_variant_b(
+                    cut_path, vo_path, ass, output, target_lufs,
+                    duration_s=plan.content_s, freeze_s=freeze_s, cfg=cfg, sp=plan,
+                )
+                if not ok:
+                    raise RenderVerificationError(f"{version} render/verification failed")
+            except style.SourceTextCollision as exc:
+                failures.append(exc)
+                log.warning("Render %s/%s: %s", name, version, exc)
+                continue
+            except Exception as exc:
+                failures.append(exc)
+                log.exception("Render %s/%s failed", name, version)
+                continue
+            results.append((version.lower(), version, str(output),
+                            str(output.with_suffix(".meta.json")), elapsed))
+        if not results:
+            collision = next((exc for exc in failures if isinstance(exc, style.SourceTextCollision)), None)
+            if collision is not None:
+                raise collision
+            raise RenderVerificationError(f"No preset verified: {name}")
+        return {"versions": results}
+
     plan_a = planning.build_style_plan(
         analysis, hook_text, variant="A", freeze_s=0.0, cfg=cfg, preset=preset_name,
         channel_name=channel_name, keyword_list=keyword_list, occupancy=occupancy,
@@ -890,6 +935,9 @@ def render_item_variants(
         preset=preset_name, channel_name=channel_name, keyword_list=keyword_list,
         occupancy=occupancy.with_freeze() if occupancy is not None and freeze_s > 0 else occupancy,
     )
+    if overrides:
+        plan_b.words = [dict(word, word=overrides.get(str(i), word["word"]))
+                        for i, word in enumerate(plan_b.words)]
     content_s = plan_a.content_s
 
     subs = Path(subtitles_dir)
@@ -951,7 +999,7 @@ def run_render_item(
 ) -> tuple[bool, str, dict[str, float]]:
     """Execute complete render stage for an item in 'cut' stage.
 
-    Generates Variant A and Variant B, validates both, purges download, and updates DB.
+    Renders and verifies the configured presets or the legacy A/B outputs, then updates the DB.
     Returns (success: bool, message: str, timing_stats: dict).
     """
     cfg = cfg or config.get_config()
@@ -1036,7 +1084,9 @@ def run_render_item(
     render_a_path = renders_dir / f"{item_id}_A.mp4"
     render_b_path = renders_dir / f"{item_id}_B.mp4"
 
-    log.info("Rendering Variants A and B for %s (preset %s)...", item_id, preset or style.default_preset(cfg))
+    legacy = bool(item.get("legacy_renders") or item.get("render_a_path") or item.get("render_b_path"))
+    versions = None if legacy else cfg.get("style", {}).get("versions", ["P1", "P2", "P3"])
+    log.info("Rendering %s for %s", ", ".join(versions or ("A", "B")), item_id)
     try:
         result = render_item_variants(
             cut_path,
@@ -1050,6 +1100,7 @@ def run_render_item(
             cfg=cfg,
             name=item_id,
             preset=preset,
+            version_presets=versions,
             channel_name=item.get("author_name") or "",
             keyword_list=keyword_list,
             clean_cut_end=cut_end_verified(item, tkey),
@@ -1061,6 +1112,28 @@ def run_render_item(
         db.mark_failed(item_id, "render", str(e), db_path=db_path)
         db.log_stage(item_id, "render", "failure", message=str(e), db_path=db_path)
         return False, str(e), {}
+
+    if versions is not None:
+        author = item.get("author_name") or "Creator"
+        source = item.get("source_platform") or item.get("source") or "youtube"
+        caption = posting.build_caption(hook_text, author, source, cfg=cfg)
+        with db.db(db_path) as conn:
+            conn.execute("DELETE FROM renders WHERE item_id=?", (item_id,))
+            conn.executemany(
+                "INSERT INTO renders VALUES (?, ?, ?, ?, ?, ?)",
+                [(item_id, *row[:4], db.now()) for row in result["versions"]],
+            )
+            with db.connection_scope(conn, db_path):
+                db.transition_stage(item_id, "awaiting_approval" if item.get("caption_words_override")
+                                    or item.get("voiceover_override") else "rendered",
+                                    {"caption_text": caption, "approved_versions": None}, db_path)
+        download = item.get("download_path")
+        if download and cfg.get("retention", {}).get("purge_downloads_immediately", True):
+            Path(download).unlink(missing_ok=True)
+        db.log_stage(item_id, "render", "success", message="Preset renders verified", db_path=db_path)
+        return True, f"Renders complete for {item_id}", {
+            "total_render_s": round(sum(row[4] for row in result["versions"]), 2),
+        }
 
     elapsed_a, elapsed_b = result["elapsed_a_s"], result["elapsed_b_s"]
     dur_a = result["probe_a"]["video_duration"]
@@ -1086,6 +1159,7 @@ def run_render_item(
                 "render_b_path": str(render_b_path),
                 "caption_text": caption_text,
                 "style_preset": result["preset"],
+                "legacy_renders": 1,
             },
             db_path=db_path,
         )

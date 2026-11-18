@@ -167,8 +167,7 @@ def test_run_render_item_regenerates_a_hook_left_over_from_an_older_window(tmp_d
     def guarded_variants(*a, **k):                # the real guard, then a fake render
         render.assert_item_caption_binding(k["item"], a[2], a[0], a[1], CFG)
         burned.update(hook=a[2], item=k["item"]["id"])
-        return {"elapsed_a_s": 1.0, "elapsed_b_s": 1.0, "probe_a": {"video_duration": 19.8},
-                "probe_b": {"video_duration": 23.0}, "preset": "P0"}
+        return {"versions": [("p2", "P2", "test-P2.mp4", "test-P2.meta.json", 1.0)]}
 
     with _render_env(tmp_path), \
          patch.object(render.hooks, "run_hooks_for_item", side_effect=fresh_hooks) as hk, \
