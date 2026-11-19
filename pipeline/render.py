@@ -310,14 +310,19 @@ def build_ass_subtitles(
         base = cap["color"]
         kw_list = list(sp.keyword_list) if sp is not None else []
         kw_on = _flag(sp, "keyword_color")
+        max_w = float(rs["safe_area"]["x_max"] - rs["safe_area"]["x_min"]) - 2 * (cap["outline"] + cap["shadow"])
+        peak = float(ss.get("caption_pop", {}).get("peak_scale", 100)) / 100.0
         for ci, chunk in enumerate(chunks):
             raw = [_clean_caption_word(cw["word"]) for cw in chunk]
             size_tag = ""
+            size = float(cap["font_size"])
             if len(raw) == 1:
                 size = caption_chunk_size(raw[0], rs)
                 if size < float(cap["font_size"]):
                     size_tag = f"\\fs{size:g}"
-            pop_tags = overlay.caption_pop_tags(ss, max_scale=100 if size_tag else None) \
+            # M1's pop overshoots (115 %): a line that only fits the safe width at 100 % pops to 100 %.
+            fits_peak = text_width_px(" ".join(raw), size, rs["font_path"]) * peak <= max_w
+            pop_tags = overlay.caption_pop_tags(ss, max_scale=100 if size_tag or not fits_peak else None) \
                 if _flag(sp, "caption_pop") else ""
             next_chunk_start = chunks[ci + 1][0]["start"] if ci + 1 < len(chunks) else video_duration
             for i, active in enumerate(chunk):
@@ -518,7 +523,9 @@ def _video_chain(
         f"boxblur=8:8,scale={W}:{H},eq=brightness=-0.22[bg]"
     )
     parts.append(_fg_chain(rs, sp, "vs2", "fg"))
-    parts.append(f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,ass={ass_arg}[vass]")
+    # The band sits zoom_fill.offset_y_px below centre (style.foreground_top), so the hook has room.
+    offset = style.foreground_offset(sp.ss) if sp is not None else 0
+    parts.append(f"[bg][fg]overlay=(W-w)/2:(H-h)/2+{offset},setsar=1,ass={ass_arg}[vass]")
     last = "vass"
     if emoji_chain:
         parts.append(emoji_chain)

@@ -140,6 +140,19 @@ class TwitchClient:
         return self.get("clips", params).get("data") or []
 
 
+def clip_title(clip: dict[str, Any]) -> str:
+    """A display title for a Helix clip.
+
+    A clip's title is whatever the viewer who pressed "clip" typed: often one word ("Reset",
+    "W", "LMAO") that says nothing in Job progress, Review or the hook prompt's context line.
+    Those get the streamer and the game added; a descriptive title (3+ words) is kept as is."""
+    title = " ".join(str(clip.get("title") or "").split())
+    who = clip.get("broadcaster_name") or "Twitch streamer"
+    if len(title.split()) >= 3:
+        return title
+    return f'{who} GTA VI clip: "{title}"' if title else f"{who} GTA VI Twitch clip"
+
+
 def clip_to_candidate(clip: dict[str, Any], now: datetime, cfg: dict[str, Any]) -> dict[str, Any] | None:
     """A Helix clip as a discovery candidate, or None if it lacks what the pipeline needs."""
     tw = twitch_cfg(cfg)
@@ -166,7 +179,7 @@ def clip_to_candidate(clip: dict[str, Any], now: datetime, cfg: dict[str, Any]) 
         "source_url": str(url),
         # Credit goes to the broadcaster (whose stream it is), not the viewer who pressed "clip".
         "author_name": clip.get("broadcaster_name") or "Twitch streamer",
-        "original_title": clip.get("title") or "GTA VI Twitch clip",
+        "original_title": clip_title(clip),
         "original_duration": float(clip.get("duration") or 0.0),
         "view_count": views,
         "upvote_count": 0,

@@ -153,6 +153,7 @@ def build_demo(path, media=True):
         "cleaned": 10,
         "rejected": 4,
         "failed": 5,
+        "archived": 2,
     }
     index = 0
     for stage in db.STAGES:

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import binding, config, db, dedupe, endings, sentence_windows, transcribe
+from . import binding, config, content_gate, db, dedupe, endings, sentence_windows, transcribe
 from .download import verify_video_file
 
 log = logging.getLogger(__name__)
@@ -229,12 +229,15 @@ def _cut_bounds(cfg: dict[str, Any]) -> tuple[float, float, float]:
 def scan_cut_windows(video_path: Path | str, cfg: dict[str, Any] | None = None) -> CutScan | None:
     """Score every window of the source (audio energy + scene density), best first.
 
-    Returns None if the source is too short, invalid, or fails the static-source floor.
+    Returns None if the source is too short or invalid. Whether the picture is static or is
+    gameplay at all is no longer judged here: the old floor counted HARD SCENE CUTS over the whole
+    source (< 0.05/s and < 2 cuts = "static"), which rejected a streamer playing continuously
+    (0 cuts) and passed tweet-screenshot montages (many cuts). pipeline.content_gate judges each
+    candidate window's real motion and content instead (run_cut_item).
     """
     cfg = cfg or config.get_config()
     cut_cfg = cfg.get("cut", {})
     min_dur, max_dur, target_dur = _cut_bounds(cfg)
-    static_floor = float(cut_cfg.get("min_scene_change_density", 0.05))
 
     audio_weight = float(cut_cfg.get("weights", {}).get("audio_energy", 0.75))
     scene_weight = float(cut_cfg.get("weights", {}).get("visual_interest", 0.25))
@@ -250,17 +253,8 @@ def scan_cut_windows(video_path: Path | str, cfg: dict[str, Any] | None = None) 
         return CutScan(total_duration, loud, [], [CutWindow(0.0, total_duration, 1.0)],
                        min_dur, max_dur, target_dur)
 
-    # 1. Visual scene cuts
+    # 1. Visual scene cuts (a soft scoring term and start snapping only; never a rejection)
     scene_cuts = extract_scene_cuts(video_path, threshold=0.3)
-    scene_density = len(scene_cuts) / total_duration if total_duration > 0 else 0.0
-
-    # Static-source floor check (e.g. cover art reveal / static podcasts)
-    if scene_density < static_floor and len(scene_cuts) < 2:
-        log.warning(
-            "Source rejected by static-source floor: scene density %.3f/s < %.3f/s (cuts=%d)",
-            scene_density, static_floor, len(scene_cuts)
-        )
-        return None
 
     # 2. Audio energy profile
     loudness_profile = extract_audio_loudness_profile(video_path)
@@ -555,14 +549,21 @@ def run_cut_item(
     transcriber: Transcriber | None = None,
     envelope: EnvelopeFn | None = None,
     *, exclude_current: bool = False,
+    gate: Callable[[Path], "content_gate.Timeline | None"] | None = None,
 ) -> tuple[bool, str]:
-    """Cut stage for a downloaded item: sentence-aligned window selection, then cut-level dedupe.
+    """Cut stage for a downloaded item: content gate, sentence-aligned window selection, cut dedupe.
 
-    The source is transcribed once (pipeline.sentence_windows); every clean sentence end that
-    admits a min..max window gives a candidate, scored with the audio/scene formula plus a soft
-    sentence-start bonus. Candidates are cut best first; one that duplicates an earlier item's
-    cut is skipped (as is any candidate overlapping it by half or more). A source with no speech
-    keeps the old loudness-trough windows. No candidate at all -> failed, `no_clean_ending`.
+    The source is first scanned by pipeline.content_gate (real motion + CLIP gameplay check); a
+    source with almost no moving gameplay anywhere is rejected (`not_gameplay_source`) before the
+    expensive transcription. The source is then transcribed once (pipeline.sentence_windows); every
+    clean sentence end that admits a min..max window gives a candidate, scored with the audio/scene
+    formula plus a soft sentence-start bonus. Candidates are taken best first: one whose own window
+    fails the content gate is skipped for the next (`gate_rejected` in the selection record), one
+    that duplicates an earlier item's cut is skipped (as is any candidate overlapping it by half or
+    more). A source with no speech keeps the old loudness-trough windows. No candidate at all ->
+    failed, `no_clean_ending`; candidates that all fail the gate -> rejected, `not_gameplay`.
+    `gate(path) -> Timeline` replaces the content-gate scan (tests); it is skipped when
+    `content_gate.enabled` is false.
     """
     cfg = cfg or config.get_config()
     item = db.get_item(item_id, db_path=db_path)
@@ -588,10 +589,36 @@ def run_cut_item(
 
     scan = scan_cut_windows(download_path, cfg=cfg)
     if not scan:
-        # Static source or duration floor failed
-        db.mark_rejected(item_id, "rejected: static_source (low scene density)", db_path=db_path)
-        _outcome(item_id, "rejected", "static_source (low scene density) or too short", db_path)
-        return False, "Rejected: static_source"
+        reason = f"too_short: the source is shorter than {_cut_bounds(cfg)[0]:.0f} s or unreadable"
+        db.mark_rejected(item_id, f"rejected: {reason}", db_path=db_path)
+        _outcome(item_id, "rejected", reason, db_path)
+        return False, f"Rejected: {reason}"
+
+    # What is actually on screen (pipeline.content_gate): scanned once, judged per window below.
+    timeline = None
+    source_gate: dict[str, Any] | None = None
+    if content_gate.settings(cfg)["enabled"]:
+        try:
+            timeline = (gate or (lambda p: content_gate.scan(p, cfg=cfg)))(download_path)
+        except Exception as e:  # noqa: BLE001 - a gate that cannot run must not pass the item
+            reason = f"content gate could not run: {type(e).__name__}: {e}"
+            log.error("%s (item %s)", reason, item_id)
+            db.mark_failed(item_id, "cut", reason, db_path=db_path)
+            _outcome(item_id, "failure", reason, db_path)
+            return False, reason
+        if timeline is not None:
+            source_gate = content_gate.verdict(timeline, cfg=cfg, scope="source")
+            log.info("Content gate %s (whole source): motion %.0f%%, gameplay %.0f%% (%s)", item_id,
+                     100 * source_gate["motion_share"], 100 * source_gate["game_share"],
+                     source_gate["non_game"] or "all gameplay")
+            if not source_gate["ok"]:
+                reason = f"not_gameplay_source: {source_gate['reason']}"
+                db.mark_rejected(item_id, f"rejected: {reason}", db_path=db_path)
+                _outcome(item_id, "rejected", reason, db_path)
+                return False, f"Rejected: {reason}"
+
+    def gate_ok(start: float, end: float) -> bool:
+        return timeline is None or content_gate.verdict(timeline, start, end, cfg)["ok"]
 
     peaks = json.loads(item.get("heatmap") or item.get("chat_heatmap") or "[]")
     signal = "heatmap" if item.get("heatmap") else "chat"
@@ -619,7 +646,12 @@ def run_cut_item(
         windows = [CutWindow(a, a + length, scorer.score(a, a + length)) for a in starts]
     if peaks:
         windows = sorted(windows, key=lambda w: scorer.score(w.start, w.end), reverse=True)
-    spans = sentence_windows.transcribe_regions(scan.total_duration, windows, scan.min_dur,
+    region_windows = windows
+    if timeline is not None and scan.total_duration > float(sw["full_transcribe_max_s"]):
+        # Long source: only a few regions are transcribed, so take them where the gameplay is
+        # (stable sort: windows that pass the gate first, each group still best score first).
+        region_windows = sorted(windows, key=lambda w: not gate_ok(w.start, w.end))
+    spans = sentence_windows.transcribe_regions(scan.total_duration, region_windows, scan.min_dur,
                                                 scan.max_dur, tail, sw)
     spans = [(max(a, lower), min(b, upper)) for a, b in spans if min(b, upper) > max(a, lower)]
     try:
@@ -635,10 +667,13 @@ def run_cut_item(
         "transcribed": [list(s) for s in spans], "transcribe_s": round(wall, 1), "transcript_cached": cached,
         "source_s": round(scan.total_duration, 2),
     }
+    if source_gate is not None:
+        selection["source_gate"] = {k: source_gate[k] for k in ("motion_share", "game_share", "non_game")}
     choices: list[tuple[EndChoice, dict[str, Any]]] = []
     if not words_all:
         # Nobody speaks: the old audio/scene windows with a loudness-trough end.
-        for rank, win in enumerate(windows if exclude_current else windows[:max_windows], start=1):
+        no_speech = windows if exclude_current or timeline is not None else windows[:max_windows]
+        for rank, win in enumerate(no_speech, start=1):
             ch = clean_end_for_window(win, scan, [], min(upper, win.start + scan.max_dur), es)
             if ch and not excluded(ch.start, ch.end):
                 choices.append((ch, {"rank": rank, "score": round(win.score, 4), "mode": "no_speech"}))
@@ -673,6 +708,7 @@ def run_cut_item(
     cuts_dir = config.media_dir("cuts")
     cut_path = cuts_dir / f"{item_id}_cut.mp4"
     duplicates: list[tuple[str, float, float]] = []      # (prior item, start, end)
+    gate_rejected: list[dict[str, Any]] = []             # candidate windows the content gate refused
     tried = 0
     for choice, info in choices:
         if tried >= max_windows:
@@ -681,6 +717,19 @@ def run_cut_item(
         if any(min(choice.end, e) - max(choice.start, s) >= 0.5 * (choice.end - choice.start)
                for _, s, e in duplicates):
             continue
+        if timeline is not None:
+            # The gate on THIS window, not just the source: a reaction video can be gameplay for a
+            # minute and tweets for the next. A failing window moves on to the next candidate.
+            v = content_gate.verdict(timeline, choice.start, choice.end, cfg)
+            if not v["ok"]:
+                gate_rejected.append({"rank": info["rank"], "start": choice.start, "end": choice.end,
+                                      "motion": v["motion_share"], "game": v["game_share"],
+                                      "reason": v["reason"]})
+                log.info("Cut candidate #%d [%.2f-%.2f s] of %s refused by the content gate: %s",
+                         info["rank"], choice.start, choice.end, item_id, v["reason"])
+                continue
+            info = {**info, "gate": {k: v[k] for k in ("motion_share", "game_share", "mean_game_prob",
+                                                       "median_motion", "clip_frames")}}
         tried += 1
         try:
             _extract_cut(download_path, choice.start, choice.end, cut_path)
@@ -718,6 +767,8 @@ def run_cut_item(
         db.delete_fingerprints(item_id, "cut", db_path=db_path)
         db.save_fingerprints(item_id, "cut", cut_hashes, db_path=db_path)
         selection.update(info, start=choice.start, end=choice.end)
+        if timeline is not None:
+            selection["gate_rejected"] = gate_rejected[:20]
         # A moved window invalidates everything written for the old one: the hook, voiceover,
         # keywords and renders described a different part of the source (the wrong-caption bug).
         stale = binding.reset_for_new_segment(item, choice.start, choice.end)
@@ -740,11 +791,16 @@ def run_cut_item(
             },
             db_path=db_path,
         )
+        gate_note = ""
+        if info.get("gate"):
+            gate_note = (f"; gate: motion {info['gate']['motion_share']:.0%}, gameplay "
+                         f"{info['gate']['game_share']:.0%}"
+                         f"{f', {len(gate_rejected)} earlier window(s) refused' if gate_rejected else ''}")
         msg = (f"Cut candidate #{info['rank']} of {selection['candidates']} "
                f"[{choice.start:.2f}s - {choice.end:.2f}s] extracted ({actual_dur:.1f}s, end: {choice.kind}"
                f"{', starts at a sentence' if info.get('at_sentence_start') else ''}; "
                f"{selection['clean_ends']} clean sentence ends; transcription {wall:.1f}s"
-               f"{' cached' if cached else ''})")
+               f"{' cached' if cached else ''}{gate_note})")
         _outcome(item_id, "success", msg, db_path)
         return True, msg
 
@@ -758,6 +814,13 @@ def run_cut_item(
         )
         _outcome(item_id, "rejected", f"duplicate_cut of {prior} ({len(duplicates)} candidate(s))", db_path)
         return False, f"Rejected: duplicate_cut of {prior}"
+    if gate_rejected:
+        best = max(gate_rejected, key=lambda g: (g["game"], g["motion"]))
+        reason = (f"not_gameplay: all {len(gate_rejected)} candidate window(s) failed the content gate "
+                  f"(best {best['start']:.0f}-{best['end']:.0f} s: {best['reason']})")
+        db.mark_rejected(item_id, f"rejected: {reason}", db_path=db_path)
+        _outcome(item_id, "rejected", reason, db_path)
+        return False, f"Rejected: {reason}"
     reason = f"no_clean_ending: no usable window ({selection.get('candidates', 0)} candidates)"
     db.mark_failed(item_id, "cut", reason, db_path=db_path)
     _outcome(item_id, "failure", reason, db_path)

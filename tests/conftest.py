@@ -59,6 +59,23 @@ def no_real_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(requests.sessions.Session, "request", refuse)
 
 
+@pytest.fixture(autouse=True)
+def content_gate_off_by_default(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cut stage's content gate decodes the source and runs CLIP (a ~600 MB local model). Unit
+    tests seed fake sources, so it is off unless a test is marked `content_gate` (those inject a
+    fake model or a timeline, or skip when the model is not on this machine)."""
+    if request.node.get_closest_marker("content_gate"):
+        return
+    from pipeline import content_gate
+
+    real = content_gate.settings
+
+    def off(cfg=None):
+        return {**real(cfg), "enabled": False}
+
+    monkeypatch.setattr(content_gate, "settings", off)
+
+
 @pytest.fixture
 def fake_clock() -> Generator[clock.FakeClock, None, None]:
     """A settable pipeline clock, starting Tuesday 10 Nov 2026 06:00 UTC (11:30 in Kolkata)."""

@@ -20,7 +20,7 @@ ROCKSTAR = "UC6VcWc1rAoWdBCM0JxrRQ3A"       # listed in sources.official_channel
 
 SEG_WORDS = [{"word": w, "start": 0.4 + i * 0.4, "end": 0.7 + i * 0.4, "prob": 0.9}
              for i, w in enumerate(["Lucia", "drives", "through", "Vice", "City."])]
-GOOD = {"authenticity": "unverified", "hook_style": "question", "hook_text": "IS LUCIA BACK IN VICE CITY?",
+GOOD = {"authenticity": "unverified", "hook_style": "question", "hook_text": "LUCIA IN VICE CITY?",
         "voiceover_script": "Lucia might be back in Vice City, look at this!", "keywords": ["LUCIA", "VICE", "CITY"]}
 
 
@@ -296,14 +296,14 @@ def test_creator_clip_can_never_be_upgraded_to_official(tmp_db, tmp_path):
 def test_off_segment_hook_fails_the_overlap_check_and_is_regenerated_once_with_the_reason(tmp_db, tmp_path):
     make_item(tmp_db, tmp_path, "item_h", bind=False)
     prompts: list[tuple[str, Any]] = []
-    off = {**GOOD, "hook_text": "ONLINE MULTIPLAYER?"}          # what the TITLE is about, not the clip
+    off = {**GOOD, "hook_text": "ONLINE MODE?"}          # what the TITLE is about, not the clip
     answers = [json.dumps(off), json.dumps(GOOD), "PASS"]
     with patch("pipeline.hooks.extract_sample_frames", return_value=[b"f"]), \
          patch("pipeline.hooks._call_gemini", side_effect=_gemini(answers, prompts)):
         ok, msg = hooks.run_hooks_for_item("item_h", cfg=CFG, db_path=tmp_db)
     assert ok, msg
     assert len(prompts) == 3                    # gen, gen, check: the overlap FAIL cost no Gemini call
-    assert "PREVIOUS ATTEMPT REJECTED" in prompts[1][0] and "ONLINE MULTIPLAYER?" in prompts[1][0]
+    assert "PREVIOUS ATTEMPT REJECTED" in prompts[1][0] and "ONLINE MODE?" in prompts[1][0]
     row = db.get_item("item_h", db_path=tmp_db)
     assert row["hook_text"] == GOOD["hook_text"] and row["stage"] == "cut"
     assert json.loads(row["hook_binding"])["check"] == "segment_check"
@@ -345,7 +345,7 @@ def _tap(item_id, action, mid):
 
 def test_two_failed_hooks_go_to_a_review_card_instead_of_rendering(tmp_db, tmp_path):
     make_item(tmp_db, tmp_path, "item_h", bind=False)
-    off = {**GOOD, "hook_text": "ONLINE MULTIPLAYER?"}
+    off = {**GOOD, "hook_text": "ONLINE MODE?"}
     with patch("pipeline.hooks.extract_sample_frames", return_value=[b"f"]), \
          patch("pipeline.hooks._call_gemini", side_effect=_gemini([json.dumps(off), json.dumps(off)], [])):
         ok, msg = hooks.run_hooks_for_item("item_h", cfg=CFG, db_path=tmp_db)
@@ -365,7 +365,7 @@ def test_two_failed_hooks_go_to_a_review_card_instead_of_rendering(tmp_db, tmp_p
     assert bot.ensure_card() == "item_h"
     (method, params), = t.calls
     assert method == "sendMessage"                                         # text card: nothing was rendered
-    assert "HOOK REVIEW" in params["text"] and "ONLINE MULTIPLAYER?" in params["text"]
+    assert "HOOK REVIEW" in params["text"] and "ONLINE MODE?" in params["text"]
     assert "Lucia drives through Vice City." in params["text"]             # what the clip actually says
     assert [b["callback_data"] for row_ in params["reply_markup"]["inline_keyboard"] for b in row_] == \
         ["a:hookok:item_h", "a:no:item_h"]

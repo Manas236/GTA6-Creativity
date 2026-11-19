@@ -18,12 +18,21 @@ python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Act
 pip install -r requirements.txt
 cp .env.example .env                                 # add GEMINI_API_KEY
 python scripts/fetch_assets.py                       # CC0 music bed + asset verification
+python -c "from pipeline import content_gate as g; g.ensure_model()"  # CLIP for the content gate (~600 MB, once; else on the first cut)
 pytest                                               # zero-network suite
 python -m pipeline.runner status
 ```
 
 `ffmpeg` and `ffprobe` must be on `PATH`, built with **libass**
 (`ffmpeg -filters | grep ass`).
+
+## Content gate (gameplay only)
+
+Every clip window must be real, moving game footage: motion is measured after removing any global
+zoom/pan (so a Ken Burns slideshow is static), and a free CLIP model (ViT-B/32, ONNX on the CPU,
+MIT licence) checks each frame is gameplay rather than a tweet, article, menu, text card or facecam.
+`config.yaml -> content_gate` holds the thresholds; `python scripts/content_gate_check.py VIDEO
+--window START END` prints the scores. PLAN.md calls #195-#197.
 
 ## Style layer
 

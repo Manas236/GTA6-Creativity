@@ -6,6 +6,22 @@ The DB migration runs automatically on first start; back up `pipeline.db` first.
 
 ## 0. Laptop: what to run next
 
+### After pulling the 2026-11-19 launch-day fix pass (office PC; PLAN.md calls #195-#200)
+Make was rejecting real gameplay and delivering fewer clips than asked. Now:
+- **Content gate** (`pipeline/content_gate.py`) replaces the scene-cut "static source" floor: every
+  candidate window must be moving (after removing global zoom/pan) and mostly gameplay (free CLIP
+  ViT-B/32, ONNX on the CPU). First use downloads ~600 MB to `assets/models/clip/` (not committed):
+  `python -c "from pipeline import content_gate as g; g.ensure_model()"`. Measure any video with
+  `python scripts/content_gate_check.py VIDEO --window START END`.
+- **Make delivers N**: failed attempts are replaced, discovery widens when it runs dry, budget
+  5 x N sources; Job progress shows "x of N done · k of B source attempts" live and why each
+  attempt failed.
+- **Text at Shorts size**: captions ~90 px caps, hook ~100 px caps (2 lines), thick outlines; the
+  video band sits 60 px lower to make room for the hook (`style.zoom_fill.offset_y_px`).
+- **Review cleanup**: new stage `archived`; `python scripts/archive_review.py --before YYYY-MM-DD`
+  (stop the dashboard first) moves old Review items' files to `media/archive/<date>/`.
+- Still yours to decide: the gate has no nudity check (see PLAN.md call #197 notes / the 19 Nov report).
+
 ### After pulling the 2026-11-12 pre-launch fix pass (office PC; PLAN.md calls #173-#192)
 Four fixes + polish landed: hook/VO claim checks, Gemini outages wait instead of failing, captions
 checked against measured speech, our text moved off text burned into the source. Run, in order:

@@ -344,7 +344,9 @@ def caption_chunk_size(text: str, rs: dict[str, Any]) -> float:
         return size
     # Allow for libass glyph hinting and the rasterized outline at the fitted size.
     max_w *= 0.98
-    floor = size * 0.7
+    # At ~90 px caps one long word ("INTERNATIONALLY") needs ~0.64x to stay inside the safe width;
+    # staying inside it wins over size, so the floor is a config fraction (default 0.5, was 0.7).
+    floor = size * float(cap.get("min_scale", 0.5))
     while True:
         width = text_width_px(text, size, rs["font_path"])
         if width <= max_w:

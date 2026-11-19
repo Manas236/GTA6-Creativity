@@ -14,7 +14,7 @@ def test_hook_json_parsing_clean():
     mock_json = """{
         "authenticity": "official",
         "hook_style": "hype_analysis",
-        "hook_text": "OFFICIAL GTA 6 TRAILER BREAKDOWN",
+        "hook_text": "GTA 6 TRAILER",
         "voiceover_script": "Look closely at this incredible detail from the official trailer!"
     }"""
     with patch("pipeline.hooks._call_gemini", return_value=mock_json):
@@ -23,7 +23,7 @@ def test_hook_json_parsing_clean():
 
     assert res["authenticity"] == "official"
     assert res["hook_style"] == "hype_analysis"
-    assert res["hook_text"] == "OFFICIAL GTA 6 TRAILER BREAKDOWN"
+    assert res["hook_text"] == "GTA 6 TRAILER"
     assert "Look closely" in res["voiceover_script"]
 
 
@@ -32,7 +32,7 @@ def test_hook_json_with_markdown_code_block():
     {
         "authenticity": "unverified",
         "hook_style": "question",
-        "hook_text": "IS THIS THE NEW GTA 6 MAP",
+        "hook_text": "NEW GTA 6 MAP",
         "voiceover_script": "Could this leaked map layout actually be the real deal?"
     }
     ```"""
@@ -51,7 +51,7 @@ def test_unverified_authenticity_default_and_question_framing():
     mock_resp = """{
         "authenticity": "unknown_rumor_leak",
         "hook_style": "curiosity",
-        "hook_text": "LEAKED VICE CITY GAMEPLAY",
+        "hook_text": "VICE CITY HEIST",
         "voiceover_script": "Check out this leaked clip from Vice City!"
     }"""
     with patch("pipeline.hooks._call_gemini", return_value=mock_resp):
@@ -221,7 +221,7 @@ def test_grounding_unexpected_reply_is_not_grounded():
 
 # ============================================================ the hooks stage
 
-GOOD = {"authenticity": "unverified", "hook_style": "question", "hook_text": "IS LUCIA BACK IN VICE CITY?",
+GOOD = {"authenticity": "unverified", "hook_style": "question", "hook_text": "LUCIA IN VICE CITY?",
         "voiceover_script": "Lucia might be back in Vice City, look at this!", "keywords": ["LUCIA", "VICE", "CITY"],
         "keywords_source": "gemini"}
 WORDS = [{"word": "Lucia", "start": 0.4, "end": 0.8, "prob": 0.9},
@@ -378,10 +378,10 @@ def test_gemini_retries_the_quality_of_life_hook_with_measured_budget():
 
     raw = {"authenticity": "unverified", "hook_style": "question", "voiceover_script": "Look at Lucia."}
     long = json.dumps({**raw, "hook_text": "QUALITY OF LIFE IMPROVEMENTS COMING?"})
-    short = json.dumps({**raw, "hook_text": "WHO IS LUCIA CAMINOS?"})
+    short = json.dumps({**raw, "hook_text": "WHO IS LUCIA?"})
     with patch.object(hooks, "_call_gemini", side_effect=[long, short]) as model:
         result = hooks.generate_hook_and_voiceover("unused.mp4", "GTA 6", frames=[b"f"], api_key="test")
-    assert result["hook_text"] == "WHO IS LUCIA CAMINOS?"
+    assert result["hook_text"] == "WHO IS LUCIA?"
     assert model.call_count == 2
     budget = hook_character_budget(render_settings())
     assert f"at most {budget} characters" in model.call_args.args[0]

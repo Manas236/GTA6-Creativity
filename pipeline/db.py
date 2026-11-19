@@ -28,6 +28,7 @@ STAGES = [
     "cleaned",
     "rejected",
     "failed",
+    "archived",       # taken out of Review by scripts/archive_review.py; its files moved to media/archive/<date>/
 ]
 
 SCHEMA = """

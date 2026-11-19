@@ -61,10 +61,27 @@ def test_select_best_cut_window_within_bounds(temp_synthetic_video: Path):
     assert end_s <= 28.0
 
 
-def test_static_source_floor_rejection(temp_static_video: Path):
-    """Static source with no scene cuts (< 0.05 cuts/sec) must be rejected."""
+def test_scene_cut_count_no_longer_rejects_a_source(temp_static_video: Path):
+    """Counting hard cuts rejected live streams (one continuous camera, 0 cuts). scan_cut_windows
+    only rejects a source that is too short now; pipeline.content_gate judges what is on screen."""
     res = cut.select_best_cut_window(temp_static_video)
-    assert res is None
+    assert res is not None
+
+
+@pytest.mark.content_gate
+def test_static_source_fails_the_content_gate_on_motion(temp_static_video: Path):
+    from pipeline import content_gate
+
+    class AllGame:          # even if CLIP said "gameplay", a still picture must fail on motion
+        def probs(self, frames):
+            import numpy as np
+            p = np.zeros((len(frames), len(content_gate.PROMPTS)), dtype=np.float32)
+            p[:, 0] = 1.0
+            return p
+
+    tl = content_gate.scan(temp_static_video, model=AllGame())
+    v = content_gate.verdict(tl)
+    assert not v["ok"] and v["motion_share"] == 0.0 and v["reason"].startswith("static")
 
 
 def test_cut_level_dedupe_detects_duplicate(tmp_db: Path):

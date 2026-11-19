@@ -52,6 +52,44 @@ discovery:
   rolling_pool_size: 100
   score_formula: >
     (percentile_rank ** velocity_power) * (0.5 ** (age_hours / half_life_hours)) * effective_weight
+  # Make jobs (pipeline/creation.py) widen discovery when its candidates run out before N clips are
+  # delivered. Each round adds to the normal settings above (cumulative: round 2 keeps round 1's).
+  widen:
+    - youtube_queries: ["GTA 6 gameplay walkthrough", "GTA 6 stream highlights", "GTA 6 funny moments",
+                        "GTA 6 gameplay PS5", "GTA VI clip"]
+      youtube_date_queries: ["GTA 6 gameplay", "GTA 6 stream"]
+      youtube_max_results_per_query: 15
+      twitch_lookback_hours: 168 # 7 days
+      twitch_limit: 100
+    - youtube_queries: ["GTA 6 mission", "GTA 6 car chase", "GTA 6 police chase", "GTA 6 open world",
+                        "GTA 6 first hour"]
+      youtube_date_queries: ["GTA VI", "Grand Theft Auto VI gameplay"]
+      youtube_max_results_per_query: 20
+      twitch_lookback_hours: 720 # 30 days
+
+# Make (dashboard): N clips asked = N clips delivered. Failed attempts are replaced by the next
+# discovery candidate until N passed every gate and rendered, or this many sources per clip were tried.
+make:
+  sources_per_clip: 5
+
+# What is on screen (pipeline/content_gate.py): replaces the old scene-cut "static source" floor.
+# Every candidate WINDOW must be moving (real motion after removing a global zoom/pan) and mostly
+# gameplay (free CLIP ViT-B/32 zero-shot, ONNX on the CPU; ~600 MB in assets/models/clip, fetched on
+# first use). The whole source gets the looser source_* floors first, before it is transcribed.
+# Calibrated on 19 Nov (PLAN.md calls #195-#197): ohnePixel 60 s club clip passes (motion 0.90+,
+# gameplay 1.00), tweet / article / menu / title-card windows fail.
+content_gate:
+  enabled: true
+  fps: 2.0 # motion samples per second
+  pixel_delta: 6 # grey-level change left after global alignment that counts a pixel as changed
+  moving_frac: 0.10 # a sample moves when this share of its pixels still changed
+  min_motion_share: 0.60 # a window needs this share of its samples moving
+  clip_every_s: 1.0 # one CLIP frame (3 crops) per this many seconds
+  game_prob: 0.50 # a CLIP frame is gameplay when P(game prompts) >= this
+  min_game_share: 0.60 # a window needs this share of its CLIP frames to be gameplay
+  source_min_game_share: 0.15 # whole source, before transcription
+  source_min_motion_share: 0.15
+  model_dir: "assets/models/clip"
 
 dedupe:
   crop_black_bars: true
@@ -80,7 +118,8 @@ cut:
   audio_weight: 0.75
   scene_weight: 0.25
   intro_outro_penalty_pct: 0.05
-  min_scene_change_density: 0.05 # Minimum scene cut density to reject static videos
+  # (min_scene_change_density removed 19 Nov: counting hard cuts rejected live streams and passed
+  # screenshot montages. Static / not-gameplay sources are judged by content_gate below.)
   # A cut may only END after a completed sentence (pipeline/endings.py). The cut stage
   # transcribes each candidate window (faster-whisper, same model as hooks) plus a tail;
   # a window whose 18-30 s end range has no sentence break is skipped for the next-best
@@ -248,13 +287,16 @@ render:
     y_min: 250
     y_max: 1440
   # libass sizes the font so (winAscent + winDescent) = Fontsize; for Montserrat that gives
-  # cap height = 0.448 x Fontsize. 138 -> ~62 px caps, 150 -> ~67 px caps (measured).
+  # cap height = 0.448 x Fontsize. 202 -> ~90 px caps, 224 -> ~100 px caps (measured).
+  # 19 Nov: captions 62 -> 90 px caps and the hook 67 -> 100 px caps (Shorts/Reels size), thicker
+  # outlines. At 90 px a caption line holds ~9-10 characters, so most lines are 1-2 words (max 3).
   caption:
-    font_size: 138
-    outline: 7
-    shadow: 3
+    font_size: 202
+    outline: 11
+    shadow: 4
     max_words: 3
     max_gap_s: 0.6
+    min_scale: 0.5 # a single word too wide for the safe area shrinks, down to this fraction (fits always beats size)
     center_y: 1300
     color: "&H00FFFFFF" # white
     highlight_color: "&H0000FFFF" # yellow (ASS is &HAABBGGRR)
@@ -282,19 +324,19 @@ render:
     char_height_spread: 0.35 # ...of similar height (fraction of the median)...
     baseline_spread: 0.25 # ...on one baseline (fraction of the median height)
   hook:
-    font_size: 150
-    min_font_size: 96 # hard minimum for rendered hooks
-    warn_below_font_size: 130 # ask Gemini for a shorter hook
-    outline: 8
-    shadow: 3
+    font_size: 224 # ~100 px caps; 2 lines of ~9 characters (the Gemini prompt's per-line budget follows this)
+    min_font_size: 150 # ~67 px caps (the old hook size): a longer hook Gemini could not shorten is shrunk to fit, never below this
+    warn_below_font_size: 212 # ~95 px caps: below this Gemini is asked for a shorter hook first
+    outline: 12
+    shadow: 4
     max_lines: 2
     # Band moved up (was 280-560) so the 2 hook lines clear the zoom-to-fill video top
     # edge at y=534; only used when the style layer does not re-place the band itself.
-    band_top_y: 260
-    band_bottom_y: 500
-    # 1.75 x cap height -> ~118 px pitch, ~29 px between the two lines' outlines
-    # (1.45 left only ~9 px, so the outlines nearly touched).
-    line_spacing: 1.75
+    band_top_y: 280
+    band_bottom_y: 560
+    # 1.5 x cap height -> ~150 px pitch at 100 px caps, ~18 px between the two lines' outlines
+    # (min_line_gap_px below keeps that floor whatever the size).
+    line_spacing: 1.55
     # Floor on the gap: outline/shadow are absolute px, so on a hook that had to shrink
     # a cap-height multiple alone collapses to ~3 px between the outlines.
     min_line_gap_px: 18
@@ -340,6 +382,7 @@ style:
     motion_step_s: 0.2 # frame-difference sampling step
     min_segment_s: 1.2 # scene cuts closer than this do not start a new segment
     edge_clearance_px: 40 # text must clear every video edge by this much
+    offset_y_px: 60 # video band 60 px below centre (594-1446 when filling): room for the 2-line 100 px hook above it
 
   # M1 -- caption pop-in --------------------------------------------------------------
   caption_pop:

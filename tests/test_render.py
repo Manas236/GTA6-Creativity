@@ -142,7 +142,7 @@ def test_build_ass_subtitles_with_speech_highlight_and_chunks():
 
 
 def test_ass_styles_use_configured_sizes_and_font():
-    ass_text = render.build_ass_subtitles("VICE CITY LOOKS INSANE", 10.0, SAMPLE_WORDS)
+    ass_text = render.build_ass_subtitles("VICE CITY", 10.0, SAMPLE_WORDS)
     hook, cap = _style(ass_text, "Hook"), _style(ass_text, "Caption")
     # Format: Name, Fontname, Fontsize, Primary, Secondary, Outline, Back, Bold, ..., Outline(16), Shadow(17)
     assert hook[1] == cap[1] == RS["font_name"] == "Montserrat Black"
@@ -150,8 +150,9 @@ def test_ass_styles_use_configured_sizes_and_font():
     assert int(hook[2]) == RS["hook"]["font_size"]  # short hook: no shrink
     assert cap[3] == RS["caption"]["color"] == "&H00FFFFFF"
     assert hook[3] == RS["hook"]["color"] == "&H0000FFFF"
-    assert float(cap[16]) == RS["caption"]["outline"] and 6 <= RS["caption"]["outline"] <= 8
-    assert float(hook[16]) == RS["hook"]["outline"] and 7 <= RS["hook"]["outline"] <= 9
+    # 19 Nov: thick Shorts-style outlines on the bigger text (were 7 / 8)
+    assert float(cap[16]) == RS["caption"]["outline"] and 10 <= RS["caption"]["outline"] <= 12
+    assert float(hook[16]) == RS["hook"]["outline"] and 11 <= RS["hook"]["outline"] <= 13
     assert float(cap[17]) > 0 and float(hook[17]) > 0  # small shadow
     assert (ROOT / RS["font_path"]).name == "Montserrat-Black.ttf"
     assert (ROOT / "assets/fonts/OFL.txt").exists()
@@ -165,20 +166,21 @@ def test_config_sizes_flow_through(monkeypatch):
 
 
 def test_layout_hook_max_two_lines_inside_safe_width():
-    long_hook = "Nobody noticed this GTA 6 detail"
+    long_hook = "NOBODY NOTICED THIS?"
     lines, size = render.layout_hook(long_hook, RS)
     assert 1 <= len(lines) <= 2
     max_w = (SA["x_max"] - SA["x_min"]) - 2 * (RS["hook"]["outline"] + RS["hook"]["shadow"])
     assert all(render.text_width_px(l, size, RS["font_path"]) <= max_w for l in lines)
     assert size < RS["hook"]["font_size"]  # had to shrink
+    assert size >= RS["hook"]["min_font_size"]
+    # 19 Nov sizes: 224 (~100 px caps) holds ~10 characters a line; never below min_font_size (150).
     lines, size = render.layout_hook("IS THIS REAL?", RS)
-    assert lines == ["IS THIS REAL?"] and size == RS["hook"]["font_size"]
+    assert lines == ["IS THIS", "REAL?"] and size == RS["hook"]["font_size"] == 224
     _, size = render.layout_hook("WHO IS LUCIA CAMINOS?", RS)
-    assert size == 150
-    _, size = render.layout_hook("QUALITY OF LIFE IMPROVEMENTS COMING?", RS)
-    assert size == 96
-    with pytest.raises(render.HookTooLong, match="hook too long"):
-        render.layout_hook("TAKE-TWO CONFIRMS GTA 6 RELEASE DATE AGAIN?", RS)
+    assert size == 174
+    for too_long in ("QUALITY OF LIFE IMPROVEMENTS COMING?", "TAKE-TWO CONFIRMS GTA 6 RELEASE DATE AGAIN?"):
+        with pytest.raises(render.HookTooLong, match="hook too long"):
+            render.layout_hook(too_long, RS)
 
 
 def test_long_caption_shrinks_only_its_chunk(tmp_path, caplog):
@@ -188,9 +190,10 @@ def test_long_caption_shrinks_only_its_chunk(tmp_path, caplog):
     ass = render.build_ass_subtitles("HOOK", 2.0, words)
     caption_events = [line for line in ass.splitlines() if line.startswith("Dialogue: 1,")]
     size = float(re.search(r"\\fs([\d.]+)", caption_events[0]).group(1))
-    assert RS["caption"]["font_size"] * 0.7 < size < RS["caption"]["font_size"]
+    floor = RS["caption"]["font_size"] * RS["caption"]["min_scale"]
+    assert floor < size < RS["caption"]["font_size"]
     assert r"\fs" not in caption_events[1]
-    assert r"\fs96.6" in caption_events[2]
+    assert f"\\fs{floor:g}" in caption_events[2]   # the min_scale floor
     assert "exceeds safe width" in caplog.text
     img = _render_ass_frame(ass, tmp_path)
     x0, _, x1, _ = _ink_bbox(img, rows=slice(1170, 1440))
@@ -241,7 +244,7 @@ def test_libass_uses_black_weight(tmp_path: Path):
 
 
 def test_cap_heights_match_targets(tmp_path: Path):
-    """Measured cap heights: captions ~60-65 px, hook ~65-70 px."""
+    """Measured cap heights: captions ~90 px, hook ~100 px (19 Nov: Shorts/Reels size; were 62 / 67)."""
     measured = {}
     for key, style in (("caption", "Caption"), ("hook", "Hook")):
         ass_text = render.build_ass_subtitles("H", 1.0, [], cfg=None)
@@ -252,8 +255,8 @@ def test_cap_heights_match_targets(tmp_path: Path):
         img = _render_ass_frame(ass_text, tmp_path, bg="black")
         ys = np.where((img.mean(axis=2) > 128).any(axis=1))[0]
         measured[key] = ys.max() - ys.min() + 1
-    assert 60 <= measured["caption"] <= 65, measured
-    assert 65 <= measured["hook"] <= 70, measured
+    assert 88 <= measured["caption"] <= 93, measured
+    assert 98 <= measured["hook"] <= 103, measured
 
 
 def test_caption_and_hook_inside_instagram_safe_area(tmp_path: Path):
@@ -262,7 +265,7 @@ def test_caption_and_hook_inside_instagram_safe_area(tmp_path: Path):
         {"word": "WORLDBUILDING", "start": 0.45, "end": 0.9},
         {"word": "EVERYWHERE", "start": 0.95, "end": 1.5},
     ]
-    long_hook = "Nobody noticed this GTA 6 detail"
+    long_hook = "NOBODY NOTICED THIS?"
     ass_text = render.build_ass_subtitles(long_hook, 2.0, words)
     img = _render_ass_frame(ass_text, tmp_path)
 
@@ -376,7 +379,8 @@ def test_render_sidecar_matches_verified_a_and_b(renders):
         meta = render_meta.read(video)
         assert meta["preset"] == "P2"
         assert meta["hook_text"] == hook
-        assert meta["hook_font_px"] == 150 and meta["hook_lines"] == [hook]
+        lines, px = render.layout_hook(hook, RS)
+        assert meta["hook_font_px"] == px == RS["hook"]["font_size"] and meta["hook_lines"] == lines
         assert not meta["hook_below_floor"]
         assert meta["duration_s"] == pytest.approx(render.media_duration(video), abs=0.05)
         assert meta["caption_words"]
@@ -389,7 +393,10 @@ def test_render_sidecar_matches_verified_a_and_b(renders):
 def test_variant_b_first_frame_is_frozen(renders):
     b, freeze = renders["B"], renders["freeze"]
     f1, f2 = _frame(b, 0.1), _frame(b, freeze - 0.2)
-    assert np.abs(f1 - f2).mean() < 1.0  # still image during the freeze
+    # Still picture during the freeze. Compared above the caption rows: the burned-in VO captions
+    # change word by word during the freeze, and at 90 px they alone move the whole-frame mean.
+    rows = slice(int(f1.shape[0] * 760 / 1920), int(f1.shape[0] * 1180 / 1920))
+    assert np.abs(f1[rows] - f2[rows]).mean() < 1.0
     g1, g2 = _frame(b, freeze + 0.5), _frame(b, freeze + 1.5)
     assert np.abs(g1 - g2).mean() > 1.0  # motion resumes after the freeze
 

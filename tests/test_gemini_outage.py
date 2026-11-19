@@ -19,7 +19,7 @@ BACKOFF = [float(s) for s in hooks.gemini_settings(CFG)["transient_backoff_s"]]
 
 WORDS = [{"word": w, "start": 0.4 * i, "end": 0.4 * i + 0.3, "prob": 0.9}
          for i, w in enumerate("Lucia drives through Vice City at night.".split())]
-GOOD = {"authenticity": "unverified", "hook_style": "question", "hook_text": "IS LUCIA BACK IN VICE CITY?",
+GOOD = {"authenticity": "unverified", "hook_style": "question", "hook_text": "LUCIA IN VICE CITY?",
         "voiceover_script": "Lucia might be back in Vice City, look at this!", "keywords": ["LUCIA", "VICE", "CITY"]}
 
 

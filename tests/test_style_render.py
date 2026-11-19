@@ -170,7 +170,7 @@ def test_safe_area_placement_after_f1_in_real_libass(tmp_path: Path):
         {"word": "UNBELIEVABLE", "start": 0.0, "end": 0.4},
         {"word": "WORLDBUILDING", "start": 0.45, "end": 0.9},
     ]
-    long_hook = "Nobody noticed this GTA 6 detail"
+    long_hook = "NOBODY NOTICED THIS?"
     segs = [edits.Segment(0.0, 2.0, "fit"), edits.Segment(2.0, 4.0, "fill")]
     sp = planning.plan_from_words(long_hook, 4.0, words, preset="P1", segments=segs,
                                   channel_name="GamingBolt")
@@ -192,7 +192,7 @@ def test_safe_area_placement_after_f1_in_real_libass(tmp_path: Path):
 
 def test_hook_two_line_outlines_do_not_touch(tmp_path: Path):
     """There must be a clear background gap between the two hook lines."""
-    long_hook = "Nobody noticed this GTA 6 detail"
+    long_hook = "NOBODY NOTICED THIS?"
     sp = planning.plan_from_words(long_hook, 3.0, [], preset="P0")
     assert len(sp.hook_lines) == 2
     img = _render_ass_frame(render.build_ass_subtitles(long_hook, 3.0, [], sp=sp), tmp_path)

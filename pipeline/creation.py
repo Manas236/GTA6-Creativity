@@ -128,6 +128,125 @@ class StopRequested(Exception):
     pass
 
 
+# An attempt "delivered" a clip once it passed every gate and rendered (Review shows it).
+DELIVERED = ("rendered", "awaiting_approval", "approved", "queued", "posted", "measured")
+UNFINISHED = ("discovered", "downloaded", "cut")
+
+
+def _job_items(job_id, path):
+    with db.db(path) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, stage, original_title, author_name, rejection_reason, error_message, hook_review "
+            "FROM items WHERE creation_job=? ORDER BY created_at, rowid", (job_id,))]
+
+
+def _set_result(job_id, text, path):
+    with db.db(path) as conn:
+        conn.execute("UPDATE dashboard_commands SET result=? WHERE id=?", (text[:500], job_id))
+
+
+def attempt_outcome(item):
+    """One line: why this attempt did not (or did) deliver a clip."""
+    stage = item["stage"]
+    if stage in DELIVERED:
+        return "delivered"
+    if stage == "needs_review":
+        try:
+            reason = json.loads(item.get("hook_review") or "{}").get("reason") or ""
+        except ValueError:
+            reason = ""
+        return f"hook failed its check twice (in Needs a decision): {reason}".strip()
+    return item.get("rejection_reason") or item.get("error_message") or stage
+
+
+def make_clips(job_id, target, cfg, path, *, produce=None, discover_round=None):
+    """Keep going until `target` clips passed every gate and rendered.
+
+    A failed attempt (download, gameplay gate on every window, no clean ending, duplicate, hook
+    check, render) is replaced by the next discovery candidate. When the candidates run out,
+    discovery is widened (`discovery.widen`: more queries, a longer age window) and continues.
+    Budget: `make.sources_per_clip` x target candidate sources (default 5 x N); only when it is
+    used up - or every widening round is dry - does the job end with fewer. Progress is written to
+    the job's result as it goes ("x of N done · k of B source attempts"); returns (done, message).
+    """
+    produce = produce or (lambda item_id: _produce(item_id, cfg, path))
+    discover_round = discover_round or (lambda level: _discover_round(cfg, path, level))
+    per_clip = int((cfg.get("make") or {}).get("sources_per_clip", 5))
+    budget = max(target, per_clip * target)
+    rounds = 1 + discover_levels(cfg)
+    level, pool, attempted = 0, [], set()
+    stop_reason = None
+
+    def report(doing=""):
+        items = _job_items(job_id, path)
+        done = sum(i["stage"] in DELIVERED for i in items)
+        _set_result(job_id, f"{done} of {target} done · {len(items)} of {budget} source attempts"
+                    + (f" · {doing}" if doing else ""), path)
+        return items, done
+
+    while True:
+        if runner.stopping(path):
+            raise StopRequested()
+        items, done = report()
+        if done >= target:
+            break
+        # A resumed job first finishes its own unfinished attempts (each at most once per run).
+        todo = next((i for i in items if i["stage"] in UNFINISHED and i["id"] not in attempted), None)
+        if todo is None:
+            if len(items) >= budget:
+                stop_reason = (f"the budget of {budget} candidate sources ({per_clip} x {target}) is used up")
+                break
+            while not pool and level < rounds:
+                report(f"discovering sources (round {level + 1} of {rounds})")
+                pool = list(discover_round(level))
+                level += 1
+            if not pool:
+                stop_reason = f"discovery ran dry after {rounds} round(s), widened each time"
+                break
+            candidate = pool.pop(0)
+            if not discover_insert(candidate, job_id, path):
+                continue
+            todo = {"id": candidate["id"], "original_title": candidate.get("original_title"),
+                    "author_name": candidate.get("author_name")}
+        attempted.add(todo["id"])
+        report(f"attempt {len(attempted)}: {todo.get('author_name') or ''} · {todo.get('original_title') or ''}")
+        produce(todo["id"])
+        item = db.get_item(todo["id"], path) or {}
+        if item.get("stage") in UNFINISHED and hooks_quota_exhausted():
+            stop_reason = "Gemini's daily quota is used up, so no hook can be written until it resets"
+            break
+    items, done = report()
+    lines = [f"{i.get('author_name') or '?'} · {i.get('original_title') or '?'}: {attempt_outcome(i)}"
+             for i in items if i["stage"] not in DELIVERED]
+    if done >= target:
+        msg = f"{done} of {target} done in {len(items)} source attempt(s)."
+    else:
+        msg = f"{done} of {target} done after {len(items)} source attempt(s): {stop_reason}."
+    log.info("Make job %s: %s%s", job_id, msg, "".join("\n  - " + line for line in lines))
+    return done, msg
+
+
+def discover_levels(cfg):
+    return discover.widen_levels(cfg)
+
+
+def _discover_round(cfg, path, level):
+    """Scored candidates not yet in the DB, best first, for widening round `level` (0 = normal)."""
+    found = discover.scored_candidates(discover.widened_config(cfg, level), path)
+    log.info("Make discovery round %d: %d new candidate(s)", level + 1, len(found))
+    return found
+
+
+def discover_insert(candidate, job_id, path):
+    return discover.insert_for_job(candidate, job_id, path)
+
+
+def hooks_quota_exhausted():
+    from . import hooks
+    blocked = getattr(hooks, "_QUOTA_BLOCKED_UNTIL", None)
+    return bool(blocked is not None and blocked > hooks._now())
+
+
 def run_jobs(cfg, path, only=None):
     from dashboard import commands
     from dashboard.store import transaction
@@ -149,16 +268,22 @@ def run_jobs(cfg, path, only=None):
                 conn.execute("UPDATE dashboard_commands SET status='running' WHERE id=?", (job_id,))
                 if action in ITEM_JOBS and job["status"] == "pending":
                     commands.apply(dict(job), cfg, path)
+            if action == "make" and not demo:
+                # N asked = N delivered: replace failed attempts until N clips rendered (or the budget ends).
+                runner.set_stage("discover", path)
+                done, message = make_clips(job_id, int(payload["count"]), cfg, path)
+                status = "applied" if done >= int(payload["count"]) else "failed"
+                with db.db(path) as conn:
+                    conn.execute("UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
+                                 (status, message[:500], db.now(), job_id))
+                continue
             with db.db(path) as conn:
                 ids = [row[0] for row in conn.execute("SELECT id FROM items WHERE creation_job=?", (job_id,))]
             if not ids:
                 if action == "make":
                     runner.set_stage("discover", path)
-                    if demo:
-                        from scripts.dashboard_demo_db import stub_discovery
-                        ids = stub_discovery(payload["count"], job_id, path)
-                    else:
-                        ids = [x["id"] for x in discover.run_discovery(cfg, path, limit=payload["count"], job_id=job_id)]
+                    from scripts.dashboard_demo_db import stub_discovery
+                    ids = stub_discovery(payload["count"], job_id, path)
                 elif action == "clip_url":
                     ids = [insert_manual(payload, job_id, path)]
             for item_id in ids:

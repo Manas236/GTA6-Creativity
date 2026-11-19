@@ -39,7 +39,10 @@ checks, scheduling and publishing.
   hype. The version switcher keeps the player's position. Use 1–3 to switch
   presets on new clips. On legacy clips, 1 and 2 approve the Captions version
   or Voiceover version respectively. The question-mark button lists the
-  other shortcuts. Use Z to undo reversible changes.
+  other shortcuts. Use Z to undo reversible changes. Items archived with
+  `python scripts/archive_review.py --before YYYY-MM-DD` (stage `archived`, files
+  moved to `media/archive/<date>/`, never deleted) are in no Review tab; the
+  Library still lists them. All pre-launch Review items were archived on 19 Nov.
 - **Library** supports search, filters, and bulk deletion or rejection.
 - **Queue** shows a seven-day calendar with open times. Drag an approved
   clip onto an empty slot, or switch to List view. Scheduled times use the
@@ -227,6 +230,17 @@ With a loop running, creation starts at the next discover stage. Otherwise a det
 `python -m pipeline.runner make --job ...` process acquires the lock and takes
 the requested clips through download, cut, hook, voiceover, render and the
 review hand-off. That worker has no posting, measuring or cleanup phase.
+
+**N asked = N delivered.** Make keeps going until N clips passed every gate and
+rendered. A failed attempt is replaced by the next discovery candidate; when the
+candidates run out, discovery widens (more queries, a longer Twitch age window;
+`discovery.widen`). It stops early only after `make.sources_per_clip` (5) x N
+candidate sources, or when Gemini's daily quota is gone. Job progress shows
+"x of N done · k of B source attempts" and the attempt in hand, live, and one row
+per attempt with its own source length, cut window, time and the reason it failed.
+Every candidate window must pass the content gate (real motion and mostly gameplay,
+`pipeline/content_gate.py`): a tweet, article, menu, text card or facecam window is
+skipped for the next window of the same source, then for the next source.
 **Remake cut** excludes windows that overlap at least half of the new window
 with the old cut. It downloads the source again if render retention purged it.
 **Regenerate hook** keeps the cut, regenerates the hook/voiceover, and renders

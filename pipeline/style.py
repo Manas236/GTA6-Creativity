@@ -75,6 +75,7 @@ STYLE_DEFAULTS: dict[str, Any] = {
         "motion_step_s": 0.2,
         "min_segment_s": 1.2,
         "edge_clearance_px": 40,
+        "offset_y_px": 0,       # the video band sits this far below the canvas centre
     },
     # M1 ------------------------------------------------------------------
     "caption_pop": {"from_scale": 80, "peak_scale": 115, "peak_ms": 60, "settle_ms": 160},
@@ -272,6 +273,7 @@ def fill_geometry(rs: dict[str, Any], ss: dict[str, Any]) -> FillGeometry:
     canvas_h = _even(fill_h * sup)
     content_h = _even(canvas_w * 9 / 16)
     fill_zoom = canvas_h / content_h
+    top = foreground_top(rs, ss, fill_h)
     return FillGeometry(
         out_w=W,
         fit_h=fit_h,
@@ -280,11 +282,25 @@ def fill_geometry(rs: dict[str, Any], ss: dict[str, Any]) -> FillGeometry:
         canvas_h=canvas_h,
         content_h=content_h,
         fill_zoom=round(fill_zoom, 6),
-        band_top_fill=(H - fill_h) // 2,
-        band_bottom_fill=(H - fill_h) // 2 + fill_h,
-        band_top_fit=(H - fill_h) // 2 + (fill_h - fit_h) // 2,
-        band_bottom_fit=(H - fill_h) // 2 + (fill_h - fit_h) // 2 + fit_h,
+        band_top_fill=top,
+        band_bottom_fill=top + fill_h,
+        band_top_fit=top + (fill_h - fit_h) // 2,
+        band_bottom_fit=top + (fill_h - fit_h) // 2 + fit_h,
     )
+
+
+def foreground_offset(ss: dict[str, Any]) -> int:
+    """How far below the canvas centre the video band sits (`zoom_fill.offset_y_px`, even px).
+
+    The 1080x1920 canvas has IG's caption/username UI over its bottom ~25 %, so the black space
+    under a centred 16:9 band is mostly wasted while the hook above it was squeezed into 244 px.
+    Moving the band down gives the big two-line hook room above the video (19 Nov)."""
+    return _even(float((ss.get("zoom_fill") or {}).get("offset_y_px", 0) or 0))
+
+
+def foreground_top(rs: dict[str, Any], ss: dict[str, Any], fg_h: int) -> int:
+    """Top y of a `fg_h`-tall foreground layer on the output canvas (render, textdetect, layout)."""
+    return (int(rs["height"]) - int(fg_h)) // 2 + foreground_offset(ss)
 
 
 # --------------------------------------------------------------------------------------

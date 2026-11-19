@@ -994,11 +994,19 @@ function updateMakeProgress() {
   patchMarkup(progress, panelHead("Job progress", current ? (current.result || commandState(current)) : "Start a job to track each clip.",
     jobs.length > 1 ? `<select id="job-select" aria-label="Choose job">${jobs.map((job) =>
       `<option value="${escape(job.id)}" ${job.id === current.id ? "selected" : ""}>${escape(labels[job.action])} · ${formatTime(job.created_at)} · ${commandState(job)}</option>`).join("")}</select>` : "") +
-    items.map((item) => {
-      const elapsed = Math.max(0, Math.floor((Date.parse(current.completed_at || new Date().toISOString()) - Date.parse(current.created_at)) / 1000));
-      return `<div class="health-row"><a href="${itemLink(item.id)}">${escape(item.original_title)}</a>
-        <span>${isReviewItem(item) ? `<a href="${reviewLink(item.id)}">Ready for review</a>` : pill(pretty(item.creation_phase || item.stage))}
-        · ${elapsed}s ${escape(item.error_message || item.rejection_reason || "")}
+    items.slice().reverse().map((item, index) => {
+      // Each row's OWN numbers: the source's length and how long this attempt has taken. (It used
+      // to print the job's total time on every row, so every attempt showed the same "635s".)
+      const finished = !item.creation_phase && !["discovered", "downloaded", "cut"].includes(item.stage);
+      const took = Math.max(0, Math.round((Date.parse(finished ? item.stage_updated_at : new Date().toISOString()) - Date.parse(item.created_at)) / 1000));
+      const length = Number(item.original_duration) > 0 ? `${Math.round(Number(item.original_duration))} s source` : "";
+      const cut = item.cut_start != null && item.cut_end != null ? `window ${Number(item.cut_start).toFixed(1)}–${Number(item.cut_end).toFixed(1)} s` : "";
+      const status = ["rendered", "awaiting_approval"].includes(item.stage) ? `<a href="${reviewLink(item.id)}">Ready for review</a>`
+        : item.stage === "needs_review" ? `<a href="${reviewLink(item.id)}">${pill("Needs a decision", "amber")}</a>`
+        : pill(pretty(item.creation_phase || item.stage), item.stage === "rejected" || item.stage === "failed" ? "red" : "");
+      const why = item.stage === "needs_review" ? `Hook failed its check twice: ${item.review_reason || ""}` : (item.error_message || item.rejection_reason || "");
+      return `<div class="health-row"><span>#${index + 1} <a href="${itemLink(item.id)}">${escape([item.author_name, item.original_title].filter(Boolean).join(" · "))}</a></span>
+        <span>${status} · ${escape([length, cut, `${took} s`].filter(Boolean).join(" · "))} ${escape(why)}
         ${item.actions.includes("retry") ? button("retry", item.id, "Retry") : ""}</span></div>`;
     }).join(""));
 }

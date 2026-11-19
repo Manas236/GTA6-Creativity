@@ -61,10 +61,14 @@ def state(path, cfg, media_root=None):
                 """SELECT id, source, author_name, original_title, stage,
             discovery_score, hook_text, hook_style, authenticity, chosen_variant, preview_only,
             error_stage, error_message, rejection_reason, created_at, stage_updated_at,
-            cut_signal, source_platform, creation_job, creation_phase, cut_path, cut_start, source_url, voiceover_script
+            cut_signal, source_platform, creation_job, creation_phase, cut_path, cut_start, source_url, voiceover_script,
+            original_duration, cut_end, updated_at, hook_review
             FROM items ORDER BY created_at DESC"""
             )
         ]
+        for item in items:
+            # Job progress shows why a Make attempt stopped; needs_review keeps its reason in hook_review.
+            item["review_reason"] = decode(item.pop("hook_review")).get("reason")
         posts = [
             dict(r)
             for r in conn.execute(

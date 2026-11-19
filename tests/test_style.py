@@ -107,10 +107,12 @@ def test_f1_geometry_fill_is_a_centre_crop_of_the_fit():
     assert GEO.fill_h / GEO.fit_h == pytest.approx(SS["zoom_fill"]["fill_scale"], abs=0.005)
     assert GEO.fill_zoom == pytest.approx(GEO.canvas_h / GEO.content_h)
     assert GEO.fill_zoom == pytest.approx(GEO.fill_h / GEO.fit_h, abs=0.002)
-    assert GEO.band("fill") == (534, 1386) and GEO.band("fit") == (656, 1264)
+    # 19 Nov: the band sits zoom_fill.offset_y_px (60) below centre, so the big hook fits above it.
+    assert SS["zoom_fill"]["offset_y_px"] == 60
+    assert GEO.band("fill") == (594, 1446) and GEO.band("fit") == (716, 1324)
     # The fill crops the sides only: at fill_zoom the visible width is 1/1.4 of the frame.
     assert GEO.canvas_w / GEO.fill_zoom / GEO.canvas_w == pytest.approx(1 / GEO.fill_zoom)
-    assert GEO.edges(["fill", "fit"]) == [534, 656, 1264, 1386]
+    assert GEO.edges(["fill", "fit"]) == [594, 716, 1324, 1446]
 
 
 def test_f1_zoom_program_crossfades_between_modes():
@@ -163,7 +165,7 @@ def test_safe_area_prefers_the_configured_caption_y_when_it_is_valid():
     mixed = style.plan_layout(["fill", "fit"], 150, 2, RS, SS, cap_height_px)
     assert mixed.caption_center_y != 1300 and any("captions moved" in n for n in mixed.notes)
     # It is the NEAREST valid centre, so it stays as low in frame as the edges allow.
-    assert mixed.caption_center_y == 1183
+    assert mixed.caption_center_y == 1223
 
 
 def test_hook_lines_have_enough_spacing_that_outlines_cannot_touch():
@@ -173,7 +175,8 @@ def test_hook_lines_have_enough_spacing_that_outlines_cannot_touch():
     pitch = cap * RS["hook"]["line_spacing"]
     ink = 2 * style.ink_half_height(cap, RS["hook"]["outline"], RS["hook"]["shadow"])
     assert pitch - ink >= 20, f"only {pitch - ink:.1f}px between the hook lines' outlines"
-    assert RS["hook"]["line_spacing"] >= 1.7
+    # 19 Nov: 1.55 at ~100 px caps (the 2-line block must fit above the video); the gap check above holds.
+    assert RS["hook"]["line_spacing"] >= 1.5
 
 
 # ============================================================ C1 keyword colour

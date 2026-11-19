@@ -387,7 +387,7 @@ nothing specific, write an honest generic question hook instead.
 
 TASK 2: WRITE HOOK
 - Hook style: Choose one of "curiosity", "question", or "hype_analysis".
-- Hook text: Up to 2 lines of at most {budget} characters each (including spaces), ALL-CAPS, about 4 to 5 words total. High impact, readable in 2 seconds.
+- Hook text: Up to 2 lines of at most {budget} characters each (including spaces), ALL-CAPS, 2 to 4 short words total (it is drawn very big). High impact, readable in 1 second.
 - It must describe what happens in THIS clip (see the grounding rule): unless it is a generic question,
   it uses at least 2 specific words (names, places, things) that are said in the CLIP TRANSCRIPT.
 - CRITICAL HONESTY RULE: If authenticity is "unverified", the hook MUST NOT claim this is confirmed real GTA 6! Frame it honestly as a question or speculation (e.g., "IS THIS REALLY GTA 6?", "WHAT IS LUCIA DOING IN VICE CITY?"). Never deceive viewers.

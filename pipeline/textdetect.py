@@ -112,13 +112,14 @@ def framing_filter(mode: str, rs: dict[str, Any], ss: dict[str, Any], zoom_fill:
     W, H = int(rs["width"]), int(rs["height"])
     if not zoom_fill:
         fg_h = _even(W * 9 / 16)
-        return f"scale={W}:{fg_h}:force_original_aspect_ratio=decrease,pad={W}:{fg_h}:(ow-iw)/2:(oh-ih)/2", fg_h, (H - fg_h) // 2
+        return (f"scale={W}:{fg_h}:force_original_aspect_ratio=decrease,pad={W}:{fg_h}:(ow-iw)/2:(oh-ih)/2",
+                fg_h, style.foreground_top(rs, ss, fg_h))
     geo = style.fill_geometry(rs, ss)
     z = geo.fill_zoom if mode == "fill" else 1.0
     chain = (f"scale={geo.canvas_w}:{geo.content_h}:force_original_aspect_ratio=decrease,"
              f"pad={geo.canvas_w}:{geo.canvas_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
              f"crop={_even(geo.canvas_w / z)}:{_even(geo.canvas_h / z)},scale={W}:{geo.fill_h}")
-    return chain, geo.fill_h, (H - geo.fill_h) // 2
+    return chain, geo.fill_h, geo.band_top_fill
 
 
 def output_frame(cut_path: Path | str, t: float, mode: str, rs: dict[str, Any], ss: dict[str, Any],

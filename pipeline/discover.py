@@ -189,9 +189,14 @@ def discover_youtube(cfg: dict[str, Any] | None = None, db_path: Any = None) -> 
 # ---------------------------------------------------------------------------
 
 def gather_candidates(cfg: dict[str, Any], db_path: Any = None) -> list[dict[str, Any]]:
-    """Unscored candidates from every source. One source failing never stops another."""
+    """Unscored candidates from every source. One source failing never stops another.
+
+    A source shorter than the minimum clip (`cut.min_duration`) is dropped here: the cut stage
+    could only reject it, and a Make job would spend one of its source attempts on it."""
     from . import twitch   # local import: twitch pulls in nothing discover needs at import time
 
+    cut_cfg = cfg.get("cut", {}) or {}
+    min_dur = float(cut_cfg.get("min_duration", cut_cfg.get("min_duration_seconds", 18.0)))
     candidates: list[dict[str, Any]] = []
     for name, fn in (("youtube", discover_youtube), ("twitch", twitch.discover_twitch)):
         try:
@@ -199,8 +204,108 @@ def gather_candidates(cfg: dict[str, Any], db_path: Any = None) -> list[dict[str
         except Exception as e:  # noqa: BLE001 - isolate the source
             log.error("%s discovery failed: %s", name, e)
             found = []
-        candidates.extend(found)
+        short = [c for c in found if 0 < float(c.get("original_duration") or 0) < min_dur]
+        if short:
+            log.info("%s: %d candidate(s) shorter than %.0f s skipped", name, len(short), min_dur)
+        candidates.extend(c for c in found if c not in short)
     return candidates
+
+
+def widen_levels(cfg: dict[str, Any]) -> int:
+    """How many widening rounds `discovery.widen` defines (round 0 is the normal discovery)."""
+    return len((cfg.get("discovery", {}) or {}).get("widen") or [])
+
+
+def widened_config(cfg: dict[str, Any], level: int) -> dict[str, Any]:
+    """`cfg` with discovery widening round `level` (1-based) applied; level 0 returns `cfg`.
+
+    Each round in `discovery.widen` may add YouTube queries (relevance and newest-first), raise
+    the results per query and the longest source, and look further back on Twitch (age window)
+    with a bigger clip page. Rounds are cumulative: round 2 also has round 1's queries."""
+    import copy
+
+    if level <= 0:
+        return cfg
+    out = copy.deepcopy(cfg)
+    rounds = ((cfg.get("discovery", {}) or {}).get("widen") or [])[:level]
+    yt = out.setdefault("sources", {}).setdefault("youtube", {})
+    tw = out["sources"].setdefault("twitch", {})
+    for r in rounds:
+        yt["queries"] = list(yt.get("queries") or []) + [q for q in r.get("youtube_queries") or []
+                                                         if q not in (yt.get("queries") or [])]
+        yt["date_queries"] = list(yt.get("date_queries") or []) + [
+            q for q in r.get("youtube_date_queries") or [] if q not in (yt.get("date_queries") or [])]
+        for key, target in (("youtube_max_results_per_query", "max_results_per_query"),
+                            ("youtube_max_duration_seconds", "max_duration_seconds")):
+            if r.get(key):
+                yt[target] = max(int(yt.get(target) or 0), int(r[key]))
+        for key, target in (("twitch_lookback_hours", "lookback_hours"), ("twitch_limit", "limit")):
+            if r.get(key):
+                tw[target] = max(float(tw.get(target) or 0), float(r[key]))
+    return out
+
+
+def scored_candidates(cfg: dict[str, Any] | None = None, db_path: Any = None,
+                      *, exclude_known: bool = True) -> list[dict[str, Any]]:
+    """Discover and score, best first, WITHOUT inserting. exclude_known drops sources already in the DB."""
+    cfg = cfg or config.get_config()
+    db.init_db(db_path)
+    found = gather_candidates(cfg, db_path)
+    scored = score_candidates(found, cfg, db_path)
+    if exclude_known:
+        with db.db(db_path) as conn:
+            scored = [c for c in scored if not conn.execute(
+                "SELECT 1 FROM items WHERE (source=? AND source_id=?) OR "
+                "(source='manual' AND source_platform=? AND source_id IN (?, ?))",
+                (c["source"], c["source_id"], c["source"], c["source_id"],
+                 f"{c['source']}:{c['source_id']}")).fetchone()]
+    return scored
+
+
+def insert_for_job(item: dict[str, Any], job_id: str, db_path: Any = None) -> bool:
+    """Insert one scored candidate as a Make job's next attempt."""
+    if not db.insert_discovered_item(item, db_path=db_path):
+        return False
+    with db.db(db_path) as conn:
+        owner = conn.execute("SELECT creation_job FROM items WHERE id=?", (item["id"],)).fetchone()
+    if owner is None:          # an upsert onto an existing row (another id): not ours to take
+        return False
+    db.transition_stage(item["id"], "discovered", {"creation_job": job_id}, db_path)
+    return True
+
+
+def score_candidates(all_candidates: list[dict[str, Any]], cfg: dict[str, Any],
+                     db_path: Any = None) -> list[dict[str, Any]]:
+    """Percentile / decay / weight scoring, best first (see run_discovery)."""
+    if not all_candidates:
+        return []
+    disc_cfg = cfg.get("discovery", {})
+    formula_str = disc_cfg.get(
+        "score_formula",
+        "(percentile_rank ** velocity_power) * (0.5 ** (age_hours / half_life_hours)) * effective_weight",
+    )
+    half_life = float(disc_cfg.get("half_life_hours", 36.0))
+    velocity_power = float(disc_cfg.get("velocity_power", 1.2))
+    pool_size = int(disc_cfg.get("rolling_pool_size", 100))
+    pools: dict[str, list[float]] = {}
+    for source in {i["source"] for i in all_candidates}:
+        pools[source] = db.get_recent_source_velocities(source, limit=pool_size, db_path=db_path) + [
+            i["raw_velocity"] for i in all_candidates if i["source"] == source
+        ]
+    for item in all_candidates:
+        p_rank = _compute_percentile(item["raw_velocity"], pools[item["source"]])
+        ctx = {
+            "percentile_rank": p_rank,
+            "velocity_power": velocity_power,
+            "age_hours": item["age_hours"],
+            "half_life_hours": half_life,
+            "effective_weight": item["effective_weight"],
+            "source_weight": item["effective_weight"],
+        }
+        item["percentile_rank"] = p_rank
+        item["decay_factor"] = 0.5 ** (item["age_hours"] / half_life)
+        item["discovery_score"] = config.evaluate_formula(formula_str, ctx)
+    return sorted(all_candidates, key=lambda x: x["discovery_score"], reverse=True)
 
 
 def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None, *, limit=None, job_id=None) -> list[dict[str, Any]]:
@@ -218,45 +323,8 @@ def run_discovery(cfg: dict[str, Any] | None = None, db_path: Any = None, *, lim
         log.info("No candidates discovered.")
         return []
 
-    disc_cfg = cfg.get("discovery", {})
-    formula_str = disc_cfg.get(
-        "score_formula",
-        "(percentile_rank ** velocity_power) * (0.5 ** (age_hours / half_life_hours)) * effective_weight",
-    )
-    half_life = float(disc_cfg.get("half_life_hours", 36.0))
-    velocity_power = float(disc_cfg.get("velocity_power", 1.2))
-    pool_size = int(disc_cfg.get("rolling_pool_size", 100))
-
-    # Rolling pool for percentile rank calculation, one per source
-    pools: dict[str, list[float]] = {}
-    for source in {i["source"] for i in all_candidates}:
-        pools[source] = db.get_recent_source_velocities(source, limit=pool_size, db_path=db_path) + [
-            i["raw_velocity"] for i in all_candidates if i["source"] == source
-        ]
-
-    scored_items: list[dict[str, Any]] = []
-    for item in all_candidates:
-        p_rank = _compute_percentile(item["raw_velocity"], pools[item["source"]])
-        age_h = item["age_hours"]
-        eff_weight = item["effective_weight"]
-        decay = 0.5 ** (age_h / half_life)
-
-        ctx = {
-            "percentile_rank": p_rank,
-            "velocity_power": velocity_power,
-            "age_hours": age_h,
-            "half_life_hours": half_life,
-            "effective_weight": eff_weight,
-            "source_weight": eff_weight,
-        }
-        score = config.evaluate_formula(formula_str, ctx)
-        item["percentile_rank"] = p_rank
-        item["decay_factor"] = decay
-        item["discovery_score"] = score
-        scored_items.append(item)
-
-    # Sort candidates by discovery_score DESC
-    scored_items.sort(key=lambda x: x["discovery_score"], reverse=True)
+    # Rolling per-source percentile pools, decay and weight: score_candidates (best first).
+    scored_items = score_candidates(all_candidates, cfg, db_path)
 
     # Insert into database
     inserted_count = 0

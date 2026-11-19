@@ -15,3 +15,6 @@ opencv-python-headless>=4.10.0 # pipeline/textdetect.py: text burned into the so
 Flask>=3.1,<4 # Local dashboard routes, signed sessions, and CSRF-protected confirmation flow
 waitress>=3.0,<4 # Loopback WSGI server that also runs on Windows without a Node build
 chat-downloader>=0.2.8,<1 # Optional replay engagement for manually pasted Twitch VODs
+onnxruntime>=1.17 # pipeline/content_gate.py: CLIP ViT-B/32 on the CPU (also pulled in by kokoro-onnx)
+tokenizers>=0.15 # CLIP prompt tokenizer (also pulled in by faster-whisper)
+huggingface_hub>=0.20 # one-time CLIP model download (also pulled in by faster-whisper)
