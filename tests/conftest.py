@@ -1,6 +1,7 @@
 """Pytest fixtures for unit tests with zero network calls."""
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Generator
@@ -9,6 +10,10 @@ import pytest
 
 from pipeline import clock, config, db
 
+# Tests read the shipped config.yaml only, never this PC's config.local.yaml (the dashboard's
+# overlay, which can hold live mode). Set before any test loads config; inherited by subprocesses.
+os.environ["GTA6_IGNORE_LOCAL_CONFIG"] = "1"
+config.get_config(reload=True)
 
 REAL_MEDIA_ROOT = config.ROOT_DIR / "media"
 

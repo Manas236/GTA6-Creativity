@@ -15,19 +15,60 @@ from .store import transaction
 START_KEY = "dashboard:runner_start"
 
 
+#: Windows: why a worker must outlive the dashboard's console (launch day, 15:30 and 16:22).
+#: sys.executable is the venv's python.exe *launcher*. With DETACHED_PROCESS the launcher had no
+#: console, so Windows gave the real interpreter it starts a brand-new console - a visible window
+#: (a Windows Terminal tab next to the dashboard on this PC). Closing it sent CTRL_CLOSE_EVENT and
+#: the Intel Fortran runtime that numpy/scipy load aborted the runner ("forrtl: error (200):
+#: program aborting due to window-CLOSE event"); the launcher's kill-on-close job then took the
+#: rest. CREATE_NO_WINDOW gives the launcher a console with no window, which the interpreter
+#: inherits: there is no window to close, and the dashboard's console is never shared.
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def worker_env(media_root):
+    # FOR_DISABLE_CONSOLE_CTRL_HANDLER: the Fortran runtime must not turn a console event into an abort.
+    return {**os.environ, "GTA6_MEDIA_DIR": str(media_root), "FOR_DISABLE_CONSOLE_CTRL_HANDLER": "1"}
+
+
 def spawn(path, media_root, *args):
     logs = media_root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    detach = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS}
-              if os.name == "nt" else {"start_new_session": True})
+    command = [sys.executable, "-m", "pipeline.runner", "--db", str(path), *args]
     with (logs / f"dashboard-{args[0]}.log").open("ab") as stream:
-        process = subprocess.Popen(
-            [sys.executable, "-m", "pipeline.runner", "--db", str(path), *args],
-            cwd=config.project_root(), env={**os.environ, "GTA6_MEDIA_DIR": str(media_root)},
-            stdin=subprocess.DEVNULL, stdout=stream, stderr=stream, **detach,
-        )
+        common = dict(cwd=config.project_root(), env=worker_env(media_root),
+                      stdin=subprocess.DEVNULL, stdout=stream, stderr=stream)
+        if os.name == "nt":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            try:
+                # Leave any job the dashboard runs in (a terminal or IDE may kill its job on close).
+                process = subprocess.Popen(command, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **common)
+            except OSError:
+                # That job forbids breakaway: start inside it, and say so on the dashboard console.
+                process = subprocess.Popen(command, creationflags=flags, **common)
+                print("WARNING: the dashboard runs inside a Windows job that does not allow breakaway, so the "
+                      f"{args[0]} worker (pid {process.pid}) may stop when the program that started the "
+                      "dashboard closes. Start the dashboard with start-dashboard.bat.", flush=True)
+        else:
+            process = subprocess.Popen(command, start_new_session=True, **common)
     threading.Thread(target=process.wait, daemon=True).start()
     return process.pid
+
+
+def post_worker_running(path, item_id):
+    """A one-off posting worker for this item is already waiting (so a second one is not started)."""
+    raw = db.kv_get(f"dashboard:post_worker:{item_id}", db_path=path)
+    try:
+        record = json.loads(raw or "{}")
+        return bool(record.get("pid")) and runner.is_pid_alive(int(record["pid"]))
+    except (TypeError, ValueError):
+        return False
+
+
+def spawn_post_worker(path, media_root, command_id, item_id):
+    pid = spawn(path, media_root, "post_now", "--job", command_id)
+    db.kv_set(f"dashboard:post_worker:{item_id}", json.dumps({"pid": pid, "job": command_id, "at": time.time()}), path)
+    return pid
 
 
 def control(operation, path, cfg, media_root, expected_stage=None):
@@ -61,6 +102,9 @@ def control(operation, path, cfg, media_root, expected_stage=None):
         if (stage in ("post", "settle") or lock["host"] != socket.gethostname()
                 or lock.get("kind") not in ("loop", "make")):
             raise ControlError("Force stop is unavailable for publishing or a remote runner.")
+        publishing = json.loads(db.kv_get(runner.PUBLISHING_KEY, db_path=path) or "{}")
+        if publishing.get("pid") == lock["pid"]:
+            raise ControlError("The runner is publishing a post right now. Wait for it to finish.")
         if lock["pid"] == os.getpid():
             raise ControlError("The dashboard holds the lock for a local action.")
         if os.name == "nt":

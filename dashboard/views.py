@@ -92,6 +92,8 @@ def state(path, cfg, media_root=None):
                 "FROM dashboard_commands ORDER BY created_at DESC, rowid DESC"
             )
         ]
+        progress_items = sorted({r[0] for r in conn.execute("SELECT DISTINCT item_id FROM post_events")}
+                                | {p["item_id"] for p in posts})
         grouped = {}
         for post in posts:
             grouped.setdefault(post["item_id"], []).append(post)
@@ -134,7 +136,7 @@ def state(path, cfg, media_root=None):
         meta_until, meta_reason = rate_limit.active_cooldown(posting.META_SOURCE, path)
         warnings = analytics_warnings(posts, metrics, cfg)
         next_at = min((p["slot_datetime"] for p in posts if p["slot_datetime"]
-                       and p["status"] in ("pending", "uploading", "processing", "publishing")
+                       and p["status"] in posting.OPEN_STATUSES
                        and clock.parse(p["slot_datetime"]) >= clock.utcnow()), default=None)
         disk_bytes = 0
         if media_root:
@@ -181,6 +183,7 @@ def state(path, cfg, media_root=None):
             "cut_stats": db.cut_outcome_stats(path, hours=24),
             "items": items,
             "posts": posts,
+            "progress_items": progress_items,
             "metrics": metrics,
             "commands": commands,
             "interval": cfg.get("orchestrator", {}).get("loop_interval_seconds", 60),
@@ -339,21 +342,39 @@ def versions_for(item_id, path):
 
 
 def schedule(path, cfg, first, days):
+    """The week grid. A clip whose slot is not a grid time (a Post now slot, or one set before the
+    slot times changed) is still shown: in the nearest cell of its own day, with its exact time."""
     from datetime import datetime, timedelta
     profile, zone, slots = scheduler.active_profile(cfg)
     with snapshot(path) as conn:
-        scheduled = {clock.iso(clock.parse(row["slot_datetime"])): dict(row)
-                     for row in conn.execute("""
-                         SELECT p.slot_datetime, i.id AS item_id, i.original_title AS title
-                         FROM posts p JOIN items i ON p.item_id = i.id
-                         WHERE i.stage = 'queued' AND p.slot_datetime IS NOT NULL
-                     """)}
-        return {"slots": [{"at": at, "profile": profile,
-                           "item_id": scheduled.get(at, {}).get("item_id"),
-                           "title": scheduled.get(at, {}).get("title")}
-                          for offset in range(days)
-                          for slot in slots
-                          for at in [clock.iso(datetime.combine(first + timedelta(days=offset), slot, zone))]]}
+        queued = {}
+        for row in conn.execute("""
+                SELECT i.id AS item_id, i.original_title AS title, MIN(p.slot_datetime) AS slot_datetime,
+                       MAX(COALESCE(p.post_now, 0)) AS post_now
+                FROM posts p JOIN items i ON p.item_id = i.id
+                WHERE i.stage = 'queued' AND p.slot_datetime IS NOT NULL
+                GROUP BY i.id"""):
+            queued[row["item_id"]] = dict(row)
+    cells = [{"at": at, "profile": profile, "item_id": None, "title": None, "extra": []}
+             for offset in range(days)
+             for slot in slots
+             for at in [clock.iso(datetime.combine(first + timedelta(days=offset), slot, zone))]]
+    by_at = {cell["at"]: cell for cell in cells}
+    for entry in sorted(queued.values(), key=lambda e: e["slot_datetime"]):
+        at = clock.iso(clock.parse(entry["slot_datetime"]))
+        cell = by_at.get(at)
+        if cell is not None and cell["item_id"] is None:
+            cell.update(item_id=entry["item_id"], title=entry["title"])
+            continue
+        moment = clock.parse(at)
+        day = moment.astimezone(zone).date()
+        same_day = [c for c in cells if clock.parse(c["at"]).astimezone(zone).date() == day]
+        if not same_day:
+            continue   # outside the requested days
+        nearest = min(same_day, key=lambda c: abs((clock.parse(c["at"]) - moment).total_seconds()))
+        nearest["extra"].append({"item_id": entry["item_id"], "title": entry["title"], "at": at,
+                                 "post_now": bool(entry["post_now"])})
+    return {"slots": cells}
 
 
 def discovered(path):

@@ -265,8 +265,11 @@ function calendarMarkup() {
       const slots = weekSlots.filter(({ at }) => dayKey(at) === day);
       return `<section><h3>${heading}</h3>${slots.map((slot) => {
         const time = formatTime(slot.at, { day: undefined, month: undefined });
+        // Clips whose slot is between grid times (a Post now slot) sit in the nearest cell with their exact time.
+        const extra = (slot.extra || []).map((entry) => `<div class="calendar-extra"><time>${escape(formatTime(entry.at, { day: undefined, month: undefined }))}</time>
+          <a href="${itemLink(entry.item_id)}">${escape(entry.title || entry.item_id)}</a>${pill(entry.post_now ? "Post now · exact time" : "Exact time", "pink")}</div>`).join("");
         return `<article class="calendar-slot" data-row="${escape(slot.at)}" ${slot.item_id || unavailable.has("move_to_slot") ? "" : `data-slot="${escape(slot.at)}"`}>
-          <time>${escape(time)}</time>${slot.item_id ? `<a href="${itemLink(slot.item_id)}">${escape(slot.title || slot.item_id)}</a>` : '<span class="muted">Empty slot</span>'}</article>`;
+          <time>${escape(time)}</time>${slot.item_id ? `<a href="${itemLink(slot.item_id)}">${escape(slot.title || slot.item_id)}</a>` : `<span class="muted">${extra ? "Grid slot free" : "Empty slot"}</span>`}${extra}</article>`;
       }).join("") || '<p class="muted">No slots</p>'}</section>`;
     }).join("")}</div></div></section>`;
 }

@@ -33,8 +33,14 @@ class RenderError(PipelineError):
 
 
 class PublishError(PipelineError):
-    """Raised during Meta Graph API publication."""
-    pass
+    """Raised during Meta Graph API publication.
+
+    `meta` carries Meta's structured error when there is one (http_status, code, subcode,
+    message, type, fbtrace_id), already free of tokens, for the dashboard's posting panel."""
+
+    def __init__(self, message: str = "", meta: dict | None = None):
+        super().__init__(message)
+        self.meta = meta
 
 
 class RateLimitError(PipelineError):

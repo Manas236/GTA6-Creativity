@@ -74,7 +74,9 @@ def get_config(reload: bool = False) -> dict[str, Any]:
         data = yaml.safe_load(f) or {}
 
     local = ROOT_DIR / "config.local.yaml"
-    if local.is_file():
+    # The test suite sets GTA6_IGNORE_LOCAL_CONFIG so this PC's dashboard overrides (for example
+    # live mode) never leak into tests that read the shipped config.yaml.
+    if local.is_file() and not os.environ.get("GTA6_IGNORE_LOCAL_CONFIG"):
         override = yaml.safe_load(local.read_text(encoding="utf-8")) or {}
         if not isinstance(override, dict):
             raise ValueError("config.local.yaml must contain a mapping")

@@ -21,7 +21,7 @@ from pathlib import Path
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, session
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
-from pipeline import binding, clock, config, creation, db, media_paths, posting, runner, scheduler
+from pipeline import binding, clock, config, creation, db, media_paths, post_progress, posting, runner, scheduler
 import connection_checks
 from . import auth, commands, settings as preferences, views, workers
 from .store import initialize, snapshot, transaction
@@ -99,8 +99,19 @@ def create_app(db_path=None, cfg=None, media_root=None, env_path=None, remote=No
                     validate_live(effective)
                 if action in ("go_live", "go_dry"):
                     dry = action == "go_dry"
-                    message = preferences.save_overlay({"app": {"dry_run": dry},
-                        "posting": {"dry_run_mode": "plan_only" if dry else None}}, target)
+                    overlay = {"app": {"dry_run": dry}, "posting": {"dry_run_mode": "plan_only" if dry else None}}
+                    cleanup_note = ""
+                    if not dry:
+                        # Same flow and same transaction: no clip may be left on a dry run's fake
+                        # container, used-up attempts or a slot that is already in the past.
+                        live_cfg = config.merge_config(effective, overlay)
+                        reset = posting.reset_dry_run_rows(cfg=live_cfg, db_path=path)
+                        moved = scheduler.reschedule_missed(clock.utcnow(), live_cfg, path)
+                        cleanup_note = (f" Reset {reset} dry-run post row(s) and moved {len(moved)} clip(s) "
+                                        "whose slot had passed to the next free slot.")
+                    # Going back to dry run touches no posts row: live rows stay live, and a row
+                    # caught mid-publish keeps its real container for the crash-safe settle.
+                    message = preferences.save_overlay(overlay, target) + cleanup_note
                     status = "applied"
                 else:
                     lock = runner.active_lock(path, runner._lock_settings(effective)[0])
@@ -114,6 +125,25 @@ def create_app(db_path=None, cfg=None, media_root=None, env_path=None, remote=No
             conn.execute("UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
                          (status, message, db.now(), command_id))
             return dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (command_id,)).fetchone())
+
+    def start_post_now(item_id, command_id, active):
+        """A runner or Make worker publishes it from its quick posting check; otherwise a
+        one-off worker does, under the runner lock (the runner itself is not started)."""
+        stage = db.kv_get("runner:stage", db_path=path) or "its cycle"
+        if active and active.get("kind") in ("loop", "make"):
+            post_progress.record(item_id, "waiting", "running",
+                                 f"Runner active (busy in {stage}). Its posting check runs every few seconds.",
+                                 command_id=command_id, db_path=path, runner_kind=active.get("kind"))
+            return
+        if workers.post_worker_running(path, item_id):
+            post_progress.record(item_id, "waiting", "running",
+                                 "No runner is running. The one-off posting worker already waiting for this clip "
+                                 "publishes it.", command_id=command_id, db_path=path)
+            return
+        pid = workers.spawn_post_worker(path, root, command_id, item_id)
+        post_progress.record(item_id, "waiting", "running",
+                             f"No runner is running. Started a one-off posting worker (pid {pid}) that publishes "
+                             "it under the runner lock.", command_id=command_id, db_path=path, worker_pid=pid)
 
     def send_alert(text):
         if alert is not None:
@@ -387,6 +417,30 @@ def create_app(db_path=None, cfg=None, media_root=None, env_path=None, remote=No
             abort(404)
         return jsonify(data)
 
+    @app.get("/api/items/<item_id>/posting")
+    def posting_progress(item_id):
+        """The posting panel: polled every 2 s by the dashboard while a post is in progress.
+        Read-only; built from post_events, the command row, the runner lock and the posts rows."""
+        effective = settings()
+        try:
+            run_index = int(request.args["run"]) if "run" in request.args else None
+        except ValueError:
+            raise commands.ControlError("Choose a run number.") from None
+        secrets_in_env = connection_checks.secret_values({**os.environ, **connection_checks.current_environment()})
+        data = post_progress.panel(
+            item_id, path,
+            lock=views.lock_status(path, effective),
+            runner_stage=db.kv_get("runner:stage", db_path=path),
+            dry_run_now=posting.is_dry_run(effective),
+            tz=scheduler.active_profile(effective)[1],
+            platforms=posting.enabled_platforms(effective) or None,
+            mask=lambda text: redact_log(text, secrets_in_env),
+            run_index=run_index,
+        )
+        if not data:
+            abort(404)
+        return jsonify(data)
+
     @app.post("/api/prepare")
     def prepare():
         body = request.get_json(silent=True)
@@ -447,8 +501,8 @@ def create_app(db_path=None, cfg=None, media_root=None, env_path=None, remote=No
                 active = runner.active_lock(path, runner._lock_settings(effective)[0])
                 if action in creation.ACTIONS and (not active or active.get("kind") in ("dashboard", "make")):
                     workers.spawn(path, root, "make", "--job", command_id)
-                if action == "post_now" and not active:
-                    workers.control("start", path, effective, root)
+                if action == "post_now":
+                    start_post_now(plan["item_id"], command_id, active)
             except (OSError, commands.ControlError) as error:
                 if not runner.active_lock(path, runner._lock_settings(effective)[0]):
                     warning = f"Worker could not start: {error}"

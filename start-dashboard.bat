@@ -53,6 +53,9 @@ echo   the scheduler or the Telegram bot: one bot token polled from two PCs give
 echo   Telegram 409 Conflict, and two schedulers would double-post.
 echo.
 echo   Leave this window open while you use the dashboard. Close it to stop it.
+echo   Closing it stops only the dashboard: a runner started with the dashboard's
+echo   Start button keeps running in the background with no window of its own.
+echo   Stop it with the dashboard's Stop button, never by closing windows.
 echo  =============================================================================
 echo.
 %VENV_PY% -m dashboard --port %PORT%

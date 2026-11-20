@@ -39,7 +39,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
-from . import clock, config, db, posting
+from . import clock, config, db, post_progress, posting
 
 log = logging.getLogger(__name__)
 
@@ -259,6 +259,10 @@ def reschedule_missed(
             continue   # a dry run already walked this item; it waits for dry_run to be switched off
         if all(posting.is_terminal_failure(r, cfg) or r["status"] == posting.STATUS_DRY_RUN for r in rows):
             continue
+        if any(r.get("post_now") for r in rows):
+            # Post now means "as soon as allowed": never silently pushed to a later grid slot.
+            # The posting check holds it for the gap, cap or a Meta pause and says why on the panel.
+            continue
         if posting.slot_is_missed(rows, now, cfg):
             candidates.append((posting.item_slot(rows) or "", item, rows))
 
@@ -284,6 +288,11 @@ def reschedule_missed(
             continue
         db.log_stage(item["id"], "scheduler", "success",
                      message=f"missed slot {old_slot}; moved to {new_slot}", db_path=db_path)
+        post_progress.ensure_run(item["id"], "scheduled", f"Slot {old_slot} reached", db_path=db_path,
+                                 slot=old_slot)
+        post_progress.record(item["id"], "checks", "waiting",
+                             f"Missed its slot {old_slot} by more than the grace; moved to {new_slot} UTC.",
+                             db_path=db_path, hold="missed", moved_to=new_slot)
         log.info("scheduler: %s missed %s, moved to %s", item["id"], old_slot, new_slot)
         moved.append((item["id"], old_slot, new_slot))
     return moved
