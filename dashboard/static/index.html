@@ -9,6 +9,7 @@
     <script defer src="/static/mock-loader.js"></script>
     <script defer src="/static/workspace.js"></script>
     <script defer src="/static/app.js"></script>
+    <script defer src="/static/progress.js"></script>
   </head>
   <body>
     <aside class="sidebar">
@@ -67,7 +68,7 @@
     <dialog id="action-dialog" aria-labelledby="dialog-title">
       <form id="action-form">
         <div class="dialog-top">
-          <span class="eyebrow">Pipeline control/span
+          <span class="eyebrow">Pipeline control</span
           ><button
             type="button"
             class="icon-button"
@@ -90,6 +91,18 @@
           </button>
         </div>
       </form>
+    </dialog>
+    <dialog id="progress-dialog" class="progress-dialog" aria-labelledby="progress-title">
+      <div class="dialog-top">
+        <span class="eyebrow">Posting progress</span
+        ><button type="button" class="icon-button" id="close-progress" aria-label="Close">×</button>
+      </div>
+      <div id="progress-body"></div>
+      <p id="progress-status" class="muted progress-status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button type="button" class="button secondary" id="copy-progress">Copy details</button
+        ><button type="button" class="button primary" id="done-progress">Close</button>
+      </div>
     </dialog>
     <dialog id="bulk-dialog" aria-labelledby="bulk-title">
       <form method="dialog">

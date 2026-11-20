@@ -59,13 +59,13 @@ import logging
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 import requests
 
-from . import clock, config, db, rate_limit
+from . import clock, config, db, post_progress, rate_limit
 from .errors import PublishError, RateLimitError
 
 log = logging.getLogger(__name__)
@@ -338,7 +338,9 @@ class MetaClient:
             self.pause(f"{what}: HTTP {status} {redact(error or data)}"[:400])
         if status != 200 or error:
             body = redact(error or getattr(resp, "text", "") or data)
-            raise PublishError(f"{what}: HTTP {status} {str(body)[:300]}")
+            meta = post_progress.meta_error_from(error, status) or {"http_status": status, "message": str(body)[:300]}
+            meta = {k: (redact(v) if isinstance(v, str) else v) for k, v in meta.items()}
+            raise PublishError(f"{what}: HTTP {status} {str(body)[:300]}", meta={"request": what, **meta})
         return data
 
     def pause(self, message: str) -> None:
@@ -571,6 +573,53 @@ def missed_slot_grace(cfg: dict[str, Any] | None) -> float:
     return float((((cfg or {}).get("posting") or {}).get("missed_slot_grace_minutes", 90))) * 60.0
 
 
+def retry_delay(cfg: dict[str, Any] | None) -> float:
+    """Seconds a failed row waits before the posting check tries it again. The quick posting
+    check runs every few seconds, so without this a failing row would burn every attempt at once."""
+    return float((((cfg or {}).get("posting") or {}).get("retry_delay_minutes", 10))) * 60.0
+
+
+DRY_RUN_PLACEHOLDER = "<dry-run-"
+
+
+def is_placeholder(container_id: Any) -> bool:
+    """A plan_only dry run's fake container / video id: nothing was ever created on Meta."""
+    return str(container_id or "").startswith(DRY_RUN_PLACEHOLDER)
+
+
+class ProgressReader:
+    """A file wrapper that reports how many bytes the upload has read so far."""
+
+    def __init__(self, stream: Any, total: int, report: Callable[[int, int], None]):
+        self.stream, self.total, self.report, self.sent = stream, int(total), report, 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self.stream.read(size)
+        self.sent += len(chunk)
+        try:
+            self.report(self.sent, self.total)
+        except Exception:  # noqa: BLE001 - progress must never break an upload
+            pass
+        return chunk
+
+    def tell(self) -> int:
+        return self.sent
+
+    @property
+    def name(self) -> str:
+        return getattr(self.stream, "name", "")
+
+    def __len__(self) -> int:
+        return self.total
+
+    def __iter__(self):
+        while True:
+            chunk = self.read(1024 * 1024)
+            if not chunk:
+                return
+            yield chunk
+
+
 def item_slot(rows: list[dict[str, Any]]) -> str | None:
     slots = [r["slot_datetime"] for r in rows if r.get("slot_datetime")]
     return min(slots) if slots else None
@@ -594,6 +643,9 @@ def reset_dry_run_rows(cfg: dict[str, Any] | None = None, db_path: Any = None) -
     Without this, flipping app.dry_run to false would find every queued item already "done" and it
     would never be posted. Their slots are in the past by then, so the scheduler re-slots them one
     per slot - they do not all go out at once. Does nothing while app.dry_run is true.
+
+    A Post now made during the dry run was a rehearsal: its post_now flag is cleared too, so going
+    live re-slots it like the others instead of publishing it the moment live mode starts.
     """
     if is_dry_run(cfg):
         return 0
@@ -602,7 +654,7 @@ def reset_dry_run_rows(cfg: dict[str, Any] | None = None, db_path: Any = None) -
             f"""
             UPDATE posts SET status = 'pending', remote_container_id = NULL, publish_started_at = NULL,
                              attempt_count = 0, error_message = 'reset after dry run', updated_at = ?,
-                             variant_decided_at = NULL
+                             variant_decided_at = NULL, post_now = 0
             WHERE status = 'dry_run'
               AND item_id IN (SELECT id FROM items WHERE stage IN ('approved', 'queued') AND {db.RELEASABLE_SQL})
             """,
@@ -697,6 +749,32 @@ class Publisher:
         self.poll_max_minutes = float(posting.get("container_poll_max_minutes", 5.0))
         self.recent_media_limit = int(posting.get("recent_media_limit", 25))
         self.max_attempts = int(posting.get("max_post_attempts", 3))
+        self._step: dict[int, str] = {}           # post id -> the step in progress (for failures)
+
+    # ------------------------------------------------------------- progress
+    def progress(self, post: dict[str, Any], step: str, state: str, message: str = "", **detail: Any) -> None:
+        """One posting-panel event for this row (never raises)."""
+        if state in ("running", "waiting"):
+            self._step[post["id"]] = step
+        if self.dry_run():
+            detail.setdefault("dry_run", True)
+            detail.setdefault("dry_run_mode", self.dry_run_mode())
+        post_progress.record(post["item_id"], step, state, message, post_id=post["id"],
+                             db_path=self.db_path, platform=post.get("platform"), **detail)
+
+    def _upload_reporter(self, post: dict[str, Any]) -> Callable[[int, int], None]:
+        last = {"at": 0.0, "pct": -100.0}
+
+        def report(sent: int, total: int) -> None:
+            pct = 100.0 * sent / total if total else 100.0
+            now = time.monotonic()
+            if sent < total and now - last["at"] < 1.0 and pct - last["pct"] < 10.0:
+                return
+            last.update(at=now, pct=pct)
+            self.progress(post, "upload", "running", f"Uploaded {sent / 1048576:.1f} of {total / 1048576:.1f} MB ({pct:.0f}%)",
+                          bytes_sent=sent, bytes_total=total, percent=round(pct, 1))
+
+        return report
 
     # ------------------------------------------------------------- helpers
     def dry_run(self) -> bool:
@@ -729,12 +807,21 @@ class Publisher:
         except Exception as e:  # noqa: BLE001
             log.warning("alert not delivered (%s): %s", e, text)
 
-    def fail(self, post: dict[str, Any], message: str, alert: bool = True, terminal: bool = False) -> str:
+    def fail(self, post: dict[str, Any], message: str, alert: bool = True, terminal: bool = False,
+             error: dict[str, Any] | None = None, step: str | None = None) -> str:
         """`terminal=True` flags the row no_retry: no later pass may touch it again."""
         msg = redact(message)[:900]
         extra = {"no_retry": 1} if terminal else {}
         set_status(post["id"], STATUS_FAILED, db_path=self.db_path, error_message=msg, **extra)
         db.log_stage(post["item_id"], "posting", "failure", message=f"{post['platform']}: {msg}", db_path=self.db_path)
+        current = get_post(post["id"], db_path=self.db_path) or post
+        retry = post_progress.retry_plan(current, self.max_attempts, retry_delay(self.cfg), terminal=terminal)
+        post_progress.fail(
+            post["item_id"], step or self._step.get(post["id"]) or "checks", msg,
+            error=error or {"exception": msg}, retry=retry, post_id=post["id"], db_path=self.db_path,
+            platform=post.get("platform"), attempt=current.get("attempt_count"), max_attempts=self.max_attempts,
+            **({"dry_run": True} if self.dry_run() else {}),
+        )
         if alert:
             self.alert(
                 f"{post['platform']} post failed for item {post['item_id']}: {msg}",
@@ -756,7 +843,19 @@ class Publisher:
         paused, why = meta_paused(self.db_path)
         if paused:
             log.warning("meta is paused, %s not sent: %s", post["platform"], why)
+            self.progress(post, "checks", "waiting", f"Meta posting is paused: {why}")
             return post["status"]
+
+        if post["status"] == STATUS_FAILED and not post.get("publish_started_at"):
+            # A retry of a row whose publish call was never issued starts from a fresh container:
+            # the old one may be ERROR / EXPIRED on Meta, or a dry run's fake id that never existed.
+            update_post(post_id, db_path=self.db_path, status=STATUS_PENDING, remote_container_id=None)
+            post = get_post(post_id, db_path=self.db_path) or post
+        elif post["status"] in (STATUS_PENDING, STATUS_UPLOADING) and is_placeholder(post.get("remote_container_id")) \
+                and not self.dry_run():
+            # A live pass must never upload to a dry run's fake container id.
+            update_post(post_id, db_path=self.db_path, remote_container_id=None)
+            post = get_post(post_id, db_path=self.db_path) or post
 
         if post["variant"] not in ("A", "B", "p1", "p2", "p3") or not post.get("variant_decided_at"):
             # The post is beginning now: this is when its slot came due, so draw the variant.
@@ -789,19 +888,36 @@ class Publisher:
         except RateLimitError as e:
             update_post(post_id, db_path=self.db_path, error_message=redact(e)[:900])
             log.warning("meta rate limited; %s left at %s", post["platform"], post["status"])
+            post_progress.fail(
+                post["item_id"], self._step.get(post_id) or "checks", redact(e)[:900],
+                error={"exception": redact(e)[:900]}, post_id=post_id, db_path=self.db_path,
+                retry={"will_retry": True,
+                       "text": f"Yes. Meta limited the account, so all Meta calls pause for "
+                               f"{self.client.pause_hours:.0f} h. The row is left as it is and continues after the pause."},
+            )
             self.alert(f"Meta paused for {self.client.pause_hours:.0f}h: {redact(e)[:300]}", key="meta_rate_limit")
             raise
         except (PublishError, requests.RequestException, OSError) as e:
             current = get_post(post_id, db_path=self.db_path) or post
+            meta = getattr(e, "meta", None)
             if current["status"] == STATUS_PUBLISHING:
                 # The publish call itself went wrong: Meta may have published anyway (a lost
                 # response). Never mark this retryable - leave it `publishing` so the next pass
                 # settles it from the remote state, which never publishes twice (call #60).
-                update_post(post_id, db_path=self.db_path, error_message=redact(f"{type(e).__name__}: {e}")[:900])
+                text = redact(f"{type(e).__name__}: {e}")[:900]
+                update_post(post_id, db_path=self.db_path, error_message=text)
                 log.warning("%s publish call failed for %s (%s); left publishing, to be settled from the remote",
                             post["platform"], post["item_id"], type(e).__name__)
+                post_progress.fail(
+                    post["item_id"], "publishing", text, error=meta or {"exception": text}, post_id=post_id,
+                    db_path=self.db_path,
+                    retry={"will_retry": True,
+                           "text": "Not blindly. Instagram may have published it anyway, so the row stays in "
+                                   "publishing and the next posting check asks Instagram first. It is never "
+                                   "published twice."},
+                )
                 return STATUS_PUBLISHING
-            return self.fail(post, f"{type(e).__name__}: {e}")
+            return self.fail(post, f"{type(e).__name__}: {e}", error=meta)
 
     # ------------------------------------------------------------- instagram
     def _publish_instagram(self, post: dict[str, Any], item: dict[str, Any]) -> str:
@@ -809,13 +925,14 @@ class Publisher:
         ig_user = config.secret("IG_USER_ID")
         token = ig_token()
         caption = post.get("caption_text") or caption_for_item(item)
+        self._step[post_id] = "checks"
         video = video_for_post(item, post, self.db_path)
         size = video.stat().st_size
         plan = Plan(post_id, PLATFORM_INSTAGRAM)
         base = self.client.base()
 
         if not self.dry_run() and not (ig_user and token):
-            return self.fail(post, "IG_USER_ID / IG_ACCESS_TOKEN missing")
+            return self.fail(post, "IG_USER_ID / IG_ACCESS_TOKEN missing", step="checks")
         ig_user = ig_user or "<IG_USER_ID>"
 
         container_id = post.get("remote_container_id")
@@ -823,6 +940,7 @@ class Publisher:
         # ---- Phase 1: the container, saved BEFORE anything else happens.
         if post["status"] in (STATUS_PENDING, STATUS_UPLOADING) and not container_id:
             set_status(post_id, STATUS_UPLOADING, db_path=self.db_path, error_message=None)
+            self.progress(post, "container", "running", "Creating the Instagram Reels container")
             params = {
                 "media_type": "REELS",
                 "upload_type": "resumable",
@@ -834,25 +952,40 @@ class Publisher:
             if self.may_send("container"):
                 data = self.client.check(self.client.post(url, data=params, timeout=60), "create REELS container")
                 container_id = data["id"]
+                self.progress(post, "container", "done", f"Container {container_id} created", container_id=container_id)
             else:
                 plan.add("POST", url, params=params)
                 container_id = f"<dry-run-container:{post_id}>"
+                self.progress(post, "container", "skipped", "Planned only (dry run). Nothing was sent to Meta.")
             update_post(post_id, db_path=self.db_path, remote_container_id=container_id)
             set_status(post_id, STATUS_CONTAINER_READY, db_path=self.db_path)
             post = get_post(post_id, db_path=self.db_path) or post
+        else:
+            self.progress(post, "container", "done", f"Reusing container {container_id} from an earlier attempt",
+                          container_id=container_id)
 
         # ---- Phase 2a: the bytes.
         upload_url = f"{self.client.rupload_base}/ig-api-upload/{self.client.api_version}/{container_id}"
         headers = {"Authorization": f"OAuth {token}", "offset": "0", "file_size": str(size)}
         if self.may_send("upload"):
+            self.progress(post, "upload", "running", f"Uploading {size / 1048576:.1f} MB", bytes_sent=0,
+                          bytes_total=size, percent=0)
             with open(video, "rb") as fh:
-                resp = self.client.post(upload_url, headers=headers, data=fh, timeout=600)
+                body_stream = ProgressReader(fh, size, self._upload_reporter(post))
+                resp = self.client.post(upload_url, headers=headers, data=body_stream, timeout=600)
             body = self.client.check(resp, "rupload")
             if not body.get("success", True):
-                return self.fail(post, f"rupload refused the file: {body}")
-            status = self._wait_for_container(container_id, token)
+                return self.fail(post, f"rupload refused the file: {body}", step="upload")
+            self.progress(post, "upload", "done", f"Uploaded {size / 1048576:.1f} MB", bytes_sent=size,
+                          bytes_total=size, percent=100)
+            status = self._wait_for_container(container_id, token, post)
             if status != "FINISHED":
-                return self.fail(post, f"container is {status}, not FINISHED")
+                last = self._last_container or {}
+                detail = last.get("status") or ""
+                return self.fail(post, f"container is {status}, not FINISHED" + (f": {detail}" if detail else ""),
+                                 step="processing",
+                                 error={"request": "container status", "message": f"Meta returned status_code "
+                                        f"{status}" + (f" ({detail})" if detail else ""), "meta_status": status})
         else:
             plan.add("POST", upload_url, headers=headers, body=str(video), file_size=size)
             plan.add(
@@ -860,6 +993,9 @@ class Publisher:
                 params={"fields": "status_code,status", "access_token": token},
                 until="FINISHED", every_s=self.poll_seconds, max_min=self.poll_max_minutes,
             )
+            self.progress(post, "upload", "skipped", f"Planned only (dry run): {size / 1048576:.1f} MB not sent.",
+                          bytes_total=size)
+            self.progress(post, "processing", "skipped", "Planned only (dry run). No status polls were sent.")
 
         # ---- Phase 2b: `publishing` is written BEFORE the publish call is issued.
         set_status(post_id, STATUS_PUBLISHING, db_path=self.db_path, publish_started_at=db.now())
@@ -874,8 +1010,13 @@ class Publisher:
             )
             db.log_stage(post["item_id"], "posting", "success",
                          message=f"instagram dry run, {len(plan.steps)} planned requests", db_path=self.db_path)
+            self.progress(post, "publishing", "skipped", "Not published: dry run.")
+            post_progress.finish(post["item_id"], "dry_run",
+                                 f"Dry run ({self.dry_run_mode()}) finished. Nothing was published.",
+                                 post_id=post_id, db_path=self.db_path, dry_run=True, plan=str(where or ""))
             return STATUS_DRY_RUN
 
+        self.progress(post, "publishing", "running", "Publish call sent to Instagram")
         published = self.client.check(
             self.client.post(publish_url, data=publish_params, timeout=60, retry=False), "media_publish")
         media_id = published["id"]
@@ -885,12 +1026,23 @@ class Publisher:
             remote_id=media_id, remote_url=link, posted_at=when or db.now(), error_message=None,
         )
         db.log_stage(post["item_id"], "posting", "success", message=f"instagram live: {media_id}", db_path=self.db_path)
+        self.progress(post, "publishing", "done", f"Published as media {media_id}", media_id=media_id)
+        self.progress(post, "live", "done", "Live on Instagram", permalink=link, media_id=media_id)
+        post_progress.finish(post["item_id"], "live", "Live on Instagram", post_id=post_id, db_path=self.db_path,
+                             permalink=link, media_id=media_id)
         return STATUS_LIVE
 
-    def _wait_for_container(self, container_id: str, token: str) -> str:
+    _last_container: dict[str, Any] | None = None
+
+    def _wait_for_container(self, container_id: str, token: str, post: dict[str, Any] | None = None) -> str:
         """Poll the container until it is FINISHED, or until the deadline. Returns the last status."""
         deadline = self.clock() + self.poll_max_minutes * 60
+        started = self.clock()
         status = "UNKNOWN"
+        polls = 0
+        self._last_container = None
+        if post is not None:
+            self.progress(post, "processing", "running", "Waiting for Meta to process the video", polls=0)
         while self.clock() < deadline:
             data = self.client.check(
                 self.client.get(
@@ -900,7 +1052,18 @@ class Publisher:
                 ),
                 "container status",
             )
+            polls += 1
+            self._last_container = data
             status = str(data.get("status_code") or "UNKNOWN")
+            if post is not None:
+                note = f"Poll {polls}: Meta says {status}" + (f" ({data.get('status')})" if data.get("status") else "")
+                if status == "FINISHED":
+                    self.progress(post, "processing", "done",
+                                  f"Meta finished processing after {polls} poll(s), {self.clock() - started:.0f} s",
+                                  polls=polls, meta_status=status)
+                else:
+                    self.progress(post, "processing", "running", note, polls=polls, meta_status=status,
+                                  meta_detail=data.get("status"))
             if status in ("FINISHED", "ERROR", "EXPIRED", "PUBLISHED"):
                 return status
             self.sleep(self.poll_seconds)
@@ -942,13 +1105,16 @@ class Publisher:
         # ---- Phase 1: the upload session, saved BEFORE anything else happens.
         if post["status"] in (STATUS_PENDING, STATUS_UPLOADING) and not video_id:
             set_status(post_id, STATUS_UPLOADING, db_path=self.db_path, error_message=None)
+            self.progress(post, "container", "running", "Starting the Facebook Reels upload session")
             params = {"upload_phase": "start", "access_token": token}
             if self.may_send("container"):
                 data = self.client.check(self.client.post(reels_url, data=params, timeout=60), "FB reels start")
                 video_id = data["video_id"]
+                self.progress(post, "container", "done", f"Upload session {video_id} started")
             else:
                 plan.add("POST", reels_url, params=params)
                 video_id = f"<dry-run-video:{post_id}>"
+                self.progress(post, "container", "skipped", "Planned only (dry run). Nothing was sent to Meta.")
             update_post(post_id, db_path=self.db_path, remote_container_id=video_id)
             set_status(post_id, STATUS_CONTAINER_READY, db_path=self.db_path)
             post = get_post(post_id, db_path=self.db_path) or post
@@ -957,13 +1123,17 @@ class Publisher:
         upload_url = f"{self.client.rupload_base}/video-upload/{self.client.api_version}/{video_id}"
         headers = {"Authorization": f"OAuth {token}", "offset": "0", "file_size": str(size)}
         if self.may_send("upload"):
+            self.progress(post, "upload", "running", f"Uploading {size / 1048576:.1f} MB", bytes_total=size)
             with open(video, "rb") as fh:
-                resp = self.client.post(upload_url, headers=headers, data=fh, timeout=600)
+                resp = self.client.post(upload_url, headers=headers,
+                                        data=ProgressReader(fh, size, self._upload_reporter(post)), timeout=600)
             body = self.client.check(resp, "FB rupload")
             if not body.get("success", True):
-                return self.fail(post, f"FB rupload refused the file: {body}")
+                return self.fail(post, f"FB rupload refused the file: {body}", step="upload")
+            self.progress(post, "upload", "done", f"Uploaded {size / 1048576:.1f} MB", bytes_total=size, percent=100)
         else:
             plan.add("POST", upload_url, headers=headers, body=str(video), file_size=size)
+            self.progress(post, "upload", "skipped", "Planned only (dry run). Nothing was sent.")
 
         # ---- Phase 2b: finish with video_state=PUBLISHED is the publish; `publishing` first.
         set_status(post_id, STATUS_PUBLISHING, db_path=self.db_path, publish_started_at=db.now())
@@ -983,12 +1153,16 @@ class Publisher:
             )
             db.log_stage(post["item_id"], "posting", "success",
                          message=f"facebook dry run, {len(plan.steps)} planned requests", db_path=self.db_path)
+            self.progress(post, "publishing", "skipped", "Not published: dry run.")
+            post_progress.finish(post["item_id"], "dry_run", "Dry run finished. Nothing was published.",
+                                 post_id=post_id, db_path=self.db_path, dry_run=True)
             return STATUS_DRY_RUN
 
+        self.progress(post, "publishing", "running", "Publish (finish) call sent to Facebook")
         finished = self.client.check(
             self.client.post(reels_url, data=finish_params, timeout=60, retry=False), "FB reels finish")
         if not finished.get("success", True):
-            return self.fail(post, f"FB reels finish refused: {finished}")
+            return self.fail(post, f"FB reels finish refused: {finished}", step="publishing")
         published_at = db.now()
         link = self._fb_permalink(video_id, token)
         set_status(
@@ -996,6 +1170,9 @@ class Publisher:
             remote_id=video_id, remote_url=link, posted_at=published_at, error_message=None,
         )
         db.log_stage(post["item_id"], "posting", "success", message=f"facebook live: {video_id}", db_path=self.db_path)
+        self.progress(post, "live", "done", "Live on Facebook", permalink=link, media_id=video_id)
+        post_progress.finish(post["item_id"], "live", "Live on Facebook", post_id=post_id, db_path=self.db_path,
+                             permalink=link, media_id=video_id)
         return STATUS_LIVE
 
     def _fb_permalink(self, video_id: str, token: str) -> str:
@@ -1137,12 +1314,21 @@ class Publisher:
     def settle(self, post: dict[str, Any], item: dict[str, Any] | None = None) -> str:
         """Resolve a row found in `publishing` after a crash. Never publishes a second time."""
         post_id = post["id"]
-        if self.dry_run() and self.dry_run_mode() != "up_to_publish":
-            # Nothing was ever sent, so there is nothing to ask the remote about.
+        container = post.get("remote_container_id")
+        if self.dry_run() and self.dry_run_mode() != "up_to_publish" and (not container or is_placeholder(container)):
+            # A plan_only dry run sent nothing, so there is nothing to ask the remote about. A row
+            # holding a REAL container (a live publish interrupted by switching to dry run) is NOT
+            # short-circuited: marking it dry_run would let the next go-live publish it again.
             set_status(post_id, STATUS_DRY_RUN, db_path=self.db_path,
                        error_message="dry run (plan_only); settled without any remote call")
+            post_progress.finish(post["item_id"], "dry_run", "Dry run: settled without any remote call.",
+                                 post_id=post_id, db_path=self.db_path, dry_run=True)
             return STATUS_DRY_RUN
 
+        post_progress.ensure_run(post["item_id"], "settle",
+                                 "Checking Instagram for a publish that may already have gone through",
+                                 db_path=self.db_path, post_id=post_id)
+        self.progress(post, "publishing", "running", "Asking Meta whether this post was already published")
         state, detail = self.remote_state(post)
         log.info("settle post %s (%s): remote says %s %s", post_id, post["platform"], state, detail)
 
@@ -1156,9 +1342,23 @@ class Publisher:
             )
             db.log_stage(post["item_id"], "posting", "success",
                          message=f"{post['platform']} was already live; recovered after a crash", db_path=self.db_path)
+            link = detail.get("remote_url") or post.get("remote_url")
+            self.progress(post, "publishing", "done", "Meta confirms it was published")
+            self.progress(post, "live", "done", "Live (confirmed after an interrupted publish)", permalink=link,
+                          media_id=detail.get("remote_id"))
+            post_progress.finish(post["item_id"], "live", "Live", post_id=post_id, db_path=self.db_path, permalink=link)
             return STATUS_LIVE
 
         if state == "not_published":
+            if self.dry_run() and not self.may_send("container"):
+                # Meta proves nothing was published, but a dry run may not create a new container.
+                set_status(post_id, STATUS_PENDING, db_path=self.db_path, remote_container_id=None,
+                           publish_started_at=None, error_message=f"not published (checked in dry run): "
+                                                                  f"{json.dumps(detail)[:300]}")
+                post_progress.finish(post["item_id"], "dry_run", "Meta confirms nothing was published. "
+                                     "It is posted for real after going live.", post_id=post_id,
+                                     db_path=self.db_path, dry_run=True)
+                return STATUS_PENDING
             # The remote proves nothing was published: start a fresh container, safely.
             set_status(
                 post_id, STATUS_PENDING, db_path=self.db_path,
@@ -1167,6 +1367,7 @@ class Publisher:
             )
             db.log_stage(post["item_id"], "posting", "start",
                          message=f"{post['platform']} container was dead; restarting", db_path=self.db_path)
+            self.progress(post, "publishing", "done", "Meta confirms nothing was published; starting a fresh container")
             item = item or db.get_item(post["item_id"], db_path=self.db_path)
             if item:
                 return self.publish(post_id, item)
@@ -1176,7 +1377,7 @@ class Publisher:
         return self.fail(
             post,
             f"remote state unknown after a crash in 'publishing'; not re-published. {json.dumps(detail)[:400]}",
-            terminal=True,
+            terminal=True, step="publishing",
         )
 
 
@@ -1244,8 +1445,14 @@ def run_posting_for_item(
 
     for post in get_posts_for_item(item_id, db_path=db_path):
         if post["platform"] not in wanted:
+            if post["status"] in OPEN_STATUSES:
+                log.info("post %s (%s) skipped: %s posting is turned off in settings", post["id"],
+                         post["platform"], post["platform"])
             continue
         if post["status"] in (STATUS_LIVE, STATUS_DRY_RUN) or is_terminal_failure(post, cfg):
+            if post["status"] == STATUS_FAILED:
+                log.info("post %s (%s) skipped: failed for good (%s)", post["id"], post["platform"],
+                         "no_retry" if post.get("no_retry") else "out of attempts")
             results[post["platform"]] = post["status"]
             continue
         try:
@@ -1280,15 +1487,15 @@ def run_posting_for_item(
     return results
 
 
-def due_items(now: datetime, db_path: Any = None) -> list[dict[str, Any]]:
-    """Queued, releasable items whose slot has come, earliest slot first.
+def due_items(now: datetime, db_path: Any = None, item_ids: Any = None) -> list[dict[str, Any]]:
+    """Queued, releasable items whose slot has come, earliest slot first (only `item_ids` when given).
 
     Items whose rows are all `dry_run` already walked the flow in a dry run and are left alone.
     """
     with db.db(db_path) as conn:
         rows = conn.execute(
             f"""
-            SELECT i.*, MIN(p.slot_datetime) AS slot
+            SELECT i.*, MIN(p.slot_datetime) AS slot, MAX(COALESCE(p.post_now, 0)) AS post_now
             FROM items i JOIN posts p ON p.item_id = i.id
             WHERE i.stage = 'queued' AND {db.RELEASABLE_SQL.replace("id NOT LIKE", "i.id NOT LIKE")}
             GROUP BY i.id
@@ -1297,7 +1504,46 @@ def due_items(now: datetime, db_path: Any = None) -> list[dict[str, Any]]:
             """,
             (clock.iso(now),),
         ).fetchall()
-        return [dict(r) for r in rows]
+        out = [dict(r) for r in rows]
+    if item_ids is not None:
+        out = [r for r in out if r["id"] in set(item_ids)]
+    return out
+
+
+def has_posting_work(now: datetime, db_path: Any = None, item_ids: Any = None) -> bool:
+    """Cheap, read-only: is anything due now, or left in `publishing` by an interrupted pass?"""
+    with db.db(db_path) as conn:
+        if conn.execute("SELECT 1 FROM posts WHERE status = 'publishing' LIMIT 1").fetchone():
+            return True
+    return bool(due_items(now, db_path, item_ids))
+
+
+def live_count_on_day(day: Any, cfg: dict[str, Any], exclude_item_id: str | None, db_path: Any = None) -> int:
+    """Items that went live on this local posting day (the daily cap counts items, not platforms)."""
+    from . import scheduler   # lazy: scheduler imports this module
+    with db.db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT item_id, MIN(posted_at) AS t FROM posts WHERE status = 'live' AND posted_at IS NOT NULL "
+            "AND item_id != ? GROUP BY item_id", (exclude_item_id or "",)
+        ).fetchall()
+    return sum(1 for r in rows if scheduler.local_day(clock.parse(r["t"]), cfg) == day)
+
+
+_HOLD_LOGGED: dict[tuple[str, str], float] = {}
+
+
+def _hold(item_id: str, reason: str, message: str, db_path: Any = None, **detail: Any) -> None:
+    """A due item that is not posted on this pass: say why, in the log (at most every 10 minutes
+    per reason) and on the posting panel (only when the reason changes)."""
+    key = (item_id, reason)
+    now = time.monotonic()
+    if now - _HOLD_LOGGED.get(key, -1e9) >= 600:
+        _HOLD_LOGGED[key] = now
+        log.info("posting: item %s held back (%s): %s", item_id, reason, message)
+    if post_progress.run_is_open(item_id, db_path):
+        # Never written onto a finished run: a failure stays on screen until the next attempt starts.
+        post_progress.record(item_id, "checks", "waiting", message, db_path=db_path, dedupe=True, hold=reason,
+                             **detail)
 
 
 def last_live_at(exclude_item_id: str | None = None, db_path: Any = None) -> str | None:
@@ -1317,8 +1563,13 @@ def run_posting_stage(
     limit: int | None = 1,
     now: datetime | None = None,
     rng: Any = None,
+    item_ids: Any = None,
 ) -> dict[str, dict[str, str]]:
     """One posting pass: settle crashed rows, then post the queued item(s) whose slot has come.
+
+    A slot set by the dashboard's Post now (posts.post_now) is exempt from the missed-slot rule:
+    it is never moved later, it waits for the gap, the daily cap and any Meta pause instead.
+    Every item that is due but not posted gets its reason logged and shown on the posting panel.
 
     Only `queued` items are posted, and only at their slot (the scheduler turns `approved` into
     `queued`). Three rules keep a sleeping laptop from double- or burst-posting:
@@ -1333,29 +1584,82 @@ def run_posting_stage(
     paused, why = meta_paused(db_path)
     if paused:
         log.warning("meta is paused; no posting this pass: %s", why)
+        for item in due_items(now, db_path=db_path, item_ids=item_ids):
+            if post_progress.run_is_open(item["id"], db_path) or item.get("post_now"):
+                _hold(item["id"], "meta_paused", f"Meta posting is paused: {why}", db_path)
         return {}
 
     publisher = publisher or Publisher(cfg=cfg, db_path=db_path)
     reset_dry_run_rows(cfg=cfg, db_path=db_path)
     settle_publishing_rows(cfg=cfg, db_path=db_path, publisher=publisher)
 
-    min_gap_s = float((cfg.get("posting") or {}).get("min_gap_hours", 3.0)) * 3600.0
+    from . import scheduler   # lazy: scheduler imports this module
+    posting_cfg = cfg.get("posting") or {}
+    min_gap_s = float(posting_cfg.get("min_gap_hours", 3.0)) * 3600.0
+    cap = int(posting_cfg.get("daily_post_target", 2))
+    wait_s = retry_delay(cfg)
+    mode = "DRY RUN" if is_dry_run(cfg) else "LIVE"
     out: dict[str, dict[str, str]] = {}
     begun = 0
-    for item in due_items(now, db_path=db_path):
+    for item in due_items(now, db_path=db_path, item_ids=item_ids):
         rows = get_posts_for_item(item["id"], db_path=db_path)
         underway = any(r["status"] in STARTED_STATUSES for r in rows)
+        post_now = bool(item.get("post_now"))
+        retrying = any(r["status"] == STATUS_FAILED for r in rows)
+
+        def begin(item=item, retrying=retrying):
+            if post_progress.ensure_run(
+                item["id"], "retry" if retrying else "scheduled",
+                f"Retrying the post (slot {item['slot']})" if retrying else f"Slot {item['slot']} reached",
+                db_path=db_path, slot=item["slot"],
+            ):
+                post_progress.record(item["id"], "waiting", "done", "Picked up by the runner's posting check",
+                                     db_path=db_path)
+
+        # A hold opens a run (so the panel says why it waits), except on top of a failed run: that
+        # failure stays on the panel until the next attempt really starts.
+        if post_progress.latest_state(item["id"], db_path) != "failed":
+            begin()
+        checks = {"mode": mode, "meta_paused": False}
         if not underway:
-            if slot_is_missed(rows, now, cfg):
-                log.info("item %s missed its slot %s; the scheduler will re-slot it", item["id"], item["slot"])
+            if slot_is_missed(rows, now, cfg) and not post_now:
+                _hold(item["id"], "missed", f"Missed its slot {item['slot']} by more than the grace; "
+                      "the scheduler moves it to the next free slot.", db_path)
                 continue
             if limit is not None and begun >= limit:
+                _hold(item["id"], "limit", "Another post started in this pass. It goes on the next check.", db_path)
                 continue
+            failed = [r for r in rows if r["status"] == STATUS_FAILED and not is_terminal_failure(r, cfg)]
+            fresh = [r for r in rows if r["status"] in OPEN_STATUSES]
+            if failed and not fresh:
+                last_failed = max(clock.parse(r["updated_at"]) for r in failed)
+                if (now - last_failed).total_seconds() < wait_s:
+                    retry_at = clock.iso(last_failed + timedelta(seconds=wait_s))
+                    _hold(item["id"], "retry_wait", f"The last attempt failed. Next attempt from {retry_at} UTC.",
+                          db_path, retry_at=retry_at)
+                    continue
             last = last_live_at(exclude_item_id=item["id"], db_path=db_path)
             if last and (now - clock.parse(last)).total_seconds() < min_gap_s:
-                log.info("item %s held back: another post went live at %s (min gap)", item["id"], last)
+                until = clock.iso(clock.parse(last) + timedelta(seconds=min_gap_s))
+                _hold(item["id"], "gap", f"Minimum gap: another post went live at {last} UTC. Allowed from {until} UTC.",
+                      db_path, last_live=last, allowed_from=until)
                 continue
+            today = scheduler.local_day(now, cfg)
+            live_today = live_count_on_day(today, cfg, item["id"], db_path)
+            if live_today >= cap:
+                _hold(item["id"], "cap", f"Daily cap reached: {live_today} of {cap} posts are already live today.",
+                      db_path, live_today=live_today, cap=cap)
+                continue
+            checks.update(last_live=last, gap_hours=min_gap_s / 3600, live_today=live_today, cap=cap)
             begun += 1
+        begin()   # an attempt is starting now (a retry opens its own run here)
+        gap_text = f"gap OK (last live {checks.get('last_live') or 'none'})" if not underway else "already underway"
+        cap_text = f"{checks.get('live_today', '?')} of {checks.get('cap', cap)} live today" if not underway else ""
+        post_progress.record(
+            item["id"], "checks", "done",
+            " · ".join(filter(None, [mode, "Meta not paused", gap_text, cap_text])),
+            db_path=db_path, **checks,
+        )
         try:
             out[item["id"]] = run_posting_for_item(item["id"], cfg=cfg, db_path=db_path, publisher=publisher,
                                                    rng=rng)
@@ -1363,8 +1667,13 @@ def run_posting_stage(
             break
         except PublishError as e:
             log.warning("posting failed for %s: %s", item["id"], redact(e))
+            post_progress.fail(item["id"], "checks", redact(e)[:900], error=getattr(e, "meta", None)
+                               or {"exception": redact(e)[:900]}, db_path=db_path,
+                               retry={"will_retry": False, "text": "No. Fix the cause shown, then Post now again."})
         except sqlite3.IntegrityError as e:
             fail_refused_item(item["id"], e, db_path=db_path)
+            post_progress.fail(item["id"], "checks", f"refused by the database: {e}", db_path=db_path,
+                               retry={"will_retry": False, "text": "No. The item was failed and taken out of the queue."})
     return out
 
 

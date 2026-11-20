@@ -70,7 +70,8 @@ def login(client, password=PASSWORD, base=BASE, ip=None, remember=False, next_pa
 PAGES = ["/", "/queue", "/analytics", "/failures", "/make", "/review", "/library",
          "/settings", "/connections", "/items/x"]
 GET_APIS = ["/api/state", "/api/library", "/api/settings", "/api/schedule", "/api/discovered",
-            "/api/logs", "/api/connections", "/api/items/x"]
+            "/api/logs", "/api/connections", "/api/items/x",
+            "/api/items/x/posting"]
 POST_APIS = ["/api/settings", "/api/settings/x", "/api/runner", "/api/connections/test",
              "/api/connections/send-telegram-test", "/api/prepare", "/api/confirm", "/logout"]
 
@@ -125,6 +126,7 @@ def test_every_route_needs_login_then_works(tmp_db, cfg, tmp_path, env_file):
                 "/api/connections"):
         assert client.get(api, base_url=BASE).status_code == 200, api
     assert client.get("/api/items/x", base_url=BASE).status_code == 404
+    assert client.get("/api/items/x/posting", base_url=BASE).status_code == 404
     assert client.get("/media/x/thumb", base_url=BASE).status_code == 200
     # Control POSTs still need the CSRF header after login.
     assert client.post("/api/runner", base_url=BASE, json={}, headers={"Origin": BASE}).status_code == 403

@@ -18,6 +18,7 @@ from pipeline import (
     creation,
     db,
     hooks,
+    post_progress,
     posting,
     rate_limit,
     scheduler,
@@ -160,14 +161,19 @@ def fingerprint(item, posts):
 
 
 def unstarted(posts):
-    return all(
-        p["status"] in ("pending", "dry_run")
-        and not p.get("remote_container_id")
-        and not p.get("remote_id")
-        and not p.get("publish_started_at")
-        and not p.get("attempt_count")
-        for p in posts
-    )
+    """No row has (or may have) reached Meta's publish call.
+
+    A `dry_run` row only walked the flow: it holds a dry run's bookkeeping (a fake container id,
+    an attempt, a publish time) but nothing was ever published, so it does not lock the item.
+    Moving such an item clears that bookkeeping (queue_controls.set_slot)."""
+    def fresh(p):
+        if p.get("remote_id"):
+            return False
+        if p["status"] == "dry_run":
+            return True
+        return (p["status"] == "pending" and not p.get("remote_container_id")
+                and not p.get("publish_started_at") and not p.get("attempt_count"))
+    return all(fresh(p) for p in posts)
 
 
 def publishing_block_reason(posts):
@@ -452,10 +458,16 @@ def prepare(action, item_id, payload, path, cfg):
             raise ControlError(str(exc)) from None
         payload = {**payload, "slot": clock.iso(slot)}
         detail = f"Earliest allowed slot: {slot_time(slot, cfg)}"
+        if (slot - clock.utcnow()).total_seconds() > 60:
+            detail += " (the minimum gap or daily cap allows nothing sooner)"
         if posting.is_dry_run(cfg):
-            detail += " (dry run)"
-        if not runner.active_lock(path, runner._lock_settings(cfg)[0]):
-            detail += ". Start runner and post."
+            detail += ". DRY RUN, nothing will reach Instagram"
+        lock = runner.active_lock(path, runner._lock_settings(cfg)[0])
+        if lock and lock.get("kind") in ("loop", "make"):
+            detail += ". The runner is active and publishes it within about a minute of that time."
+        else:
+            detail += ". No runner is running, so a one-off posting worker publishes it under the runner lock."
+        detail += " A progress panel opens after you confirm."
     if action == "reslot":
         bounded = copy.deepcopy(cfg)
         bounded.setdefault("posting", {})["daily_post_target"] = min(
@@ -502,6 +514,10 @@ def enqueue(plan, command_id, path):
                 db.now(),
             ),
         )
+        if plan["action"] == "post_now":
+            slot = plan["payload"].get("slot")
+            post_progress.open_run(item_id, "post_now", f"Post now confirmed (earliest allowed slot {slot} UTC)",
+                                   command_id=command_id, db_path=path, slot=slot)
         return dict(
             conn.execute(
                 "SELECT * FROM dashboard_commands WHERE id = ?", (command_id,)
@@ -660,7 +676,7 @@ def apply(command, cfg, path):
         if reason:
             raise ControlError(reason)
         posting.ensure_post_rows(item, clock.iso(slot), cfg, path)
-        queue_controls.set_slot(item_id, clock.iso(slot), path)
+        queue_controls.set_slot(item_id, clock.iso(slot), path, post_now=True)
         db.transition_stage(item_id, "queued", db_path=path)
         return f"Scheduled for {slot_time(slot, cfg)}."
     if action == "edit_hook":
@@ -704,7 +720,7 @@ def apply(command, cfg, path):
         slot = clock.iso(scheduler.next_free_slot(after, bounded, path, item_id))
         with db.db(path) as conn:
             conn.execute(
-                "UPDATE posts SET slot_datetime = ?, variant_decided_at = NULL, updated_at = ? "
+                "UPDATE posts SET slot_datetime = ?, variant_decided_at = NULL, post_now = 0, updated_at = ? "
                 "WHERE item_id = ?",
                 (slot, db.now(), item_id),
             )
@@ -745,18 +761,7 @@ def runner_boundary(cfg, path, stage):
         ),
         path,
     )
-    with db.db(path) as conn:
-        ids = [
-            r[0]
-            for r in conn.execute(
-                "SELECT id FROM dashboard_commands WHERE status='pending' AND action NOT IN "
-                "('make','clip_url','remake_cut','remake_hook','make_from_discovered',"
-                "'edit_caption_words','edit_voiceover','snapshot_now','go_live','go_dry','run_stage') "
-                "ORDER BY created_at, rowid LIMIT 50"
-            )
-        ]
-    for command_id in ids:
-        apply_pending(command_id, cfg, path)
+    apply_waiting(cfg, path)
 
 
 def apply_pending(command_id, cfg, path, media_root=None):
@@ -793,6 +798,8 @@ def apply_pending(command_id, cfg, path, media_root=None):
             "UPDATE dashboard_commands SET status=?, result=?, completed_at=? WHERE id=?",
             (status, message, db.now(), command_id),
         )
+        if row["action"] == "post_now":
+            record_post_now_pickup(row, status, message, cfg, path)
 
         result = dict(conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (command_id,)).fetchone())
     if status == "applied" and row["action"] == "delete":
@@ -805,6 +812,54 @@ def apply_pending(command_id, cfg, path, media_root=None):
     return result
 
 
+def record_post_now_pickup(row, status, message, cfg, path):
+    """Posting panel: who applied a Post now, after how long, or why it was refused."""
+    try:
+        waited = max(0, int((clock.utcnow() - clock.parse(row["created_at"])).total_seconds()))
+    except (TypeError, ValueError):
+        waited = 0
+    if status != "applied":
+        post_progress.fail(row["item_id"], "checks", message, command_id=row["id"], db_path=path,
+                           error={"exception": message},
+                           retry={"will_retry": False, "text": "No. Open Post now again to get a new slot."})
+        return
+    lock = runner.active_lock(path, runner._lock_settings(cfg)[0]) or {}
+    stage = db.kv_get("runner:stage", db_path=path) or "its cycle"
+    if lock.get("kind") == "dashboard":
+        # The slot is set, but nothing that publishes has picked it up yet: the one-off worker will.
+        post_progress.record(row["item_id"], "waiting", "running",
+                             f"No runner is running. The dashboard set the slot under the runner lock. {message}",
+                             command_id=row["id"], db_path=path, runner_kind="dashboard")
+        return
+    who = {
+        "loop": f"the runner (pid {lock.get('pid')}, busy in {stage})",
+        "make": f"the Make worker (pid {lock.get('pid')})",
+        "post": f"the one-off posting worker (pid {lock.get('pid')})",
+        "dashboard": "the dashboard, under the runner lock (no runner was running)",
+    }.get(lock.get("kind"), "the lock holder")
+    post_progress.record(row["item_id"], "waiting", "done", f"Picked up by {who} after {waited} s. {message}",
+                         command_id=row["id"], db_path=path, waited_s=waited, runner_kind=lock.get("kind"),
+                         runner_stage=stage)
+
+
+QUICK_COMMANDS_SQL = (
+    "SELECT id FROM dashboard_commands WHERE status='pending' AND action NOT IN "
+    "('make','clip_url','remake_cut','remake_hook','make_from_discovered',"
+    "'edit_caption_words','edit_voiceover','snapshot_now','go_live','go_dry','run_stage') "
+    "ORDER BY created_at, rowid LIMIT 50"
+)
+
+
+def apply_waiting(cfg, path, media_root=None):
+    """Apply every quick command still pending, oldest first (the caller holds the runner lock).
+
+    Commands queued while a lock holder did not process them (a Make worker, or a runner that
+    stopped) would otherwise wait for the next runner, then apply after newer ones and be refused."""
+    with db.db(path) as conn:
+        ids = [r[0] for r in conn.execute(QUICK_COMMANDS_SQL)]
+    return [apply_pending(command_id, cfg, path, media_root) for command_id in ids]
+
+
 def submit(plan, command_id, path, cfg, media_root=None):
     command = enqueue(plan, command_id, path)
     if command["status"] != "pending":
@@ -815,6 +870,10 @@ def submit(plan, command_id, path, cfg, media_root=None):
     if plan["action"] in creation.ACTIONS or not runner.acquire_lock(path, stale, heartbeat, "dashboard"):
         return command
     try:
+        with db.db(path) as conn:
+            older = [r[0] for r in conn.execute(QUICK_COMMANDS_SQL) if r[0] != command_id]
+        for older_id in older:
+            apply_pending(older_id, cfg, path, media_root)
         return apply_pending(command_id, cfg, path, media_root) or command
     finally:
         runner.release_lock(path)

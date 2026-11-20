@@ -534,6 +534,7 @@ posting:
   min_gap_hours: 3.0 # between any two posts (scheduled slots and real live times)
   # A queued post that has not started within this long after its slot (laptop asleep, Meta
   # paused) is NOT sent late: the scheduler moves it to the next free slot, one per slot.
+  # A slot set by the dashboard's Post now is never moved: it waits for the gap, cap or pause.
   missed_slot_grace_minutes: 90
   max_slot_search_days: 60
   meta_min_gap_seconds: 3.0 # minimum gap between any two Meta requests, shared across processes
@@ -560,6 +561,7 @@ posting:
   retry_backoff_s: 2.0 # exponential: 2s, 4s, 8s ...
   retry_backoff_cap_s: 30.0
   max_post_attempts: 3 # a posts row is given up on after this many attempts
+  retry_delay_minutes: 10 # a failed row waits this long before the next attempt
   rate_limit_pause_hours: 3.0 # a 429 or block pauses every Meta call for this long
   container_poll_seconds: 10.0
   container_poll_max_minutes: 5.0
@@ -622,6 +624,9 @@ orchestrator:
   loop_interval_seconds: 60
   heartbeat_interval_seconds: 30
   heartbeat_stale_seconds: 120
+  # The lock holder (runner loop or Make worker) checks for Post now commands and due slots this
+  # often, on its own thread, so a post never waits for the rest of a cycle. 0 turns it off.
+  quick_post_seconds: 5
 
 dashboard:
   # Remote access through a Cloudflare quick tunnel (DASHBOARD.md "Remote access").

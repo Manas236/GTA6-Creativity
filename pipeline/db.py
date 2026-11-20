@@ -354,8 +354,19 @@ def init_db(db_path: Path | str | None = None) -> None:
                 "UPDATE posts SET variant_decided_at = COALESCE(publish_started_at, posted_at, updated_at) "
                 "WHERE status NOT IN ('pending', 'dry_run') OR remote_container_id IS NOT NULL"
             )
+        # 1 = the slot came from the dashboard's Post now: it is never moved by the missed-slot rule.
+        if "post_now" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN post_now INTEGER DEFAULT 0")
+        # Posting progress events for the dashboard panel (pipeline.post_progress).
+        for statement in post_progress_schema():
+            conn.execute(statement)
         # Trigger bodies reference the migrated items.preview_only column.
         conn.executescript(PREVIEW_ONLY_TRIGGERS)
+
+
+def post_progress_schema() -> list[str]:
+    from .post_progress import SCHEMA as PROGRESS_SCHEMA
+    return [part.strip() for part in PROGRESS_SCHEMA.split(";") if part.strip()]
 
 
 # ---------------------------------------------------------------------------

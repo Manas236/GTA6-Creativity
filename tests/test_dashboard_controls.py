@@ -181,6 +181,8 @@ def test_force_stop_refuses_posting_and_requires_delay(local, tmp_db):
 
 
 def test_settings_backup_and_reload(tmp_path, monkeypatch):
+    # This test is about the overlay itself, in its own folder: read config.local.yaml here.
+    monkeypatch.delenv("GTA6_IGNORE_LOCAL_CONFIG", raising=False)
     base = config.project_root() / "config.yaml"
     original = base.read_bytes()
     (tmp_path / "config.yaml").write_bytes(original)
@@ -274,19 +276,25 @@ def test_manual_source_ids_are_separate_by_platform(tmp_db):
                                           "source_url": f"https://youtu.be/{video}"}, tmp_db)
 
 
-def test_post_now_applies_confirmed_slot_and_only_starts_runner(local, clip, tmp_db, fake_clock, monkeypatch):
+def test_post_now_applies_confirmed_slot_and_starts_one_off_worker(local, clip, tmp_db, fake_clock, monkeypatch):
+    """No runner: the dashboard sets the slot under the runner lock and starts a one-off posting
+    worker. It does NOT start the whole runner loop any more."""
     _, client, cfg, csrf = local
     item_id = clip["id"]
     db.transition_stage(item_id, "approved", db_path=tmp_db)
-    started = []
+    started, spawned = [], []
     monkeypatch.setattr(workers, "control", lambda operation, *_: started.append(operation))
+    monkeypatch.setattr(workers, "spawn_post_worker", lambda path, root, job, item: spawned.append((job, item)) or 4242)
     preparation = post(client, csrf, "/api/prepare", {"action": "post_now", "item_id": item_id})
     assert preparation.status_code == 200
-    assert "dry run" in preparation.json["description"] and "Start runner and post" in preparation.json["description"]
+    description = preparation.json["description"]
+    assert "DRY RUN, nothing will reach Instagram" in description and "one-off posting worker" in description
     applied = post(client, csrf, "/api/confirm", {"ticket": preparation.json["ticket"]})
     assert applied.json["command"]["status"] == "applied"
     assert db.get_item(item_id, tmp_db)["stage"] == "queued"
     posts = posting.get_posts_for_item(item_id, tmp_db)
     assert posting.item_slot(posts) == preparation.json["payload"]["slot"]
     assert {row["status"] for row in posts} == {"pending"}
-    assert started == ["start"]
+    assert all(row["post_now"] == 1 for row in posts)
+    assert started == []
+    assert spawned == [(applied.json["command"]["id"], item_id)]

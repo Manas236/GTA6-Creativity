@@ -15,7 +15,8 @@ import time
 import uuid
 from typing import Any
 
-from . import analytics, cleanup, config, cut, db, discover, download, healthcheck, hooks, posting, render, scheduler, telegram_bot, voiceover
+from . import (analytics, cleanup, clock, config, cut, db, discover, download, healthcheck, hooks, post_progress,
+               posting, render, scheduler, telegram_bot, voiceover)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,6 +127,169 @@ def stopping(db_path=None):
         return False
     raw = db.kv_get(STOP_KEY, db_path=db_path)
     return bool(raw and json.loads(raw).get("token") == token)
+
+
+# ---------------------------------------------------------------------------
+# Quick posting: Post now and due slots publish within seconds, not at the end of a cycle
+# ---------------------------------------------------------------------------
+#
+# The lock design: one process holds `runner:lock` for its whole life (the loop, a Make worker or
+# a one-off worker), so no second process can post while it runs. A cycle's stages can take many
+# minutes (cut took 11 minutes on launch day), so a check between stages would still leave a
+# Post now waiting that long. Instead the lock-holding process runs a small thread that every
+# few seconds applies waiting Post now commands and publishes whatever is due. It is the same
+# process and the same lock, and POSTING_MUTEX serializes it with every other posting write in
+# that process (the dashboard controls applied at stage boundaries, settle, schedule and post).
+
+POSTING_MUTEX = threading.RLock()
+PUBLISHING_KEY = "runner:publishing"   # set while the quick posting check is inside a posting pass
+QUICK_POST_SECONDS = 5.0
+
+
+def quick_post_seconds(cfg: dict[str, Any] | None) -> float:
+    return float(((cfg or {}).get("orchestrator") or {}).get("quick_post_seconds", QUICK_POST_SECONDS))
+
+
+def apply_post_now_commands(cfg: dict[str, Any], db_path: Any = None, item_ids: Any = None) -> list[Any]:
+    """Apply the dashboard's waiting Post now commands (the caller holds the runner lock)."""
+    try:
+        from dashboard import commands
+    except ModuleNotFoundError:
+        return []
+    with db.db(db_path) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='dashboard_commands'").fetchone():
+            return []
+        rows = conn.execute(
+            "SELECT id, item_id FROM dashboard_commands WHERE status='pending' AND action='post_now' "
+            "ORDER BY created_at, rowid"
+        ).fetchall()
+    wanted = set(item_ids) if item_ids is not None else None
+    return [commands.apply_pending(r["id"], cfg, db_path) for r in rows if wanted is None or r["item_id"] in wanted]
+
+
+def quick_post_tick(db_path: Any = None, cfg: dict[str, Any] | None = None, item_ids: Any = None,
+                    publisher: Any = None) -> dict[str, Any]:
+    """One quick posting check: apply waiting Post now commands, then publish what is due now
+    (only `item_ids` when given), with the posting stage's own gap, cap and Meta pause rules.
+    The caller holds the runner lock."""
+    cfg = cfg or config.get_config(reload=True)
+    with POSTING_MUTEX:
+        apply_post_now_commands(cfg, db_path, item_ids)
+        if not posting.has_posting_work(clock.utcnow(), db_path, item_ids):
+            return {}
+        db.kv_set(PUBLISHING_KEY, json.dumps({"pid": os.getpid(), "at": time.time()}), db_path=db_path)
+        try:
+            return posting.run_posting_stage(cfg=cfg, db_path=db_path, item_ids=item_ids, publisher=publisher)
+        finally:
+            db.kv_set(PUBLISHING_KEY, "", db_path=db_path)
+
+
+class QuickPoster:
+    """The quick posting check, on a thread of the process that holds the runner lock."""
+
+    def __init__(self, db_path: Any, interval_s: float, cfg: dict[str, Any] | None = None):
+        self.db_path, self.interval_s, self.cfg = db_path, interval_s, cfg
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> "QuickPoster":
+        if self.interval_s > 0:
+            self.thread = threading.Thread(target=self._run, name="quick-post", daemon=True)
+            self.thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(self.interval_s):
+            try:
+                # Reloaded every check, so Go live / Back to dry run apply within seconds.
+                quick_post_tick(self.db_path, self.cfg or config.get_config(reload=True))
+            except Exception:  # noqa: BLE001 - a failed check must never stop the next one
+                log.exception("Quick posting check failed")
+
+    def stop(self) -> None:
+        """Stop, and wait for a posting pass in flight: the lock is released only after it."""
+        self.stop_event.set()
+        with POSTING_MUTEX:
+            pass
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+
+
+def _post_now_status(job_id: str, item_id: str, cfg: dict[str, Any], db_path: Any) -> str:
+    """'pending' (the command waits), 'open' (rows still to publish) or 'done'."""
+    with db.db(db_path) as conn:
+        command = conn.execute("SELECT status FROM dashboard_commands WHERE id=?", (job_id,)).fetchone()
+        item = conn.execute("SELECT stage FROM items WHERE id=?", (item_id,)).fetchone()
+    if command is None or item is None:
+        return "done"
+    if command["status"] == "pending":
+        return "pending"
+    if command["status"] != "applied" or item["stage"] != "queued":
+        return "done"
+    wanted = set(posting.enabled_platforms(cfg))
+    rows = [r for r in posting.get_posts_for_item(item_id, db_path) if r["platform"] in wanted]
+    if not rows or all(r["status"] in (posting.STATUS_LIVE, posting.STATUS_DRY_RUN)
+                       or posting.is_terminal_failure(r, cfg) for r in rows):
+        return "done"
+    return "open"
+
+
+def run_post_now_worker(job_id: str, db_path: Any = None, *, poll_s: float = 5.0,
+                        max_life_s: float = 26 * 3600.0, sleep: Any = time.sleep) -> int:
+    """The one-off publish for a Post now confirmed while no runner is running.
+
+    It takes the runner lock only when there is something to do (the command to apply, the slot
+    due), so the dashboard's other quick controls keep applying at once in between. If the runner
+    or a Make worker starts meanwhile, that process's quick posting check takes over and this
+    worker exits. Never more than one process posts: everything happens under the runner lock."""
+    from dashboard.store import initialize
+
+    initialize(db_path)
+    cfg = config.get_config(reload=True)
+    with db.db(db_path) as conn:
+        row = conn.execute("SELECT * FROM dashboard_commands WHERE id=?", (job_id,)).fetchone()
+    if row is None or row["action"] != "post_now":
+        log.warning("post_now worker: %s is not a Post now command", job_id)
+        return 1
+    item_id = row["item_id"]
+    deadline = time.time() + max_life_s
+    first = True
+    while time.time() < deadline:
+        if not first:
+            sleep(poll_s)
+        first = False
+        cfg = config.get_config(reload=True)
+        stale, heartbeat = _lock_settings(cfg)
+        holder = active_lock(db_path, stale)
+        if holder and holder.get("kind") in ("loop", "make"):
+            post_progress.record(item_id, "waiting", "done",
+                                 f"The {'runner' if holder['kind'] == 'loop' else 'Make worker'} "
+                                 f"(pid {holder.get('pid')}) started and took over this post.",
+                                 command_id=job_id, db_path=db_path, dedupe=True)
+            return 0
+        status = _post_now_status(job_id, item_id, cfg, db_path)
+        if status == "done":
+            return 0
+        if status == "open" and not posting.has_posting_work(clock.utcnow(), db_path, {item_id}):
+            continue   # waiting for the slot (the gap or the daily cap); the panel says until when
+        if not acquire_lock(db_path=db_path, stale_timeout_s=stale, heartbeat_interval_s=heartbeat, kind="post"):
+            continue
+        try:
+            set_stage("post", db_path)
+            post_progress.record(item_id, "waiting", "done",
+                                 f"The one-off posting worker (pid {os.getpid()}) took the runner lock.",
+                                 command_id=job_id, db_path=db_path, dedupe=True)
+            quick_post_tick(db_path, cfg, item_ids={item_id})
+        except Exception:  # noqa: BLE001 - logged; the loop re-checks the state
+            log.exception("post_now worker: posting pass failed for %s", item_id)
+        finally:
+            with POSTING_MUTEX:
+                set_stage("idle", db_path)
+                release_lock(db_path=db_path)
+    post_progress.fail(item_id, "waiting", "The one-off posting worker stopped waiting after 26 hours.",
+                       command_id=job_id, db_path=db_path,
+                       retry={"will_retry": False, "text": "No. Start the runner, or press Post now again."})
+    return 1
 
 
 def print_status(db_path: Any = None) -> None:
@@ -255,6 +419,9 @@ STAGES: list[tuple[str, Any]] = [
 ]
 
 
+#: Stages that write posts rows: never concurrent with the quick posting check (POSTING_MUTEX).
+POSTING_STAGES = {"settle", "schedule", "post"}
+
 #: Single-stage CLI commands that just run one stage function under the lock.
 EXTRA_COMMANDS: dict[str, Any] = {"analytics": _stage_analytics, "cleanup": _stage_cleanup}
 
@@ -297,7 +464,8 @@ def run_stages(
         t_stage = time.time()
         if runner_boundary is not None:
             try:
-                runner_boundary(cfg, db_path, name)
+                with POSTING_MUTEX:   # controls may delete or move posts rows
+                    runner_boundary(cfg, db_path, name)
             except Exception:
                 log.exception("Dashboard boundary failed before %s; running the stage", name)
         try:
@@ -305,7 +473,11 @@ def run_stages(
                 cfg = config.get_config(reload=True)
             if name == "analytics":
                 run_dashboard_operations(cfg, db_path)
-            results[name] = fn(cfg, db_path)
+            if name in POSTING_STAGES:
+                with POSTING_MUTEX:
+                    results[name] = fn(cfg, db_path)
+            else:
+                results[name] = fn(cfg, db_path)
             log.info("Stage %-9s ok in %.1fs: %s", name, time.time() - t_stage, str(results[name])[:300])
         except Exception as e:  # noqa: BLE001 - this is the isolation boundary
             log.exception("Stage %s failed; carrying on with the next stage", name)
@@ -370,6 +542,7 @@ def run_loop(
         return 0
 
     log.info("Runner loop started (interval %.0fs). Ctrl-C to stop.", gap)
+    quick = QuickPoster(db_path, quick_post_seconds(cfg), fixed_config).start()
     cycles = 0
     try:
         while (max_cycles is None or cycles < max_cycles) and not stopping(db_path):
@@ -400,6 +573,7 @@ def run_loop(
     except KeyboardInterrupt:
         log.info("Runner loop stopped.")
     finally:
+        quick.stop()
         release_lock(db_path=db_path)
     return cycles
 
@@ -455,6 +629,8 @@ def main() -> None:
     make_parser.add_argument("--job", required=True)
     operation = subparsers.add_parser("operation", help="Run a confirmed dashboard operation")
     operation.add_argument("--job", required=True)
+    post_now = subparsers.add_parser("post_now", help="Publish a dashboard Post now while no runner is running")
+    post_now.add_argument("--job", required=True)
     subparsers.add_parser("status", help="Print current database status and stage counts")
 
     args = parser.parse_args()
@@ -571,6 +747,8 @@ def main() -> None:
     elif args.command == "make":
         from .creation import make_worker
         make_worker(args.job, db_path=db_p)
+    elif args.command == "post_now":
+        sys.exit(run_post_now_worker(args.job, db_path=db_p))
     elif args.command == "operation":
         db.init_db(db_p)
         if not acquire_lock(db_path=db_p):

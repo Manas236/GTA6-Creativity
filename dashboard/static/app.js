@@ -150,7 +150,7 @@ function commandsPanel() {
     ${state.commands.length > 8 ? `<details><summary class="muted">Older controls</summary>${state.commands.slice(8).map(commandRow).join("")}</details>` : ""}</section>`;
 }
 function commandRow(c) {
-  return `<div class="command-row">${pill(commandState(c), c.status === "applied" ? "green" : ["pending", "running"].includes(c.status) ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${resultMessage(c.result || (c.status === "running" ? "Worker running." : "Waiting for a worker or the next runner boundary."))}</p></div><code>${escape(formatTime(c.created_at))}</code></div>`;
+  return `<div class="command-row">${pill(commandState(c), c.status === "applied" ? "green" : ["pending", "running"].includes(c.status) ? "amber" : "red")}<div class="grow"><strong>${escape(labels[c.action] || c.action)}</strong><p>${resultMessage(c.result || (c.status === "running" ? "Worker running." : "Waiting for a worker or the next runner boundary."))}</p></div>${c.action === "post_now" && c.item_id ? `<button type="button" class="button secondary" data-progress="${escape(c.item_id)}">Progress</button>` : ""}<code>${escape(formatTime(c.created_at))}</code></div>`;
 }
 function overview() {
   const status = summaryStatus();
@@ -212,7 +212,7 @@ function queue() {
       `<button class="button secondary" id="queue-view" aria-pressed="${queueCompact}">${queueCompact ? "Calendar" : "List view"}</button>`,
     ) + calendarMarkup() +
     `<div class="toolbar"><input type="search" id="queue-search" aria-label="Search items" placeholder="Search clips, creators or item IDs" value="${escape(filters.queue)}"><select id="stage-filter" aria-label="Filter stage"><option value="all">Approved & queued</option>${state.stages.map((s) => `<option value="${s.stage}" ${filters.stage === s.stage ? "selected" : ""}>${pretty(s.stage)} (${s.count})</option>`).join("")}</select></div>
-  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "compact" ? "Queue order" : day === "unscheduled" ? "Waiting for a slot" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card ${queueCompact ? "queue-compact" : ""}" data-queue-item="${escape(item.id)}" draggable="${item.stage === "approved" || item.actions.includes("up")}"><div class="queue-time">${posts[0] ? escape(queueTime(posts[0].slot_datetime)) : "—"}<div class="small">${posts[0] ? "Scheduled" : "Unscheduled"}</div></div><div><h3><a href="${reviewLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(versionName(posts[0]?.variant || item.chosen_variant))}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.includes("post_now") ? button("post_now", item.id) : ""}
+  ${[...groups].map(([day, list]) => `<div class="section-label">${day === "compact" ? "Queue order" : day === "unscheduled" ? "Waiting for a slot" : escape(formatTime(list[0].posts[0].slot_datetime, { hour: undefined, minute: undefined, weekday: "long", year: "numeric" }))}</div>${list.map(({ item, posts }) => `<article class="queue-card ${queueCompact ? "queue-compact" : ""}" data-queue-item="${escape(item.id)}" draggable="${item.stage === "approved" || item.actions.includes("up")}"><div class="queue-time">${posts[0] ? escape(queueTime(posts[0].slot_datetime)) : "No slot"}<div class="small">${posts[0] ? "Scheduled" : "Unscheduled"}</div></div><div><h3><a href="${reviewLink(item.id)}">${escape(item.original_title)}</a></h3><p>${escape(item.author_name)} · ${escape(item.source)} · ${escape(item.hook_text || "Hook not generated")}</p><div class="chips">${pill(pretty(item.stage), item.stage === "queued" ? "pink" : "")}${pill(versionName(posts[0]?.variant || item.chosen_variant))}${posts.map((p) => pill(`${p.platform} · ${p.status}`)).join("")}</div></div><div class="detail-actions">${item.actions.includes("post_now") ? button("post_now", item.id) : ""}${progressLink(item.id)}
       <details class="queue-menu"><summary class="button secondary" aria-label="More actions">…</summary>
       <div>${item.actions.filter((action) => ["unapprove", "up", "down", "reslot"].includes(action)).map((action) => button(action, item.id)).join("")}
       <a href="${reviewLink(item.id)}">Open in Review</a></div></details></div><div class="reslot-host"></div></article>`).join("")}`).join("") || empty("No items match this filter.")}${commandsPanel()}`);
@@ -314,6 +314,7 @@ async function itemPage(id = decodeURIComponent(location.pathname.split("/")[2])
    .join("")}</div></section></div>
  <section class="panel commands">${panelHead("Post text (Instagram caption)", "Creator credit and disclosure are appended when an override is saved.")}
  <p class="caption-preview">${escape(detail.caption)}</p>${detail.actions.includes("edit_caption") ? button("edit_caption", i.id) : ""}</section>
+ ${hasProgress(i.id) || detail.posts.length ? `<section class="panel commands">${panelHead("Posting", "Every step of each publish attempt, live while it runs.")}<button type="button" class="button secondary" data-progress="${escape(i.id)}">Posting progress</button></section>` : ""}
  ${postedDetails(detail)}
  ${detail.review.reason ? `<section class="panel commands">${panelHead("Review context")}<p class="reason">${escape(detail.review.reason)}</p><p>${escape(detail.review.transcript_excerpt || "")}</p></section>` : ""}
  <section class="panel commands">${panelHead("Stage history", "Full history, oldest to newest", pill(`${detail.logs.length} events`))}${detail.logs.map((l) => `<div class="log-entry"><time>${escape(formatTime(l.created_at))}</time><span>${escape(pretty(l.stage))}</span><div>${pill(l.status, ["failed", "failure"].includes(l.status) ? "red" : l.status === "success" ? "green" : "")}<p>${escape(l.message)}${l.duration_s ? ` · ${Number(l.duration_s).toFixed(1)}s` : ""}</p></div></div>`).join("") || empty("No stage history recorded.")}</section>${commandsPanel()}`);
@@ -720,7 +721,7 @@ function updateRunnerLabel() {
   const running = state.lock.status === "alive" && state.lock.kind !== "dashboard";
   runnerDot.dataset.status = running ? "alive" : "stopped";
   document.querySelector("#nav-runner-label").textContent = !running ? "Runner stopped" :
-    state.lock.kind === "make" ? "Make job running" : "Runner running";
+    state.lock.kind === "make" ? "Make job running" : state.lock.kind === "post" ? "Posting worker running" : "Runner running";
 }
 
 function remoteLabel(remote) {
@@ -886,6 +887,8 @@ document
       if (!confirmation) return;
       const result = await api("/api/confirm", { ticket: confirmation.ticket });
       dialog.close();
+      // Every confirmed Post now opens its live progress panel (refused ones show why).
+      const postNowItem = pendingAction.action === "post_now" && result.command ? pendingAction.item_id : null;
       if (result.command.status === "pending") waitingCommands.set(result.command.id, { title: confirmation.title, action: pendingAction.action });
       if (pendingAction.action === "delete" && result.command.status !== "refused" &&
           result.command.status !== "failed" && isReviewPage()) {
@@ -894,6 +897,7 @@ document
       }
       commandNotice(pendingAction.action, result.command, confirmation.title, {}, null, result.warning);
       await refresh(true);
+      if (postNowItem) openProgress(postNowItem);
     } catch (error) {
       document.querySelector("#dialog-error").innerHTML = resultMessage(error.message);
     } finally {
@@ -1248,7 +1252,7 @@ async function library() {
     <tbody>${items.map((item) => `<tr data-row="${escape(item.id)}"><td>${item.actions.some((action) => ["delete", "reject"].includes(action)) ?
       `<input type="checkbox" data-select-item value="${escape(item.id)}" aria-label="Select ${escape(item.original_title)}" ${selectedItems.has(item.id) ? "checked" : ""}>` : ""}
     </td><td><a class="library-clip" href="${itemLink(item.id)}"><img class="library-thumb" src="${mediaURL("/media/" + encodeURIComponent(item.id) + "/thumb")}" alt="" loading="lazy" width="64" height="36">${escape(item.original_title)}</a></td>
-    <td>${escape(item.author_name)} · ${escape(platform(item))}</td><td>${pill(pretty(item.stage))}</td></tr>`).join("")}</tbody></table></div>`);
+    <td>${escape(item.author_name)} · ${escape(platform(item))}</td><td><span class="library-stage">${pill(pretty(item.stage))}${progressLink(item.id)}</span></td></tr>`).join("")}</tbody></table></div>`);
   updateBulkBar();
 }
 

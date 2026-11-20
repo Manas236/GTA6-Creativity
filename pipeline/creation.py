@@ -264,7 +264,7 @@ def run_jobs(cfg, path, only=None):
         job_id, action = job["id"], job["action"]
         payload = json.loads(job["payload"])
         try:
-            with transaction(path) as conn:
+            with runner.POSTING_MUTEX, transaction(path) as conn:   # item jobs delete posts rows
                 conn.execute("UPDATE dashboard_commands SET status='running' WHERE id=?", (job_id,))
                 if action in ITEM_JOBS and job["status"] == "pending":
                     commands.apply(dict(job), cfg, path)
@@ -318,7 +318,17 @@ def make_worker(job_id, db_path=None):
         if not row or row["status"] not in ("pending", "running"):
             return
         time.sleep(2)
+    # A Make job can hold the lock for an hour: Post now and due slots still publish meanwhile.
+    quick = runner.QuickPoster(db_path, runner.quick_post_seconds(cfg)).start()
     try:
         run_jobs(cfg, db_path, only=job_id)
+        # Quick controls confirmed while this job held the lock would otherwise wait for a runner.
+        try:
+            from dashboard.commands import apply_waiting
+            with runner.POSTING_MUTEX:
+                apply_waiting(config.get_config(reload=True), db_path)
+        except Exception:  # noqa: BLE001 - the job itself finished; log and release
+            log.exception("Make worker could not apply waiting dashboard controls")
     finally:
+        quick.stop()
         runner.release_lock(db_path)

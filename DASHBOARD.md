@@ -248,7 +248,41 @@ the variants again so the video and caption stay in sync.
 
 **Stop runner** waits for the current stage. **Force stop** becomes available
 after two minutes and names the stage it would interrupt. It is blocked during
-the posting and publishing-settlement stages.
+the posting and publishing-settlement stages, and while the quick posting check
+is publishing.
+
+Workers started from the dashboard (the runner loop, Make, operations and the
+one-off posting worker) have no console window of their own, so closing the
+dashboard window, or any other window, never stops them. Until this fix they got
+a visible console of their own (a Windows Terminal tab next to the dashboard on
+this PC), and closing it aborted the runner.
+
+### Post now and the posting panel
+
+**Post now** takes the earliest slot the minimum gap and daily cap allow. The
+process that holds the runner lock (the runner loop or a Make worker) runs a
+quick posting check every `orchestrator.quick_post_seconds` (5 s) on its own
+thread: it applies waiting Post now commands and publishes whatever is due, so a
+post never waits for the rest of a cycle. With no runner running, the dashboard
+sets the slot under the runner lock and starts a one-off
+`python -m pipeline.runner post_now --job ...` worker that publishes it under
+the lock and exits. A Post now slot is never moved by the missed-slot grace: if
+the gap, the cap or a Meta pause holds it, it waits and the panel says why.
+
+Every confirmed Post now opens a **posting progress** panel: request recorded,
+waiting for runner (with the runner's current stage), checks, Instagram
+container, upload (bytes and percent), Meta processing (each status poll),
+publishing, and live with the permalink. Each stage shows its state and times.
+A failure highlights its stage with Meta's code, subcode and message (tokens
+masked) and whether it will be retried; **Copy details** copies it all as plain
+text. The events live in `post_events`, so a refresh shows the same panel
+(`?progress=<item id>` in the URL), and scheduled posts record the same steps.
+Open it any time from **Posting progress** on a Queue card, a Library row or the
+item page.
+
+**Go live** resets rows a dry run left behind (fake containers, used attempts)
+and moves clips whose slot already passed to the next free slot, in the same
+flow. **Back to dry run** changes no posts row.
 
 ### Engagement signals
 

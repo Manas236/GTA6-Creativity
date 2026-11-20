@@ -61,11 +61,18 @@ def move(item_id, direction, cfg, path):
     return f"Moved to {second.astimezone(scheduler.active_profile(cfg)[1]).isoformat()}."
 
 
-def set_slot(item_id, slot, path):
+def set_slot(item_id, slot, path, post_now=False):
+    """Give an unstarted item a new slot (callers validate `unstarted` first).
+
+    A row a dry run walked keeps nothing from it: its fake container id, its attempt count and
+    its publish time are cleared, so a live pass creates a real container instead of uploading
+    to "<dry-run-container:N>". `post_now` marks a slot the missed-slot rule must never move."""
     with db.db(path) as conn:
         conn.execute(
-            "UPDATE posts SET slot_datetime=?, status='pending', variant_decided_at=NULL, updated_at=? WHERE item_id=?",
-            (slot, db.now(), item_id),
+            "UPDATE posts SET slot_datetime=?, status='pending', variant_decided_at=NULL, updated_at=?, "
+            "remote_container_id=NULL, attempt_count=0, publish_started_at=NULL, error_message=NULL, "
+            "no_retry=0, post_now=? WHERE item_id=? AND status NOT IN ('live', 'publishing')",
+            (slot, db.now(), int(bool(post_now)), item_id),
         )
 
 
